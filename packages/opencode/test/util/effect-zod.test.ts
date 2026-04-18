@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { Effect, Schema, SchemaGetter } from "effect"
 import z from "zod"
 
-import { zod, ZodOverride, ZodPreprocess } from "../../src/util/effect-zod"
+import { toJsonSchema, zod, ZodOverride, ZodPreprocess } from "../../src/util/effect-zod"
 
 function json(schema: z.ZodTypeAny) {
   const { $schema: _, ...rest } = z.toJSONSchema(schema)
@@ -749,6 +749,36 @@ describe("util.effect-zod", () => {
       const schema = zod(Schema.Struct({ foo: Schema.optional(Schema.String) }))
       expect(schema.parse({})).toEqual({})
       expect(schema.parse({ foo: "hi" })).toEqual({ foo: "hi" })
+    })
+
+    test("key defaults fill in missing struct keys", () => {
+      const schema = zod(
+        Schema.Struct({
+          mode: Schema.String.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed("ctrl-x"))),
+        }),
+      )
+
+      expect(schema.parse({})).toEqual({ mode: "ctrl-x" })
+    })
+
+    test("key defaults still accept explicit values", () => {
+      const schema = zod(
+        Schema.Struct({
+          mode: Schema.String.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed("ctrl-x"))),
+        }),
+      )
+
+      expect(schema.parse({ mode: "ctrl-c" })).toEqual({ mode: "ctrl-c" })
+    })
+
+    test("JSON Schema output includes the default key for key defaults", () => {
+      const shape = toJsonSchema(
+        Schema.Struct({
+          mode: Schema.String.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed("ctrl-x"))),
+        }),
+      ) as any
+      expect(shape.properties.mode.default).toBe("ctrl-x")
+      expect(shape.required).toBeUndefined()
     })
   })
 

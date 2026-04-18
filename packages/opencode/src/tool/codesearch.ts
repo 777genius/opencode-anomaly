@@ -9,9 +9,10 @@ export const Parameters = Schema.Struct({
     description:
       "Search query to find relevant context for APIs, Libraries, and SDKs. For example, 'React useState hook examples', 'Python pandas dataframe filtering', 'Express.js middleware', 'Next js partial prerendering configuration'",
   }),
-  tokensNum: Schema.Number.check(Schema.isGreaterThanOrEqualTo(1000))
-    .check(Schema.isLessThanOrEqualTo(50000))
-    .pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed(5000)))
+  tokensNum: Schema.Finite.pipe(
+    Schema.check(Schema.isGreaterThanOrEqualTo(1000), Schema.isLessThanOrEqualTo(50000)),
+    Schema.withDecodingDefaultTypeKey(Effect.succeed(5000)),
+  )
     .annotate({
       description:
         "Number of tokens to return (1000-50000). Default is 5000 tokens. Adjust this value based on how much context you need - use lower values for focused queries and higher values for comprehensive documentation.",
@@ -26,7 +27,7 @@ export const CodeSearchTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: { query: string; tokensNum: number }, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
           yield* ctx.ask({
             permission: "codesearch",

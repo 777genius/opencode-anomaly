@@ -487,6 +487,7 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "number",
     },
     "livecrawl": {
+      "default": "fallback",
       "description": "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
       "enum": [
         "fallback",
@@ -495,6 +496,7 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "string",
     },
     "numResults": {
+      "default": 8,
       "description": "Number of search results to return (default: 8)",
       "type": "number",
     },
@@ -503,6 +505,7 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "string",
     },
     "type": {
+      "default": "auto",
       "description": "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
       "enum": [
         "auto",

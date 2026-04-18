@@ -88,15 +88,18 @@ function walkUncached(ast: SchemaAST.AST): z.ZodTypeAny {
   // Schema.decodeTo / Schema.transform attach encoding to non-Declaration
   // nodes, where we do apply the transform.
   //
-  // Schema.withDecodingDefault also attaches encoding, but we want `.default(v)`
-  // on the inner Zod rather than a transform wrapper — so optional ASTs whose
-  // encoding resolves a default from Option.none() route through body()/opt().
+  // Schema.withDecodingDefault and Schema.withDecodingDefaultTypeKey both
+  // attach encodings. For JSON Schema we want those as plain `.default(v)`
+  // annotations rather than transform wrappers, so ASTs whose encoding
+  // resolves a default from Option.none() route through body()/opt().
   const hasEncoding = ast.encoding?.length && ast._tag !== "Declaration"
-  const hasTransform = hasEncoding && !(SchemaAST.isOptional(ast) && extractDefault(ast) !== undefined)
-  const base = hasTransform ? encoded(ast) : body(ast)
+  const fallback = hasEncoding ? extractDefault(ast) : undefined
+  const hasTransform = hasEncoding && fallback === undefined
+  const base = hasTransform ? encoded(ast) : body(ast, fallback)
   const checked = ast.checks?.length ? applyChecks(base, ast.checks, ast) : base
+  const defaulted = fallback !== undefined && !SchemaAST.isOptional(ast) ? checked.default(fallback.value) : checked
   const preprocess = (ast.annotations as { [ZodPreprocess]?: (val: unknown) => unknown } | undefined)?.[ZodPreprocess]
-  const out = preprocess ? z.preprocess(preprocess, checked) : checked
+  const out = preprocess ? z.preprocess(preprocess, defaulted) : defaulted
   const desc = SchemaAST.resolveDescription(ast)
   const ref = SchemaAST.resolveIdentifier(ast)
   const described = desc ? out.describe(desc) : out
@@ -234,8 +237,8 @@ function issueMessage(issue: any): string | undefined {
   return undefined
 }
 
-function body(ast: SchemaAST.AST): z.ZodTypeAny {
-  if (SchemaAST.isOptional(ast)) return opt(ast)
+function body(ast: SchemaAST.AST, fallback?: { value: unknown }): z.ZodTypeAny {
+  if (SchemaAST.isOptional(ast)) return opt(ast, fallback)
 
   switch (ast._tag) {
     case "String":
@@ -268,7 +271,7 @@ function body(ast: SchemaAST.AST): z.ZodTypeAny {
   }
 }
 
-function opt(ast: SchemaAST.AST): z.ZodTypeAny {
+function opt(ast: SchemaAST.AST, fallback = extractDefault(ast)): z.ZodTypeAny {
   if (ast._tag !== "Union") return fail(ast)
   const items = ast.types.filter((item) => item._tag !== "Undefined")
   const inner =
@@ -280,7 +283,6 @@ function opt(ast: SchemaAST.AST): z.ZodTypeAny {
   // Schema.withDecodingDefault attaches an encoding `Link` whose transformation
   // decode Getter resolves `Option.none()` to `Option.some(default)`.  Invoke
   // it to extract the default and emit `.default(...)` instead of `.optional()`.
-  const fallback = extractDefault(ast)
   if (fallback !== undefined) return inner.default(fallback.value)
   return inner.optional()
 }

@@ -11,11 +11,11 @@ const MAX_TIMEOUT = 120 * 1000 // 2 minutes
 export const Parameters = Schema.Struct({
   url: Schema.String.annotate({ description: "The URL to fetch content from" }),
   format: Schema.Literals(["text", "markdown", "html"])
-    .pipe(Schema.optional, Schema.withDecodingDefault(Effect.succeed("markdown" as const)))
+    .pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed("markdown" as const)))
     .annotate({
       description: "The format to return the content in (text, markdown, or html). Defaults to markdown.",
     }),
-  timeout: Schema.optional(Schema.Number).annotate({ description: "Optional timeout in seconds (max 120)" }),
+  timeout: Schema.optional(Schema.Finite).annotate({ description: "Optional timeout in seconds (max 120)" }),
 })
 
 export const WebFetchTool = Tool.define(

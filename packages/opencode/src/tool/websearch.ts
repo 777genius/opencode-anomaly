@@ -6,17 +6,21 @@ import DESCRIPTION from "./websearch.txt"
 
 export const Parameters = Schema.Struct({
   query: Schema.String.annotate({ description: "Websearch query" }),
-  numResults: Schema.optional(Schema.Number).annotate({
+  numResults: Schema.Finite.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(8))).annotate({
     description: "Number of search results to return (default: 8)",
   }),
-  livecrawl: Schema.optional(Schema.Literals(["fallback", "preferred"])).annotate({
+  livecrawl: Schema.Literals(["fallback", "preferred"]).pipe(
+    Schema.withDecodingDefaultTypeKey(Effect.succeed("fallback" as const)),
+  ).annotate({
     description:
       "Live crawl mode - 'fallback': use live crawling as backup if cached content unavailable, 'preferred': prioritize live crawling (default: 'fallback')",
   }),
-  type: Schema.optional(Schema.Literals(["auto", "fast", "deep"])).annotate({
+  type: Schema.Literals(["auto", "fast", "deep"]).pipe(
+    Schema.withDecodingDefaultTypeKey(Effect.succeed("auto" as const)),
+  ).annotate({
     description: "Search type - 'auto': balanced search (default), 'fast': quick results, 'deep': comprehensive search",
   }),
-  contextMaxCharacters: Schema.optional(Schema.Number).annotate({
+  contextMaxCharacters: Schema.optional(Schema.Finite).annotate({
     description: "Maximum characters for context string optimized for LLMs (default: 10000)",
   }),
 })
@@ -52,9 +56,9 @@ export const WebSearchTool = Tool.define(
             McpExa.SearchArgs,
             {
               query: params.query,
-              type: params.type || "auto",
-              numResults: params.numResults || 8,
-              livecrawl: params.livecrawl || "fallback",
+              type: params.type,
+              numResults: params.numResults,
+              livecrawl: params.livecrawl,
               contextMaxCharacters: params.contextMaxCharacters,
             },
             "25 seconds",

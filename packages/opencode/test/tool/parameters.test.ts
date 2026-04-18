@@ -34,6 +34,9 @@ const parse = <S extends Schema.Decoder<unknown>>(schema: S, input: unknown): S[
 const accepts = (schema: Schema.Decoder<unknown>, input: unknown): boolean =>
   Result.isSuccess(Schema.decodeUnknownResult(schema)(input))
 
+const toNativeJsonSchema = <S extends Schema.Decoder<unknown>>(schema: S) =>
+  Schema.toStandardJSONSchemaV1(schema)["~standard"].jsonSchema.input({ target: "draft-2020-12" })
+
 describe("tool parameters", () => {
   describe("JSON Schema (wire shape)", () => {
     test("apply_patch", () => expect(toJsonSchema(ApplyPatch)).toMatchSnapshot())
@@ -54,6 +57,39 @@ describe("tool parameters", () => {
     test("webfetch", () => expect(toJsonSchema(WebFetch)).toMatchSnapshot())
     test("websearch", () => expect(toJsonSchema(WebSearch)).toMatchSnapshot())
     test("write", () => expect(toJsonSchema(Write)).toMatchSnapshot())
+  })
+
+  describe("native JSON Schema (experimental tool route)", () => {
+    test("codesearch uses a plain finite number", () => {
+      const native = toNativeJsonSchema(CodeSearch) as any
+      expect(native.properties.tokensNum).toEqual({
+        type: "number",
+        allOf: [{ minimum: 1000 }, { maximum: 50000 }],
+      })
+    })
+
+    test("webfetch format stays a string enum", () => {
+      const native = toNativeJsonSchema(WebFetch) as any
+      expect(native.properties.format).toEqual({
+        type: "string",
+        enum: ["text", "markdown", "html"],
+      })
+    })
+
+    test("websearch defaulted fields stay non-nullable", () => {
+      const native = toNativeJsonSchema(WebSearch) as any
+      expect(native.properties.numResults).toEqual({
+        type: "number",
+      })
+      expect(native.properties.livecrawl).toEqual({
+        type: "string",
+        enum: ["fallback", "preferred"],
+      })
+      expect(native.properties.type).toEqual({
+        type: "string",
+        enum: ["auto", "fast", "deep"],
+      })
+    })
   })
 
   describe("apply_patch", () => {
@@ -254,13 +290,21 @@ describe("tool parameters", () => {
 
   describe("webfetch", () => {
     test("accepts url-only", () => {
-      expect(parse(WebFetch, { url: "https://example.com" }).url).toBe("https://example.com")
+      expect(parse(WebFetch, { url: "https://example.com" })).toEqual({
+        url: "https://example.com",
+        format: "markdown",
+      })
     })
   })
 
   describe("websearch", () => {
     test("accepts query", () => {
-      expect(parse(WebSearch, { query: "opencode" }).query).toBe("opencode")
+      expect(parse(WebSearch, { query: "opencode" })).toEqual({
+        query: "opencode",
+        numResults: 8,
+        livecrawl: "fallback",
+        type: "auto",
+      })
     })
   })
 
