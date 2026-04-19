@@ -570,6 +570,8 @@ export const dict = {
   "settings.general.row.theme.description": "OpenCodeのテーマをカスタマイズします。",
   "settings.general.row.font.title": "コードフォント",
   "settings.general.row.font.description": "コードブロックとターミナルで使用するフォントをカスタマイズします",
+  "settings.general.row.terminalFont.title": "Terminal Font",
+  "settings.general.row.terminalFont.description": "Customise the font used in the terminal",
   "settings.general.row.uiFont.title": "UIフォント",
   "settings.general.row.uiFont.description": "インターフェース全体で使用するフォントをカスタマイズします",
   "settings.general.row.followup.title": "フォローアップの動作",
