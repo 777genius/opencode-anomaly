@@ -735,7 +735,7 @@ export const dict = {
   "settings.general.row.theme.title": "Theme",
   "settings.general.row.theme.description": "Customise how OpenCode is themed.",
   "settings.general.row.font.title": "Code Font",
-  "settings.general.row.font.description": "Customise the font used in code blocks and terminals",
+  "settings.general.row.font.description": "Customise the font used in code blocks",
   "settings.general.row.terminalFont.title": "Terminal Font",
   "settings.general.row.terminalFont.description": "Customise the font used in the terminal",
   "settings.general.row.uiFont.title": "UI Font",

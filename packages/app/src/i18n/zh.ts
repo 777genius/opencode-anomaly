@@ -631,7 +631,7 @@ export const dict = {
   "settings.general.row.theme.title": "主题",
   "settings.general.row.theme.description": "自定义 OpenCode 的主题。",
   "settings.general.row.font.title": "代码字体",
-  "settings.general.row.font.description": "自定义代码块和终端使用的字体",
+  "settings.general.row.font.description": "自定义代码块使用的字体",
   "settings.general.row.terminalFont.title": "Terminal Font",
   "settings.general.row.terminalFont.description": "Customise the font used in the terminal",
   "settings.general.row.uiFont.title": "界面字体",
