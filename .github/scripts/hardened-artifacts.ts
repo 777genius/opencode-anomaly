@@ -160,14 +160,29 @@ export const validateArchiveEntry = (entry: string) => {
   }
 }
 
+const archiveEntries = (archivePath: string) => {
+  if (archivePath.endsWith(".zip") && process.platform !== "win32") {
+    return run(["unzip", "-Z1", archivePath]).split("\n")
+  }
+  return run(["tar", "-tf", archivePath]).split("\n")
+}
+
+const extractArchive = (archivePath: string, destination: string) => {
+  if (archivePath.endsWith(".zip") && process.platform !== "win32") {
+    run(["unzip", "-q", archivePath, "-d", destination])
+    return
+  }
+  run(["tar", "-xf", archivePath, "-C", destination])
+}
+
 const extract = async (archivePath: string, destination: string) => {
-  const entries = run(["tar", "-tf", archivePath]).split("\n")
+  const entries = archiveEntries(archivePath)
   entries.forEach(validateArchiveEntry)
   if (entries.length !== 1 || !["opencode", "opencode.exe"].includes(entries[0])) {
     fail(`archive must contain exactly one root binary: ${archivePath}`)
   }
   await mkdir(destination, { recursive: true })
-  run(["tar", "-xf", archivePath, "-C", destination])
+  extractArchive(archivePath, destination)
   const binary = path.join(destination, entries[0])
   if (!(await lstat(binary)).isFile()) fail(`archive payload is not a regular file: ${archivePath}`)
   return binary
