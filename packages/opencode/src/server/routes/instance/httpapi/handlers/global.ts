@@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput } from "../groups/global"
+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -70,6 +71,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const config = yield* Config.Service
     const installation = yield* Installation.Service
     const bridge = yield* EffectBridge.make()
+    const hostedApproval = yield* HostedApprovalCoordinator.Service
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return { healthy: true as const, version: InstallationVersion }
@@ -84,7 +86,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
-      const result = yield* config.updateGlobal(ctx.payload)
+      const result = yield* hostedApproval.withConfigMutation(config.updateGlobal(ctx.payload), (value) => value.changed)
       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
       return result.info
     })

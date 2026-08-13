@@ -68,10 +68,22 @@ const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
     return yield* permission.reply(input)
   })
 
+const conditionalReply = (input: Parameters<Permission.Interface["conditionalReply"]>[0]) =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    return yield* permission.conditionalReply(input)
+  })
+
 const list = () =>
   Effect.gen(function* () {
     const permission = yield* Permission.Service
     return yield* permission.list()
+  })
+
+const hostedList = () =>
+  Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    return yield* permission.hostedList()
   })
 
 // fromConfig tests
@@ -737,6 +749,174 @@ it.instance(
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "conditional reply - concurrent callers settle exactly once",
+  () =>
+    Effect.gen(function* () {
+      const requestID = PermissionV1.ID.make("per_conditional_concurrent")
+      const sessionID = SessionID.make("session_conditional_concurrent")
+      const asked = yield* ask({
+        id: requestID,
+        sessionID,
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      const [{ requestIncarnation }] = yield* hostedList()
+      let matched = 0
+      const settle = conditionalReply({
+        requestID,
+        sessionID,
+        requestIncarnation,
+        reply: "once",
+        matches: () => {
+          matched += 1
+          return true
+        },
+      }).pipe(Effect.exit)
+      const [left, right] = yield* Effect.all([settle, settle], { concurrency: "unbounded" })
+
+      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "applied")).toHaveLength(1)
+      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "mismatch")).toHaveLength(1)
+      expect(matched).toBe(1)
+      yield* Fiber.join(asked)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - duplicate live request ID cannot replace its incarnation",
+  () =>
+    Effect.gen(function* () {
+      const requestID = PermissionV1.ID.make("per_duplicate_live")
+      const first = yield* ask({
+        id: requestID,
+        sessionID: SessionID.make("session_duplicate_first"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(1)
+      const [before] = yield* hostedList()
+
+      const duplicate = yield* ask({
+        id: requestID,
+        sessionID: SessionID.make("session_duplicate_second"),
+        permission: "edit",
+        patterns: ["file.ts"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.exit)
+      expect(Exit.isFailure(duplicate)).toBe(true)
+      const [after] = yield* hostedList()
+      expect(after.request.sessionID).toBe(before.request.sessionID)
+      expect(after.requestIncarnation).toBe(before.requestIncarnation)
+
+      yield* conditionalReply({
+        requestID,
+        sessionID: before.request.sessionID,
+        requestIncarnation: before.requestIncarnation,
+        reply: "once",
+        matches: () => true,
+      })
+      yield* Fiber.join(first)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "conditional reply - reject is scoped to one request",
+  () =>
+    Effect.gen(function* () {
+      const sessionID = SessionID.make("session_conditional_scoped")
+      const firstID = PermissionV1.ID.make("per_conditional_first")
+      const secondID = PermissionV1.ID.make("per_conditional_second")
+      const first = yield* ask({
+        id: firstID,
+        sessionID,
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      const second = yield* ask({
+        id: secondID,
+        sessionID,
+        permission: "edit",
+        patterns: ["file.ts"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(2)
+      const incarnations = new Map((yield* hostedList()).map((item) => [item.request.id, item.requestIncarnation]))
+      yield* conditionalReply({
+        requestID: firstID,
+        sessionID,
+        requestIncarnation: incarnations.get(firstID)!,
+        reply: "reject",
+        matches: () => true,
+      })
+
+      const firstExit = yield* Fiber.await(first)
+      expect(Exit.isFailure(firstExit)).toBe(true)
+      expect((yield* list()).map((request) => request.id)).toEqual([secondID])
+      yield* conditionalReply({
+        requestID: secondID,
+        sessionID,
+        requestIncarnation: incarnations.get(secondID)!,
+        reply: "once",
+        matches: () => true,
+      })
+      yield* Fiber.join(second)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "conditional reply - mismatched incarnation performs no effect",
+  () =>
+    Effect.gen(function* () {
+      const requestID = PermissionV1.ID.make("per_conditional_mismatch")
+      const sessionID = SessionID.make("session_conditional_mismatch")
+      const asked = yield* ask({
+        id: requestID,
+        sessionID,
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      yield* waitForPending(1)
+      const [{ requestIncarnation }] = yield* hostedList()
+      const mismatch = yield* conditionalReply({
+        requestID,
+        sessionID,
+        requestIncarnation,
+        reply: "once",
+        matches: () => false,
+      })
+      expect(mismatch.status).toBe("mismatch")
+      expect((yield* list()).map((request) => request.id)).toEqual([requestID])
+
+      yield* conditionalReply({ requestID, sessionID, requestIncarnation, reply: "once", matches: () => true })
+      yield* Fiber.join(asked)
     }),
   { git: true },
 )
