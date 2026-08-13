@@ -1,0 +1,204 @@
+name: hardened CLI prerelease
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/hardened-cli-release.yml
+      - .github/scripts/hardened-artifacts.ts
+      - .github/scripts/hardened-artifacts.test.ts
+      - .github/hardened/**
+
+concurrency:
+  group: hardened-cli-v1.18.4-agentteams.1
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_COMMIT: 1554487639c28df9eb294c93257ed52114aa24c5
+  BASE_COMMIT: 49c69c5ed3ccf706b61b3febb43c8aaff7f8325e
+  VERSION: 1.18.4-agentteams.1
+  TAG: v1.18.4-agentteams.1
+  BUN_VERSION: 1.3.14
+  PATCH: .github/hardened/opencode-hosted-approval-v2-r3.patch
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: infra
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Verify immutable source, parent, patch, and resulting tree
+        run: bun infra/.github/scripts/hardened-artifacts.ts identity --repo source --patch "infra/$PATCH"
+
+  build:
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [one, two]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: infra
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: test "$(bun --version)" = "$BUN_VERSION"
+      - run: bun install --frozen-lockfile
+        working-directory: source
+      - name: Clean build
+        working-directory: source/packages/opencode
+        env:
+          OPENCODE_VERSION: ${{ env.VERSION }}
+          OPENCODE_RELEASE: ""
+        run: bun script/build.ts
+      - name: Create deterministic archives
+        run: bun infra/.github/scripts/hardened-artifacts.ts archive --dist source/packages/opencode/dist --output hardened-assets
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-build-${{ matrix.pass }}
+          path: hardened-assets
+          if-no-files-found: error
+          retention-days: 1
+
+  reproducible:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-build-one
+          path: build-one
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-build-two
+          path: build-two
+      - run: bun .github/scripts/hardened-artifacts.ts compare --left build-one --right build-two
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reproducible-assets
+          path: build-one
+          if-no-files-found: error
+          retention-days: 1
+
+  native-verify:
+    needs: reproducible
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: opencode-linux-x64.tar.gz
+          - runner: ubuntu-24.04-arm
+            asset: opencode-linux-arm64.tar.gz
+          - runner: macos-15-intel
+            asset: opencode-darwin-x64.zip
+          - runner: macos-14
+            asset: opencode-darwin-arm64.zip
+          - runner: windows-2025
+            asset: opencode-windows-x64.zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reproducible-assets
+          path: assets
+      - run: bun .github/scripts/hardened-artifacts.ts verify --archive "assets/${{ matrix.asset }}"
+
+  manifest:
+    needs: native-verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reproducible-assets
+          path: release
+      - run: bun .github/scripts/hardened-artifacts.ts manifest --assets release --patch "$PATCH" --output release/release-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-release-candidate
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  hardened-release:
+    needs: manifest
+    if: github.event_name == 'workflow_dispatch' && github.repository == '777genius/opencode-anomaly'
+    runs-on: ubuntu-24.04
+    environment: hardened-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          fetch-depth: 2
+          persist-credentials: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-release-candidate
+          path: release
+      - name: Refuse every existing tag, release, or asset collision
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          if git -C source ls-remote --exit-code --tags origin "refs/tags/$TAG"; then exit 1; fi
+          owner="${GITHUB_REPOSITORY%%/*}"
+          repository="${GITHUB_REPOSITORY#*/}"
+          existing="$(gh api graphql -f query='query($owner:String!,$repository:String!,$tag:String!){repository(owner:$owner,name:$repository){release(tagName:$tag){id releaseAssets(first:100){nodes{name}}}}}' -F owner="$owner" -F repository="$repository" -F tag="$TAG" --jq '.data.repository.release // empty')"
+          test -z "$existing"
+          test "$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
+      - name: Create exact-source draft prerelease without clobbering
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" release/* --draft --prerelease --target "$SOURCE_COMMIT" --title "$TAG" --notes "Hardened non-production prerelease. productionEligible=false."
