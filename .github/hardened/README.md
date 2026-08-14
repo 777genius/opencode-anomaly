@@ -3,7 +3,7 @@
 This directory freezes the reviewed patch used by the isolated hardened release
 workflow. The patch is applied to base commit
 `49c69c5ed3ccf706b61b3febb43c8aaff7f8325e`; its resulting tree must equal source
-commit `1554487639c28df9eb294c93257ed52114aa24c5`.
+commit `476b667c385210b19fbd15bcb57456cacb0ae9e7`.
 
 The workflow intentionally produces a draft prerelease that is never production
 eligible. It does not replace or modify the upstream publish workflow. Release

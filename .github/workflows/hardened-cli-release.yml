@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: 1554487639c28df9eb294c93257ed52114aa24c5
+  SOURCE_COMMIT: 476b667c385210b19fbd15bcb57456cacb0ae9e7
   BASE_COMMIT: 49c69c5ed3ccf706b61b3febb43c8aaff7f8325e
   VERSION: 1.18.4-agentteams.1
   TAG: v1.18.4-agentteams.1
@@ -36,13 +36,16 @@ jobs:
         with:
           ref: ${{ env.SOURCE_COMMIT }}
           path: source
-          fetch-depth: 2
+          fetch-depth: 3
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - name: Verify immutable source, parent, patch, and resulting tree
         run: bun infra/.github/scripts/hardened-artifacts.ts identity --repo source --patch "infra/$PATCH"
+      - name: Run hardened release contract tests
+        run: bun test ./.github/scripts/hardened-artifacts.test.ts
+        working-directory: infra
 
   build:
     needs: identity
@@ -152,7 +155,8 @@ jobs:
         with:
           name: reproducible-assets
           path: release
-      - run: bun .github/scripts/hardened-artifacts.ts manifest --assets release --patch "$PATCH" --output release/release-manifest.json
+      - run: bun .github/scripts/hardened-artifacts.ts manifest --assets release --patch "$PATCH" --schema .github/hardened/release-manifest.schema.json --output release/release-manifest.json
+      - run: bun .github/scripts/hardened-artifacts.ts validate-manifest --manifest release/release-manifest.json --schema .github/hardened/release-manifest.schema.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hardened-release-candidate
@@ -178,7 +182,7 @@ jobs:
           ref: ${{ env.SOURCE_COMMIT }}
           path: source
           fetch-depth: 2
-          persist-credentials: true
+          persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: hardened-release-candidate
@@ -188,11 +192,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
-          if git -C source ls-remote --exit-code --tags origin "refs/tags/$TAG"; then exit 1; fi
-          owner="${GITHUB_REPOSITORY%%/*}"
-          repository="${GITHUB_REPOSITORY#*/}"
-          existing="$(gh api graphql -f query='query($owner:String!,$repository:String!,$tag:String!){repository(owner:$owner,name:$repository){release(tagName:$tag){id releaseAssets(first:100){nodes{name}}}}}' -F owner="$owner" -F repository="$repository" -F tag="$TAG" --jq '.data.repository.release // empty')"
-          test -z "$existing"
+          require_absent() {
+            response="$(mktemp)"
+            if gh api --include "$1" >"$response" 2>&1; then
+              cat "$response"
+              return 1
+            fi
+            if ! grep -Eq '^HTTP/[0-9.]+ 404' "$response"; then
+              cat "$response"
+              return 1
+            fi
+          }
+          require_absent "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"
+          require_absent "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
           test "$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:

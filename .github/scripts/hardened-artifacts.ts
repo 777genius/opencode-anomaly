@@ -5,10 +5,10 @@ import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/pr
 import path from "node:path"
 
 export const RELEASE = {
-  sourceCommit: "1554487639c28df9eb294c93257ed52114aa24c5",
-  sourceTree: "d9c931acf04736d065a108115bd71c6e6721bf65",
+  sourceCommit: "476b667c385210b19fbd15bcb57456cacb0ae9e7",
+  sourceTree: "122dd7d77fd01f1a054ac52666a1e9a8a5529dcb",
   baseCommit: "49c69c5ed3ccf706b61b3febb43c8aaff7f8325e",
-  patchSha256: "1c80d32f7ad745e97abb7298b69a01062e22c88a3ccd5837cfbcff84e8edc506",
+  patchSha256: "dbd8b2c1eda38043e3bfc9e2b809f4ef393fa075349ed219109a7deaca0c590e",
   version: "1.18.4-agentteams.1",
   tag: "v1.18.4-agentteams.1",
   bunVersion: "1.3.14",
@@ -60,14 +60,13 @@ const run = (command: string[], cwd = process.cwd()) => {
 
 const requireValue = (args: string[], flag: string) => {
   const index = args.indexOf(flag)
-  if (index === -1 || !args[index + 1]) fail(`missing ${flag}`)
-  return args[index + 1]
+  return index === -1 || !args[index + 1] ? fail(`missing ${flag}`) : args[index + 1]
 }
 
 export const validateConstants = () => {
   if (RELEASE.productionEligible !== false) fail("productionEligible must remain hardcoded false")
   if (RELEASE.tag !== `v${RELEASE.version}`) fail("tag/version mismatch")
-  for (const key of ["sourceCommit", "baseCommit"] as const) {
+  for (const key of ["sourceCommit", "sourceTree", "baseCommit"] as const) {
     if (!/^[0-9a-f]{40}$/.test(RELEASE[key])) fail(`invalid ${key}`)
   }
   if (!/^[0-9a-f]{64}$/.test(RELEASE.patchSha256)) fail("invalid patchSha256")
@@ -81,8 +80,8 @@ const identity = async (args: string[]) => {
   if ((await sha256(patch)) !== RELEASE.patchSha256) fail("immutable patch SHA-256 mismatch")
   if (run(["git", "rev-parse", "HEAD"], repository) !== RELEASE.sourceCommit)
     fail("checkout is not exact source commit")
-  if (run(["git", "rev-parse", "HEAD^"], repository) !== RELEASE.baseCommit)
-    fail("source parent is not exact base commit")
+  if (run(["git", "merge-base", RELEASE.baseCommit, RELEASE.sourceCommit], repository) !== RELEASE.baseCommit)
+    fail("source does not descend from exact base commit")
 
   const temporary = await Bun.$`mktemp -d`.text().then((value) => value.trim())
   try {
@@ -103,7 +102,7 @@ const identity = async (args: string[]) => {
   }
 }
 
-const archive = async (args: string[]) => {
+export const archive = async (args: string[]) => {
   validateConstants()
   const dist = path.resolve(requireValue(args, "--dist"))
   const output = path.resolve(requireValue(args, "--output"))
@@ -128,7 +127,8 @@ const archive = async (args: string[]) => {
       ])
       continue
     }
-    // bsdtar/libarchive emits stable ZIP metadata when the input mtime is fixed.
+    // Info-ZIP omits extra metadata with -X and emits stable timestamps when the input mtime is fixed.
+    await rm(target, { force: true })
     run(["touch", "-t", "198001010000", binary])
     run(["zip", "-X", "-q", target, path.basename(binary)], path.dirname(binary))
   }
@@ -255,7 +255,81 @@ const manifest = async (args: string[]) => {
     },
     assets,
   }
+  await validateReleaseManifest(
+    result,
+    path.resolve(args.includes("--schema") ? requireValue(args, "--schema") : schemaFile),
+  )
   await writeFile(output, `${JSON.stringify(result, null, 2)}\n`, { flag: "wx" })
+}
+
+type JsonSchema = {
+  type?: string
+  const?: unknown
+  enum?: unknown[]
+  required?: string[]
+  properties?: Record<string, JsonSchema>
+  additionalProperties?: boolean
+  minItems?: number
+  maxItems?: number
+  items?: JsonSchema
+  pattern?: string
+  exclusiveMinimum?: number
+}
+
+const schemaFile = new URL("../hardened/release-manifest.schema.json", import.meta.url).pathname
+
+const valueType = (value: unknown) => {
+  if (Array.isArray(value)) return "array"
+  if (value === null) return "null"
+  if (Number.isInteger(value)) return "integer"
+  return typeof value
+}
+
+const validateSchemaNode = (schema: JsonSchema, value: unknown, location = "$"): void => {
+  if (schema.const !== undefined && !Object.is(value, schema.const)) fail(`${location} must equal its schema constant`)
+  if (schema.enum && !schema.enum.some((item) => Object.is(item, value))) fail(`${location} is not in its schema enum`)
+  if (schema.type) {
+    const actual = valueType(value)
+    if (actual !== schema.type && !(schema.type === "number" && actual === "integer")) {
+      fail(`${location} must be ${schema.type}, got ${actual}`)
+    }
+  }
+  if (typeof value === "string" && schema.pattern && !new RegExp(schema.pattern).test(value)) {
+    fail(`${location} does not match ${schema.pattern}`)
+  }
+  if (typeof value === "number" && schema.exclusiveMinimum !== undefined && value <= schema.exclusiveMinimum) {
+    fail(`${location} must be greater than ${schema.exclusiveMinimum}`)
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) fail(`${location} has too few items`)
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) fail(`${location} has too many items`)
+    if (schema.items) value.forEach((item, index) => validateSchemaNode(schema.items!, item, `${location}[${index}]`))
+  }
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>
+    for (const key of schema.required ?? []) {
+      if (!Object.hasOwn(record, key)) fail(`${location}.${key} is required`)
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(record)) {
+        if (!Object.hasOwn(schema.properties ?? {}, key)) fail(`${location}.${key} is not allowed`)
+      }
+    }
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      if (Object.hasOwn(record, key)) validateSchemaNode(child, record[key], `${location}.${key}`)
+    }
+  }
+}
+
+export const validateReleaseManifest = async (value: unknown, schemaPath = schemaFile) => {
+  const schema = JSON.parse(await readFile(schemaPath, "utf8")) as JsonSchema
+  validateSchemaNode(schema, value)
+}
+
+const validateManifest = async (args: string[]) => {
+  const manifestPath = path.resolve(requireValue(args, "--manifest"))
+  const schemaPath = path.resolve(requireValue(args, "--schema"))
+  await validateReleaseManifest(JSON.parse(await readFile(manifestPath, "utf8")), schemaPath)
 }
 
 const main = async () => {
@@ -265,6 +339,7 @@ const main = async () => {
   if (command === "compare") return compare(args)
   if (command === "verify") return verify(args)
   if (command === "manifest") return manifest(args)
+  if (command === "validate-manifest") return validateManifest(args)
   fail(`unknown command: ${command ?? "<missing>"}`)
 }
 

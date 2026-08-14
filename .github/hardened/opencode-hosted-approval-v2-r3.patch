@@ -1,6 +1,6 @@
 diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
 new file mode 100644
-index 0000000..ab8ddf3
+index 0000000000000000000000000000000000000000..ab8ddf33bde5c1c9186fcb1db66b04e387ab6c56
 --- /dev/null
 +++ b/packages/opencode/docs/hosted-approval-v2.md
 @@ -0,0 +1,32 @@
@@ -36,12 +36,112 @@ index 0000000..ab8ddf3
 +
 +- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
 +- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
+diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
+index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1ee6ef29d 100644
+--- a/packages/opencode/src/config/config.ts
++++ b/packages/opencode/src/config/config.ts
+@@ -18,7 +18,7 @@ import { isRecord } from "@/util/record"
+ import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import { InstanceState } from "@/effect/instance-state"
+-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
++import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Semaphore } from "effect"
+ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
+ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+ import { containsPath, type InstanceContext } from "../project/instance-context"
+@@ -181,6 +181,15 @@ const layer = Layer.effect(
+     const env = yield* Env.Service
+     const npmSvc = yield* Npm.Service
+     const http = yield* HttpClient.HttpClient
++    const writeLocks = new Map<string, Semaphore.Semaphore>()
++
++    const writeLock = (file: string) => {
++      const hit = writeLocks.get(file)
++      if (hit) return hit
++      const next = Semaphore.makeUnsafe(1)
++      writeLocks.set(file, next)
++      return next
++    }
+ 
+     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
+ 
+@@ -624,10 +633,14 @@ const layer = Layer.effect(
+     const update = Effect.fn("Config.update")(function* (config: Info) {
+       const dir = yield* InstanceState.directory
+       const file = path.join(dir, "config.json")
+-      const existing = yield* loadFile(file)
+-      yield* fs
+-        .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
+-        .pipe(Effect.orDie)
++      yield* writeLock(file).withPermit(
++        Effect.gen(function* () {
++          const existing = yield* loadFile(file)
++          yield* fs
++            .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
++            .pipe(Effect.orDie)
++        }),
++      )
+     })
+ 
+     const invalidate = Effect.fn("Config.invalidate")(function* () {
+@@ -636,27 +649,31 @@ const layer = Layer.effect(
+ 
+     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
+       const file = globalConfigFile()
+-      const before = (yield* readConfigFile(file)) ?? "{}"
+-      const patch = writableGlobal(config)
+-
+-      let next: Info
+-      let changed: boolean
+-      if (!file.endsWith(".jsonc")) {
+-        const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
+-        const merged = mergeDeep(writable(existing), patch)
+-        const serialized = JSON.stringify(merged, null, 2)
+-        changed = serialized !== before
+-        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
+-        next = merged
+-      } else {
+-        const updated = patchJsonc(before, patch)
+-        next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
+-        changed = updated !== before
+-        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
+-      }
++      return yield* writeLock(file).withPermit(
++        Effect.gen(function* () {
++          const before = (yield* readConfigFile(file)) ?? "{}"
++          const patch = writableGlobal(config)
++
++          let next: Info
++          let changed: boolean
++          if (!file.endsWith(".jsonc")) {
++            const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
++            const merged = mergeDeep(writable(existing), patch)
++            const serialized = JSON.stringify(merged, null, 2)
++            changed = serialized !== before
++            if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
++            next = merged
++          } else {
++            const updated = patchJsonc(before, patch)
++            next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
++            changed = updated !== before
++            if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
++          }
+ 
+-      if (changed) yield* invalidate()
+-      return { info: next, changed }
++          if (changed) yield* invalidate()
++          return { info: next, changed }
++        }),
++      )
+     })
+ 
+     return Service.of({
 diff --git a/packages/opencode/src/hosted-approval/coordinator.ts b/packages/opencode/src/hosted-approval/coordinator.ts
 new file mode 100644
-index 0000000..a819760
+index 0000000000000000000000000000000000000000..bc3fbbb4f24cccb90247376e182736f57f202d63
 --- /dev/null
 +++ b/packages/opencode/src/hosted-approval/coordinator.ts
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,63 @@
 +import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 +import { Context, Effect, Layer, Semaphore } from "effect"
 +import { randomUUID } from "node:crypto"
@@ -70,26 +170,30 @@ index 0000000..a819760
 +  return Layer.succeed(
 +    Service,
 +    (() => {
-+    const mutex = Semaphore.makeUnsafe(1)
-+    const runtimeInstanceId = token("runtime_instance")
-+    let configGeneration = token("config_generation")
-+    const service: Interface = {
-+      snapshot: () => ({ runtimeInstanceId, configGeneration }),
-+      withConfigMutation: (effect, changed = () => true) =>
-+        Effect.uninterruptible(
-+          mutex.withPermit(
++      const mutex = Semaphore.makeUnsafe(1)
++      const runtimeInstanceId = token("runtime_instance")
++      let configGeneration = token("config_generation")
++      const service: Interface = {
++        snapshot: () => ({ runtimeInstanceId, configGeneration }),
++        withConfigMutation: (effect, changed = () => true) =>
++          Effect.uninterruptibleMask((restore) =>
 +            Effect.gen(function* () {
-+              const result = yield* effect
-+              // All hosted observations take this lock, so replacement occurs
-+              // before a successful mutation becomes observable to the protocol.
-+              if (changed(result)) configGeneration = token("config_generation")
++              // Config I/O remains interruptible and does not hold the process
++              // coordinator. Only the generation's linearization point is shared.
++              const result = yield* restore(effect)
++              if (changed(result)) {
++                yield* mutex.withPermit(
++                  Effect.sync(() => {
++                    configGeneration = token("config_generation")
++                  }),
++                )
++              }
 +              return result
 +            }),
 +          ),
-+        ),
-+      withConditionalReply: (effect) => mutex.withPermit(effect),
-+    }
-+    return Service.of(service)
++        withConditionalReply: (effect) => mutex.withPermit(effect),
++      }
++      return Service.of(service)
 +    })(),
 +  )
 +}
@@ -103,10 +207,10 @@ index 0000000..a819760
 +export const HostedApprovalCoordinator = { Service, layer, makeTestLayer, node }
 diff --git a/packages/opencode/src/hosted-approval/protocol.ts b/packages/opencode/src/hosted-approval/protocol.ts
 new file mode 100644
-index 0000000..0f7cc01
+index 0000000000000000000000000000000000000000..b37e769f07e1f6fbe2ffa14f7b6e562e115be395
 --- /dev/null
 +++ b/packages/opencode/src/hosted-approval/protocol.ts
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,26 @@
 +import { createHash } from "node:crypto"
 +
 +export const protocol = "agent-teams-hosted-approval-v2" as const
@@ -117,11 +221,10 @@ index 0000000..0f7cc01
 +    if (encoded === undefined) throw new TypeError("Unsupported hosted approval canonical value")
 +    return encoded
 +  }
-+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
++  if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(",")}]`
 +  if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
 +  const record = value as Record<string, unknown>
 +  return `{${Object.keys(record)
-+    .filter((key) => record[key] !== undefined)
 +    .sort()
 +    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
 +    .join(",")}}`
@@ -135,7 +238,7 @@ index 0000000..0f7cc01
 +  return JSON.parse(JSON.stringify(value)) as T
 +}
 diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
-index 2e27ff2..09e4a40 100644
+index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..09e4a40bd2d6167053479a8badaed81edc86aadb 100644
 --- a/packages/opencode/src/permission/index.ts
 +++ b/packages/opencode/src/permission/index.ts
 @@ -2,21 +2,52 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -492,7 +595,7 @@ index 2e27ff2..09e4a40 100644
  
  export * as Permission from "."
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
-index 79959db..d85de71 100644
+index 79959db499bd12a359ac84a9a189faebc84c016e..de13fa0210b6abce51bb44714b36d0bc3d43936e 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
 @@ -8,6 +8,70 @@ import { InstanceContextMiddleware } from "../middleware/instance-context"
@@ -579,7 +682,7 @@ index 79959db..d85de71 100644
 +          params: { sessionID: Schema.String },
 +          query: WorkspaceRoutingQuery,
 +          success: HostedObserve,
-+          error: Schema.Union([HostedUnavailableError, HttpApiError.InternalServerError]),
++          error: [HostedUnavailableError, HttpApiError.InternalServerError],
 +        }),
 +        HttpApiEndpoint.post("hostedReply", "/experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply", {
 +          params: { sessionID: Schema.String, requestID: PermissionV1.ID },
@@ -592,7 +695,7 @@ index 79959db..d85de71 100644
            query: WorkspaceRoutingQuery,
            success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
-index 3d0e8a0..0ba6cd5 100644
+index 3d0e8a06c09c6b3a2366b521ff05f7eaca63eff8..0ba6cd511d057757c30a53925cd8b37c8b81fb18 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
 @@ -5,19 +5,25 @@ import { Effect } from "effect"
@@ -624,7 +727,7 @@ index 3d0e8a0..0ba6cd5 100644
      })
  
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-index c1f588d..09f55ad 100644
+index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc93197d13f 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
 @@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -653,10 +756,10 @@ index c1f588d..09f55ad 100644
        return result.info
      })
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
-index cdb8849..a31bb57 100644
+index cdb88490605f1311f02a7d8d0c69806a21ddc514..34f93d917393437a83879b817531f550a15b5d38 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
-@@ -1,13 +1,251 @@
+@@ -1,13 +1,253 @@
  import { PermissionV1 } from "@opencode-ai/core/v1/permission"
  import { Permission } from "@/permission"
  import { Effect } from "effect"
@@ -769,15 +872,12 @@ index cdb8849..a31bb57 100644
 +    const serverAuth = yield* ServerAuth.Config
 +
 +    const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
-+      if (!ServerAuth.required(serverAuth)) {
-+        return { unavailable: HttpServerResponse.empty({ status: 404 }) } as const
-+      }
-+      return { unavailable: undefined } as const
++      if (!ServerAuth.required(serverAuth)) return yield* new HostedUnavailableError()
++      return yield* Effect.void
 +    })
 +
 +    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
-+      const availability = yield* requireHosted()
-+      if (availability.unavailable) return availability.unavailable
++      yield* requireHosted()
 +      return yield* hostedApproval.withConditionalReply(
 +        Effect.sync(() => ({
 +          schemaVersion: 2 as const,
@@ -791,8 +891,7 @@ index cdb8849..a31bb57 100644
 +    const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
 +      params: { sessionID: string }
 +    }) {
-+      const availability = yield* requireHosted()
-+      if (availability.unavailable) return availability.unavailable
++      yield* requireHosted()
 +      return yield* hostedApproval.withConditionalReply(
 +        Effect.gen(function* () {
 +          const snapshot = hostedApproval.snapshot()
@@ -809,7 +908,6 @@ index cdb8849..a31bb57 100644
 +                rawPermission: raw,
 +              }
 +            })
-+          if (permissions.length > 256) return yield* new HttpApiError.InternalServerError()
 +          const response = {
 +            schemaVersion: 2 as const,
 +            protocol,
@@ -817,7 +915,13 @@ index cdb8849..a31bb57 100644
 +            sessionId: ctx.params.sessionID,
 +            permissions,
 +          }
-+          if (Buffer.byteLength(JSON.stringify(response), "utf8") > 1024 * 1024) {
++          const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
++          if (permissions.length > 256 || bytes > 1024 * 1024) {
++            yield* Effect.logWarning("hosted approval observe overflow", {
++              sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
++              droppedCount: permissions.length,
++              droppedBytes: bytes,
++            })
 +            return yield* new HttpApiError.InternalServerError()
 +          }
 +          return response
@@ -829,8 +933,7 @@ index cdb8849..a31bb57 100644
 +      params: { sessionID: string; requestID: PermissionV1.ID }
 +      payload: typeof HostedReplyPayload.Type
 +    }) {
-+      const availability = yield* requireHosted()
-+      if (availability.unavailable) return availability.unavailable
++      yield* requireHosted()
 +      if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
 +        return yield* new HttpApiError.BadRequest()
 +      }
@@ -870,8 +973,10 @@ index cdb8849..a31bb57 100644
 +      params: { sessionID: string; requestID: PermissionV1.ID }
 +      request: HttpServerRequest.HttpServerRequest
 +    }) {
-+      const availability = yield* requireHosted()
-+      if (availability.unavailable) return availability.unavailable
++      const unavailable = yield* requireHosted().pipe(
++        Effect.match({ onFailure: () => true, onSuccess: () => false }),
++      )
++      if (unavailable) return HttpServerResponse.empty({ status: 404 })
 +      const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
 +        Effect.catch(() => Effect.succeed(undefined)),
 +      )
@@ -909,7 +1014,7 @@ index cdb8849..a31bb57 100644
  
      const list = Effect.fn("PermissionHttpApi.list")(function* () {
        return yield* svc.list()
-@@ -36,6 +274,11 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
+@@ -36,6 +276,11 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
        return true
      })
  
@@ -923,7 +1028,7 @@ index cdb8849..a31bb57 100644
    }),
  )
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/server.ts b/packages/opencode/src/server/routes/instance/httpapi/server.ts
-index fb9d2db..d942753 100644
+index fb9d2db65621540a514786f2061714f16b6c766c..d942753d204268d24d53a36804cd832ff6f884f5 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/server.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/server.ts
 @@ -49,6 +49,7 @@ import { ToolRegistry } from "@/tool/registry"
@@ -959,17 +1064,44 @@ index fb9d2db..d942753 100644
    EventV2Bridge.node,
    SessionRunState.node,
    SessionProcessor.node,
+diff --git a/packages/opencode/test/config/config.test.ts b/packages/opencode/test/config/config.test.ts
+index e281831ddfa8e09a70ddb37076b02dbf252701fc..2f3fa6f841dfeeb3f1044b0ff4a9125f26094996 100644
+--- a/packages/opencode/test/config/config.test.ts
++++ b/packages/opencode/test/config/config.test.ts
+@@ -371,6 +371,22 @@ it.instance("updates config and preserves empty shell sentinel", () =>
+   }),
+ )
+ 
++it.instance("serializes concurrent updates to the same config file", () =>
++  Effect.gen(function* () {
++    const test = yield* TestInstance
++    const config = yield* Config.Service
++    yield* Effect.all(
++      [config.update({ model: "test/model" }), config.update({ username: "test-user" })],
++      { concurrency: "unbounded" },
++    )
++
++    expect(yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))).toMatchObject({
++      model: "test/model",
++      username: "test-user",
++    })
++  }),
++)
++
+ it.effect("updates global config and omits empty shell key in json", () =>
+   withGlobalConfig({ config: { shell: "bash" } }, ({ dir }) =>
+     Effect.gen(function* () {
 diff --git a/packages/opencode/test/hosted-approval/coordinator.test.ts b/packages/opencode/test/hosted-approval/coordinator.test.ts
 new file mode 100644
-index 0000000..783f9c2
+index 0000000000000000000000000000000000000000..da099bdb34ca2b13345a369a89f57dd8bb34cc51
 --- /dev/null
 +++ b/packages/opencode/test/hosted-approval/coordinator.test.ts
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,130 @@
 +import { expect, test } from "bun:test"
 +import { Deferred, Effect, Fiber } from "effect"
 +import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
 +
-+test("coordinator uses process-unique tokens and rotates generation before mutation", async () => {
++test("coordinator uses process-unique tokens and rotates generation after mutation", async () => {
 +  const result = await Effect.gen(function* () {
 +    const coordinator = yield* HostedApprovalCoordinator.Service
 +    const before = coordinator.snapshot()
@@ -1019,30 +1151,88 @@ index 0000000..783f9c2
 +test("cancellation cannot split a committed mutation from generation rotation", async () => {
 +  const result = await Effect.gen(function* () {
 +    const coordinator = yield* HostedApprovalCoordinator.Service
++    const locked = yield* Deferred.make<void>()
++    const unlock = yield* Deferred.make<void>()
 +    const committed = yield* Deferred.make<void>()
-+    const release = yield* Deferred.make<void>()
 +    const before = coordinator.snapshot().configGeneration
++    const lock = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(locked, undefined)
++        yield* Deferred.await(unlock)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(locked)
 +    const fiber = yield* coordinator.withConfigMutation(
 +      Effect.gen(function* () {
 +        yield* Deferred.succeed(committed, undefined)
-+        yield* Deferred.await(release)
 +        return true
 +      }),
 +    ).pipe(Effect.forkScoped)
 +    yield* Deferred.await(committed)
 +    yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped)
-+    yield* Deferred.succeed(release, undefined)
++    yield* Deferred.succeed(unlock, undefined)
++    yield* Fiber.await(lock)
 +    yield* Fiber.await(fiber)
 +    return { before, after: coordinator.snapshot().configGeneration }
 +  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
 +  expect(result.after).not.toBe(result.before)
 +})
++
++test("config work does not hold the process coordinator", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const started = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const before = coordinator.snapshot().configGeneration
++    const mutation = yield* coordinator.withConfigMutation(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(started, undefined)
++        yield* Deferred.await(release)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(started)
++    const during = yield* coordinator.withConditionalReply(
++      Effect.sync(() => coordinator.snapshot().configGeneration),
++    ).pipe(Effect.timeout("250 millis"))
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(mutation)
++    return { before, during, after: coordinator.snapshot().configGeneration }
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(result.during).toBe(result.before)
++  expect(result.after).not.toBe(result.before)
++})
++
++test("conditional operations remain single-writer atomic", async () => {
++  const order = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const entered = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const values: string[] = []
++    const first = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        values.push("first-enter")
++        yield* Deferred.succeed(entered, undefined)
++        yield* Deferred.await(release)
++        values.push("first-exit")
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(entered)
++    const second = yield* coordinator.withConditionalReply(
++      Effect.sync(() => values.push("second")),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(first)
++    yield* Fiber.join(second)
++    return values
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(order).toEqual(["first-enter", "first-exit", "second"])
++})
 diff --git a/packages/opencode/test/hosted-approval/protocol.test.ts b/packages/opencode/test/hosted-approval/protocol.test.ts
 new file mode 100644
-index 0000000..2662522
+index 0000000000000000000000000000000000000000..66f91bf650a5d10bbb338c84982cefdd7a44c5e3
 --- /dev/null
 +++ b/packages/opencode/test/hosted-approval/protocol.test.ts
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,61 @@
 +import { describe, expect, test } from "bun:test"
 +import { canonicalJson, digest, rawPermission } from "../../src/hosted-approval/protocol"
 +import { readHostedReplyBody } from "../../src/server/routes/instance/httpapi/handlers/permission"
@@ -1080,6 +1270,17 @@ index 0000000..2662522
 +  test("rejects unsupported canonical values", () => {
 +    expect(() => canonicalJson({ value: BigInt(1) })).toThrow("Unsupported hosted approval canonical value")
 +  })
++
++  test("rejects undefined at every nesting position", () => {
++    const sparse: unknown[] = []
++    sparse.length = 1
++    expect(() => canonicalJson(undefined)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson([undefined])).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson(sparse)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson({ nested: { value: undefined } })).toThrow(
++      "Unsupported hosted approval canonical value",
++    )
++  })
 +})
 +
 +test("bounded request reader stops before consuming chunks after the limit", async () => {
@@ -1094,7 +1295,7 @@ index 0000000..2662522
 +  expect(consumed).toBe(2)
 +})
 diff --git a/packages/opencode/test/permission/next.test.ts b/packages/opencode/test/permission/next.test.ts
-index 2f2ce98..7ee5651 100644
+index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..7ee5651c9ff74a4dfaec704db2f6eb10e40052b6 100644
 --- a/packages/opencode/test/permission/next.test.ts
 +++ b/packages/opencode/test/permission/next.test.ts
 @@ -68,12 +68,24 @@ const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
@@ -1298,7 +1499,7 @@ index 2f2ce98..7ee5651 100644
    "reply - reject with message throws CorrectedError",
    () =>
 diff --git a/packages/opencode/test/server/httpapi-control-plane.test.ts b/packages/opencode/test/server/httpapi-control-plane.test.ts
-index b837bf7..ca97867 100644
+index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240924f4be3 100644
 --- a/packages/opencode/test/server/httpapi-control-plane.test.ts
 +++ b/packages/opencode/test/server/httpapi-control-plane.test.ts
 @@ -17,6 +17,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
@@ -1318,7 +1519,7 @@ index b837bf7..ca97867 100644
      // Raw HttpApi routes expose an opaque handler context at the request boundary.
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
-index bcbe7ae..5651f16 100644
+index bcbe7aecbba4dca653d83c81658d3d08ff08f846..5651f16b50c72f3dd557e112751a258bdd1d1f30 100644
 --- a/packages/opencode/test/server/httpapi-global.test.ts
 +++ b/packages/opencode/test/server/httpapi-global.test.ts
 @@ -16,10 +16,12 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
@@ -1336,10 +1537,10 @@ index bcbe7ae..5651f16 100644
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
 new file mode 100644
-index 0000000..fcf8189
+index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf7bfc38a7
 --- /dev/null
 +++ b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
-@@ -0,0 +1,139 @@
+@@ -0,0 +1,157 @@
 +import { afterEach, describe, expect, test } from "bun:test"
 +import { ConfigProvider, Layer } from "effect"
 +import { HttpRouter } from "effect/unstable/http"
@@ -1369,6 +1570,24 @@ index 0000000..fcf8189
 +})
 +
 +describe("hosted approval v2 HttpApi", () => {
++  test("maps unavailable capability and observe errors through their declared response contract", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app()
++    const headers = { "x-opencode-directory": dir.path }
++    const capability = await request("/experimental/agent-teams/hosted-approval-capability", { headers })
++    const observe = await request(
++      "/experimental/agent-teams/hosted-approval/session/ses_missing/permissions",
++      { headers },
++    )
++    const observeBody = await observe.text()
++    expect(capability.status).toBe(404)
++    expect(await capability.json()).toEqual({ _tag: "HostedApprovalUnavailable" })
++    expect({ status: observe.status, body: observeBody }).toEqual({
++      status: 404,
++      body: JSON.stringify({ _tag: "HostedApprovalUnavailable" }),
++    })
++  })
++
 +  test("is unavailable before reading malformed bodies when server auth is absent", async () => {
 +    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
 +    const request = app()
