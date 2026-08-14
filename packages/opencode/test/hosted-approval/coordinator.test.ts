@@ -2,7 +2,7 @@ import { expect, test } from "bun:test"
 import { Deferred, Effect, Fiber } from "effect"
 import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
 
-test("coordinator uses process-unique tokens and rotates generation before mutation", async () => {
+test("coordinator uses process-unique tokens and rotates generation after mutation", async () => {
   const result = await Effect.gen(function* () {
     const coordinator = yield* HostedApprovalCoordinator.Service
     const before = coordinator.snapshot()
@@ -52,21 +52,79 @@ test("all providers of the production layer share one process authority", async 
 test("cancellation cannot split a committed mutation from generation rotation", async () => {
   const result = await Effect.gen(function* () {
     const coordinator = yield* HostedApprovalCoordinator.Service
+    const locked = yield* Deferred.make<void>()
+    const unlock = yield* Deferred.make<void>()
     const committed = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
     const before = coordinator.snapshot().configGeneration
+    const lock = yield* coordinator.withConditionalReply(
+      Effect.gen(function* () {
+        yield* Deferred.succeed(locked, undefined)
+        yield* Deferred.await(unlock)
+      }),
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.await(locked)
     const fiber = yield* coordinator.withConfigMutation(
       Effect.gen(function* () {
         yield* Deferred.succeed(committed, undefined)
-        yield* Deferred.await(release)
         return true
       }),
     ).pipe(Effect.forkScoped)
     yield* Deferred.await(committed)
     yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped)
-    yield* Deferred.succeed(release, undefined)
+    yield* Deferred.succeed(unlock, undefined)
+    yield* Fiber.await(lock)
     yield* Fiber.await(fiber)
     return { before, after: coordinator.snapshot().configGeneration }
   }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
   expect(result.after).not.toBe(result.before)
+})
+
+test("config work does not hold the process coordinator", async () => {
+  const result = await Effect.gen(function* () {
+    const coordinator = yield* HostedApprovalCoordinator.Service
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const before = coordinator.snapshot().configGeneration
+    const mutation = yield* coordinator.withConfigMutation(
+      Effect.gen(function* () {
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+      }),
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    const during = yield* coordinator.withConditionalReply(
+      Effect.sync(() => coordinator.snapshot().configGeneration),
+    ).pipe(Effect.timeout("250 millis"))
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(mutation)
+    return { before, during, after: coordinator.snapshot().configGeneration }
+  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
+  expect(result.during).toBe(result.before)
+  expect(result.after).not.toBe(result.before)
+})
+
+test("conditional operations remain single-writer atomic", async () => {
+  const order = await Effect.gen(function* () {
+    const coordinator = yield* HostedApprovalCoordinator.Service
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const values: string[] = []
+    const first = yield* coordinator.withConditionalReply(
+      Effect.gen(function* () {
+        values.push("first-enter")
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+        values.push("first-exit")
+      }),
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.await(entered)
+    const second = yield* coordinator.withConditionalReply(
+      Effect.sync(() => values.push("second")),
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.succeed(release, undefined)
+    yield* Fiber.join(first)
+    yield* Fiber.join(second)
+    return values
+  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
+  expect(order).toEqual(["first-enter", "first-exit", "second"])
 })

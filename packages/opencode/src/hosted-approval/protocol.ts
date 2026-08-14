@@ -8,11 +8,10 @@ export function canonicalJson(value: unknown): string {
     if (encoded === undefined) throw new TypeError("Unsupported hosted approval canonical value")
     return encoded
   }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+  if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(",")}]`
   if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
   const record = value as Record<string, unknown>
   return `{${Object.keys(record)
-    .filter((key) => record[key] !== undefined)
     .sort()
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(",")}}`

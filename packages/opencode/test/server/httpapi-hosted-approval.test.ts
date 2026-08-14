@@ -27,6 +27,24 @@ afterEach(async () => {
 })
 
 describe("hosted approval v2 HttpApi", () => {
+  test("maps unavailable capability and observe errors through their declared response contract", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const request = app()
+    const headers = { "x-opencode-directory": dir.path }
+    const capability = await request("/experimental/agent-teams/hosted-approval-capability", { headers })
+    const observe = await request(
+      "/experimental/agent-teams/hosted-approval/session/ses_missing/permissions",
+      { headers },
+    )
+    const observeBody = await observe.text()
+    expect(capability.status).toBe(404)
+    expect(await capability.json()).toEqual({ _tag: "HostedApprovalUnavailable" })
+    expect({ status: observe.status, body: observeBody }).toEqual({
+      status: 404,
+      body: JSON.stringify({ _tag: "HostedApprovalUnavailable" }),
+    })
+  })
+
   test("is unavailable before reading malformed bodies when server auth is absent", async () => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const request = app()

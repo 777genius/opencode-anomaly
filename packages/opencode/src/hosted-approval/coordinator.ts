@@ -26,26 +26,30 @@ export function makeTestLayer() {
   return Layer.succeed(
     Service,
     (() => {
-    const mutex = Semaphore.makeUnsafe(1)
-    const runtimeInstanceId = token("runtime_instance")
-    let configGeneration = token("config_generation")
-    const service: Interface = {
-      snapshot: () => ({ runtimeInstanceId, configGeneration }),
-      withConfigMutation: (effect, changed = () => true) =>
-        Effect.uninterruptible(
-          mutex.withPermit(
+      const mutex = Semaphore.makeUnsafe(1)
+      const runtimeInstanceId = token("runtime_instance")
+      let configGeneration = token("config_generation")
+      const service: Interface = {
+        snapshot: () => ({ runtimeInstanceId, configGeneration }),
+        withConfigMutation: (effect, changed = () => true) =>
+          Effect.uninterruptibleMask((restore) =>
             Effect.gen(function* () {
-              const result = yield* effect
-              // All hosted observations take this lock, so replacement occurs
-              // before a successful mutation becomes observable to the protocol.
-              if (changed(result)) configGeneration = token("config_generation")
+              // Config I/O remains interruptible and does not hold the process
+              // coordinator. Only the generation's linearization point is shared.
+              const result = yield* restore(effect)
+              if (changed(result)) {
+                yield* mutex.withPermit(
+                  Effect.sync(() => {
+                    configGeneration = token("config_generation")
+                  }),
+                )
+              }
               return result
             }),
           ),
-        ),
-      withConditionalReply: (effect) => mutex.withPermit(effect),
-    }
-    return Service.of(service)
+        withConditionalReply: (effect) => mutex.withPermit(effect),
+      }
+      return Service.of(service)
     })(),
   )
 }

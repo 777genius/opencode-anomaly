@@ -35,6 +35,17 @@ describe("hosted approval protocol", () => {
   test("rejects unsupported canonical values", () => {
     expect(() => canonicalJson({ value: BigInt(1) })).toThrow("Unsupported hosted approval canonical value")
   })
+
+  test("rejects undefined at every nesting position", () => {
+    const sparse: unknown[] = []
+    sparse.length = 1
+    expect(() => canonicalJson(undefined)).toThrow("Unsupported hosted approval canonical value")
+    expect(() => canonicalJson([undefined])).toThrow("Unsupported hosted approval canonical value")
+    expect(() => canonicalJson(sparse)).toThrow("Unsupported hosted approval canonical value")
+    expect(() => canonicalJson({ nested: { value: undefined } })).toThrow(
+      "Unsupported hosted approval canonical value",
+    )
+  })
 })
 
 test("bounded request reader stops before consuming chunks after the limit", async () => {

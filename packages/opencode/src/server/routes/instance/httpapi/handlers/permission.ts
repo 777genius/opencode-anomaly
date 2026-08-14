@@ -109,15 +109,12 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
     const serverAuth = yield* ServerAuth.Config
 
     const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
-      if (!ServerAuth.required(serverAuth)) {
-        return { unavailable: HttpServerResponse.empty({ status: 404 }) } as const
-      }
-      return { unavailable: undefined } as const
+      if (!ServerAuth.required(serverAuth)) return yield* new HostedUnavailableError()
+      return yield* Effect.void
     })
 
     const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
-      const availability = yield* requireHosted()
-      if (availability.unavailable) return availability.unavailable
+      yield* requireHosted()
       return yield* hostedApproval.withConditionalReply(
         Effect.sync(() => ({
           schemaVersion: 2 as const,
@@ -131,8 +128,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
     const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
       params: { sessionID: string }
     }) {
-      const availability = yield* requireHosted()
-      if (availability.unavailable) return availability.unavailable
+      yield* requireHosted()
       return yield* hostedApproval.withConditionalReply(
         Effect.gen(function* () {
           const snapshot = hostedApproval.snapshot()
@@ -149,7 +145,6 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
                 rawPermission: raw,
               }
             })
-          if (permissions.length > 256) return yield* new HttpApiError.InternalServerError()
           const response = {
             schemaVersion: 2 as const,
             protocol,
@@ -157,7 +152,13 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             sessionId: ctx.params.sessionID,
             permissions,
           }
-          if (Buffer.byteLength(JSON.stringify(response), "utf8") > 1024 * 1024) {
+          const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
+          if (permissions.length > 256 || bytes > 1024 * 1024) {
+            yield* Effect.logWarning("hosted approval observe overflow", {
+              sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
+              droppedCount: permissions.length,
+              droppedBytes: bytes,
+            })
             return yield* new HttpApiError.InternalServerError()
           }
           return response
@@ -169,8 +170,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       params: { sessionID: string; requestID: PermissionV1.ID }
       payload: typeof HostedReplyPayload.Type
     }) {
-      const availability = yield* requireHosted()
-      if (availability.unavailable) return availability.unavailable
+      yield* requireHosted()
       if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
         return yield* new HttpApiError.BadRequest()
       }
@@ -210,8 +210,10 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       params: { sessionID: string; requestID: PermissionV1.ID }
       request: HttpServerRequest.HttpServerRequest
     }) {
-      const availability = yield* requireHosted()
-      if (availability.unavailable) return availability.unavailable
+      const unavailable = yield* requireHosted().pipe(
+        Effect.match({ onFailure: () => true, onSuccess: () => false }),
+      )
+      if (unavailable) return HttpServerResponse.empty({ status: 404 })
       const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
         Effect.catch(() => Effect.succeed(undefined)),
       )

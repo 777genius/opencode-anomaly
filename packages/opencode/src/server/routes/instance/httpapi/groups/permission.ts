@@ -91,7 +91,7 @@ export const PermissionApi = HttpApi.make("permission")
           params: { sessionID: Schema.String },
           query: WorkspaceRoutingQuery,
           success: HostedObserve,
-          error: Schema.Union([HostedUnavailableError, HttpApiError.InternalServerError]),
+          error: [HostedUnavailableError, HttpApiError.InternalServerError],
         }),
         HttpApiEndpoint.post("hostedReply", "/experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply", {
           params: { sessionID: Schema.String, requestID: PermissionV1.ID },
