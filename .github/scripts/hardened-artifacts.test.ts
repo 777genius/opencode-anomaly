@@ -15,12 +15,12 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "476b667c385210b19fbd15bcb57456cacb0ae9e7",
-      sourceTree: "122dd7d77fd01f1a054ac52666a1e9a8a5529dcb",
-      baseCommit: "49c69c5ed3ccf706b61b3febb43c8aaff7f8325e",
-      patchSha256: "dbd8b2c1eda38043e3bfc9e2b809f4ef393fa075349ed219109a7deaca0c590e",
-      version: "1.18.4-agentteams.1",
-      tag: "v1.18.4-agentteams.1",
+      sourceCommit: "94540b2cbd116bb5bcd6c9ac8f4734f3df637a2b",
+      sourceTree: "762a2f4322b572639b12f2ec30a126de72138d18",
+      baseCommit: "826d9ad46a22bef0294998e08daa3c4904fea28f",
+      patchSha256: "c8a1389e6e296e25d5cb7f9da563d09c5d87560ea2ca1a0aab0d6dc1c9a11968",
+      version: "1.18.21-agentteams.1",
+      tag: "v1.18.21-agentteams.1",
       bunVersion: "1.3.14",
       productionEligible: false,
     })
@@ -31,7 +31,7 @@ describe("hardened release contract", () => {
     for (const [key, value] of Object.entries(RELEASE)) {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
-    expect(schema.properties.release.properties.patchSize.const).toBe(74229)
+    expect(schema.properties.release.properties.patchSize.const).toBe(85072)
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
@@ -54,7 +54,7 @@ describe("hardened release contract", () => {
     }
     const value = {
       schemaVersion: 1,
-      release: { ...RELEASE, patchSize: 74229 },
+      release: { ...RELEASE, patchSize: 85072 },
       workflow: {
         repository: "local",
         workflow: "local",

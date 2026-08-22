@@ -1,41 +1,3 @@
-diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
-new file mode 100644
-index 0000000000000000000000000000000000000000..ab8ddf33bde5c1c9186fcb1db66b04e387ab6c56
---- /dev/null
-+++ b/packages/opencode/docs/hosted-approval-v2.md
-@@ -0,0 +1,32 @@
-+# Hosted approval v2
-+
-+OpenCode exposes hosted approval only when standard server Basic authentication
-+is configured. The capability, observe, and conditional reply endpoints use the
-+same Authorization and workspace routing middleware as `/permission`. Without a
-+server password all three return 404; bad credentials return 401.
-+
-+The protocol identifier is `agent-teams-hosted-approval-v2`. One process-wide
-+coordinator owns a random `runtime_instance_<32 lowercase hex>` and a random
-+`config_generation_<32 lowercase hex>`. The generation changes after successful
-+config writes and after an ordinary `always` reply changes approval policy.
-+Credentials are outside this generation and must be bound separately by clients.
-+
-+Pending requests are observed per session at
-+`GET /experimental/agent-teams/hosted-approval/session/:sessionID/permissions`.
-+Each insertion receives a random `request_incarnation_<32 lowercase hex>`.
-+Responses are all-or-nothing, limited to 256 requests and 1 MiB JSON.
-+
-+Conditional replies use
-+`POST /experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply`.
-+Bodies are limited to 16 KiB, fatal UTF-8 decoded, checked for duplicate JSON
-+keys, and exact-schema decoded. Runtime/config mismatches return 412 with no
-+effect. Missing, replayed, wrong-session, wrong-incarnation, or digest mismatches
-+return 409 with no effect. Successful replies settle exactly one request; reject
-+never cascades and `always` is not supported.
-+
-+Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
-+are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
-+JSON primitives use `JSON.stringify`. Golden vectors:
-+
-+- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
-+- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
 diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
 index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1ee6ef29d 100644
 --- a/packages/opencode/src/config/config.ts
@@ -136,6 +98,1311 @@ index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1
      })
  
      return Service.of({
+diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
+index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..f58fcf3a19d983bb1d9173ac52a985b9e4b157ee 100644
+--- a/packages/opencode/src/permission/index.ts
++++ b/packages/opencode/src/permission/index.ts
+@@ -2,27 +2,67 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
+ import { InstanceState } from "@/effect/instance-state"
+ import { Wildcard } from "@opencode-ai/core/util/wildcard"
+-import { Deferred, Effect, Layer, Context } from "effect"
++import { Deferred, Effect, Layer, Context, Semaphore } from "effect"
+ import os from "os"
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { EventV2Bridge } from "@/event-v2-bridge"
++import { randomUUID } from "node:crypto"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ export const Event = PermissionV1.Event
+ 
+ export interface Interface {
+   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
++  /**
++   * Claims and settles exactly one pending request when its full external
++   * incarnation still matches. Unlike the interactive reply operation this
++   * never cascades to other requests and never persists an approval rule.
++   */
++  readonly conditionalReply: (
++    input: ConditionalReplyInput,
++  ) => Effect.Effect<ConditionalReplyResult>
+   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
++  readonly hostedList: () => Effect.Effect<ReadonlyArray<HostedPendingRequest>>
++}
++
++export interface ConditionalReplyInput {
++  readonly requestID: PermissionV1.ID
++  readonly sessionID: PermissionV1.Request["sessionID"]
++  readonly sessionIncarnation: string
++  readonly requestIncarnation: string
++  readonly reply: "once" | "reject"
++  readonly message?: string
++  /** Runs synchronously while the permission state lock is held. */
++  readonly matches: (request: PermissionV1.Request) => boolean
++}
++
++export type ConditionalReplyResult =
++  | { readonly status: "applied"; readonly request: PermissionV1.Request }
++  | { readonly status: "mismatch" }
++
++export interface HostedPendingRequest {
++  readonly request: PermissionV1.Request
++  readonly sessionIncarnation: string
++  readonly requestIncarnation: string
+ }
+ 
+ interface PendingEntry {
+   info: PermissionV1.Request
++  sessionIncarnation: string
++  requestIncarnation: string
+   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+ }
+ 
+ interface State {
+   pending: Map<PermissionV1.ID, PendingEntry>
+   approved: PermissionV1.Rule[]
++  sessionIncarnations: Map<PermissionV1.Request["sessionID"], string>
++}
++
++function incarnation(prefix: "session_incarnation" | "request_incarnation") {
++  return `${prefix}_${randomUUID().replaceAll("-", "")}`
+ }
+ 
+ export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
+@@ -43,20 +83,48 @@ const layer = Layer.effect(
+   Service,
+   Effect.gen(function* () {
+     const events = yield* EventV2Bridge.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
++    const mutex = Semaphore.makeUnsafe(1)
+     const state = yield* InstanceState.make<State>(
+       Effect.fn("Permission.state")(function* (ctx) {
+         void ctx
+         const state = {
+           pending: new Map<PermissionV1.ID, PendingEntry>(),
+           approved: [],
++          sessionIncarnations: new Map<PermissionV1.Request["sessionID"], string>(),
+         }
+ 
++        const unsubscribe = yield* events.listen((event) => {
++          if (event.location?.directory !== ctx.directory) return Effect.void
++          if (event.type !== SessionV1.Event.Created.type && event.type !== SessionV1.Event.Deleted.type) {
++            return Effect.void
++          }
++          const data = event.data as { sessionID: PermissionV1.Request["sessionID"] }
++          return hostedApproval.withConditionalReply(
++            mutex.withPermit(
++              Effect.sync(() => {
++                if (event.type === SessionV1.Event.Deleted.type) {
++                  state.sessionIncarnations.delete(data.sessionID)
++                  return
++                }
++                // Creation only rotates an identity already observed by this
++                // permission service. New sessions are minted lazily on ask.
++                if (state.sessionIncarnations.has(data.sessionID)) {
++                  state.sessionIncarnations.set(data.sessionID, incarnation("session_incarnation"))
++                }
++              }),
++            ),
++          )
++        })
++        yield* Effect.addFinalizer(() => unsubscribe)
++
+         yield* Effect.addFinalizer(() =>
+           Effect.gen(function* () {
+             for (const item of state.pending.values()) {
+               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+             }
+             state.pending.clear()
++            state.sessionIncarnations.clear()
+           }),
+         )
+ 
+@@ -65,113 +133,192 @@ const layer = Layer.effect(
+     )
+ 
+     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+-      const { approved, pending } = yield* InstanceState.get(state)
+-      const { ruleset, ...request } = input
+-      let needsAsk = false
+-
+-      for (const pattern of request.patterns) {
+-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+-        yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
+-        if (rule.action === "deny") {
+-          return yield* new PermissionV1.DeniedError({
+-            ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+-          })
+-        }
+-        if (rule.action === "allow") continue
+-        needsAsk = true
+-      }
+-
+-      if (!needsAsk) return
+-
+-      const id = request.id ?? PermissionV1.ID.ascending()
+-      const info: PermissionV1.Request = {
+-        id,
+-        sessionID: request.sessionID,
+-        permission: request.permission,
+-        patterns: request.patterns,
+-        metadata: request.metadata,
+-        always: request.always,
+-        tool: request.tool,
+-      }
+-      yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
+-
+       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
+-      pending.set(id, { info, deferred })
+-      yield* events.publish(Event.Asked, info)
++      const pendingID = yield* hostedApproval.withConditionalReply(mutex.withPermit(
++        Effect.gen(function* () {
++          const { approved, pending, sessionIncarnations } = yield* InstanceState.get(state)
++          const { ruleset, ...request } = input
++          let needsAsk = false
++          for (const pattern of request.patterns) {
++            const rule = evaluate(request.permission, pattern, ruleset, approved)
++            yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
++            if (rule.action === "deny") {
++              return yield* new PermissionV1.DeniedError({
++                ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
++              })
++            }
++            if (rule.action !== "allow") needsAsk = true
++          }
++          if (!needsAsk) return undefined
++
++          const id = request.id ?? PermissionV1.ID.ascending()
++          // Caller-provided IDs are allowed by the public schema, but replacing
++          // a live entry would enable request-incarnation ABA and orphan its deferred.
++          if (pending.has(id)) return yield* new PermissionV1.DeniedError({ ruleset: [] })
++          const info: PermissionV1.Request = {
++            id,
++            sessionID: request.sessionID,
++            permission: request.permission,
++            patterns: request.patterns,
++            metadata: request.metadata,
++            always: request.always,
++            tool: request.tool,
++          }
++          const sessionIncarnation = sessionIncarnations.get(info.sessionID) ?? incarnation("session_incarnation")
++          sessionIncarnations.set(info.sessionID, sessionIncarnation)
++          yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
++          pending.set(id, {
++            info,
++            sessionIncarnation,
++            requestIncarnation: incarnation("request_incarnation"),
++            deferred,
++          })
++          yield* events.publish(Event.Asked, info)
++          return id
++        }),
++      ))
++      if (!pendingID) return
+       return yield* Effect.ensuring(
+         Deferred.await(deferred),
+-        Effect.sync(() => {
+-          pending.delete(id)
+-        }),
++        hostedApproval.withConditionalReply(mutex.withPermit(
++          Effect.gen(function* () {
++            // Delete only the exact entry owned by this ask. A future request
++            // that reuses the ID must not be removed by this finalizer.
++            const { pending } = yield* InstanceState.get(state)
++            if (pending.get(pendingID)?.deferred === deferred) pending.delete(pendingID)
++          }),
++        )),
+       )
+     })
+ 
+-    const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
+-      const { approved, pending } = yield* InstanceState.get(state)
+-      const existing = pending.get(input.requestID)
+-      if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+-
+-      pending.delete(input.requestID)
+-      yield* events.publish(Event.Replied, {
+-        sessionID: existing.info.sessionID,
+-        requestID: existing.info.id,
+-        reply: input.reply,
+-      })
+-
+-      if (input.reply === "reject") {
+-        yield* Deferred.fail(
+-          existing.deferred,
+-          input.message
+-            ? new PermissionV1.CorrectedError({ feedback: input.message })
+-            : new PermissionV1.RejectedError(),
+-        )
++    const reply = Effect.fn("Permission.reply")((input: PermissionV1.ReplyInput) => {
++      const settle = mutex.withPermit(
++        Effect.gen(function* () {
++          const { approved, pending } = yield* InstanceState.get(state)
++          const existing = pending.get(input.requestID)
++          if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+ 
+-        for (const [id, item] of pending.entries()) {
+-          if (item.info.sessionID !== existing.info.sessionID) continue
+-          pending.delete(id)
++          pending.delete(input.requestID)
+           yield* events.publish(Event.Replied, {
+-            sessionID: item.info.sessionID,
+-            requestID: item.info.id,
+-            reply: "reject",
++            sessionID: existing.info.sessionID,
++            requestID: existing.info.id,
++            reply: input.reply,
+           })
+-          yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+-        }
+-        return
+-      }
+ 
+-      yield* Deferred.succeed(existing.deferred, undefined)
+-      if (input.reply === "once") return
++          if (input.reply === "reject") {
++            yield* Deferred.fail(
++              existing.deferred,
++              input.message
++                ? new PermissionV1.CorrectedError({ feedback: input.message })
++                : new PermissionV1.RejectedError(),
++            )
+ 
+-      for (const pattern of existing.info.always) {
+-        approved.push({
+-          permission: existing.info.permission,
+-          pattern,
+-          action: "allow",
+-        })
+-      }
++            for (const [id, item] of pending.entries()) {
++              if (item.info.sessionID !== existing.info.sessionID) continue
++              pending.delete(id)
++              yield* events.publish(Event.Replied, {
++                sessionID: item.info.sessionID,
++                requestID: item.info.id,
++                reply: "reject",
++              })
++              yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
++            }
++            return
++          }
+ 
+-      for (const [id, item] of pending.entries()) {
+-        if (item.info.sessionID !== existing.info.sessionID) continue
+-        const ok = item.info.patterns.every(
+-          (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
+-        )
+-        if (!ok) continue
+-        pending.delete(id)
+-        yield* events.publish(Event.Replied, {
+-          sessionID: item.info.sessionID,
+-          requestID: item.info.id,
+-          reply: "always",
+-        })
+-        yield* Deferred.succeed(item.deferred, undefined)
+-      }
+-    })
++          yield* Deferred.succeed(existing.deferred, undefined)
++          if (input.reply === "once") return
++
++          for (const pattern of existing.info.always) {
++            approved.push({
++              permission: existing.info.permission,
++              pattern,
++              action: "allow",
++            })
++          }
+ 
+-    const list = Effect.fn("Permission.list")(function* () {
+-      const pending = (yield* InstanceState.get(state)).pending
+-      return Array.from(pending.values(), (item) => item.info)
++          for (const [id, item] of pending.entries()) {
++            if (item.info.sessionID !== existing.info.sessionID) continue
++            const ok = item.info.patterns.every(
++              (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
++            )
++            if (!ok) continue
++            pending.delete(id)
++            yield* events.publish(Event.Replied, {
++              sessionID: item.info.sessionID,
++              requestID: item.info.id,
++              reply: "always",
++            })
++            yield* Deferred.succeed(item.deferred, undefined)
++          }
++        }),
++      )
++      return input.reply === "always"
++        ? hostedApproval.withConfigMutation(settle)
++        : hostedApproval.withConditionalReply(settle)
+     })
+ 
+-    return Service.of({ ask, reply, list })
++    const conditionalReply = Effect.fn("Permission.conditionalReply")((input: ConditionalReplyInput) =>
++      Effect.uninterruptible(
++        mutex.withPermit(
++          Effect.gen(function* () {
++            const { pending, sessionIncarnations } = yield* InstanceState.get(state)
++            const existing = pending.get(input.requestID)
++            if (!existing) return { status: "mismatch" } as const
++            if (
++              existing.info.sessionID !== input.sessionID ||
++              existing.sessionIncarnation !== input.sessionIncarnation ||
++              sessionIncarnations.get(input.sessionID) !== input.sessionIncarnation ||
++              existing.requestIncarnation !== input.requestIncarnation ||
++              !input.matches(existing.info)
++            ) {
++              return { status: "mismatch" } as const
++            }
++
++            pending.delete(input.requestID)
++            yield* events.publish(Event.Replied, {
++              sessionID: existing.info.sessionID,
++              requestID: existing.info.id,
++              reply: input.reply,
++            })
++            if (input.reply === "once") yield* Deferred.succeed(existing.deferred, undefined)
++            else {
++              yield* Deferred.fail(
++                existing.deferred,
++                input.message
++                  ? new PermissionV1.CorrectedError({ feedback: input.message })
++                  : new PermissionV1.RejectedError(),
++              )
++            }
++            return { status: "applied", request: existing.info } as const
++          }),
++        ),
++      ),
++    )
++
++    const list = Effect.fn("Permission.list")(() =>
++      hostedApproval.withConditionalReply(mutex.withPermit(
++        Effect.gen(function* () {
++          const pending = (yield* InstanceState.get(state)).pending
++          return Array.from(pending.values(), (item) => item.info)
++        }),
++      )),
++    )
++
++    const hostedList = Effect.fn("Permission.hostedList")(() =>
++      mutex.withPermit(
++        Effect.gen(function* () {
++          const pending = (yield* InstanceState.get(state)).pending
++          return Array.from(pending.values(), ({ info: request, sessionIncarnation, requestIncarnation }) => ({
++            request,
++            sessionIncarnation,
++            requestIncarnation,
++          }))
++        }),
++      ),
++    )
++
++    return Service.of({ ask, reply, conditionalReply, list, hostedList })
+   }),
+ )
+ 
+@@ -218,6 +365,10 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
+   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
+ }
+ 
+-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
++export const node = LayerNode.make({
++  service: Service,
++  layer: layer,
++  deps: [EventV2Bridge.node, HostedApprovalCoordinator.node],
++})
+ 
+ export * as Permission from "."
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
+index 79959db499bd12a359ac84a9a189faebc84c016e..80ff005def818509dd6fa2b95417f7a58766115e 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
+@@ -8,6 +8,74 @@ import { InstanceContextMiddleware } from "../middleware/instance-context"
+ import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
+ import { described } from "./metadata"
+ 
++const RuntimeInstanceId = Schema.String.check(Schema.isPattern(/^runtime_instance_[0-9a-f]{32}$/))
++const ConfigGeneration = Schema.String.check(Schema.isPattern(/^config_generation_[0-9a-f]{32}$/))
++const SessionIncarnation = Schema.String.check(Schema.isPattern(/^session_incarnation_[0-9a-f]{32}$/))
++const RequestIncarnation = Schema.String.check(Schema.isPattern(/^request_incarnation_[0-9a-f]{32}$/))
++const HostedDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
++export class HostedConflictError extends Schema.TaggedErrorClass<HostedConflictError>()(
++  "HostedApprovalConflict",
++  {},
++  { httpApiStatus: 409 },
++) {}
++export class HostedPreconditionError extends Schema.TaggedErrorClass<HostedPreconditionError>()(
++  "HostedApprovalPreconditionFailed",
++  {},
++  { httpApiStatus: 412 },
++) {}
++export class HostedUnavailableError extends Schema.TaggedErrorClass<HostedUnavailableError>()(
++  "HostedApprovalUnavailable",
++  {},
++  { httpApiStatus: 404 },
++) {}
++export const HostedReplyPayload = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  expectedConfigGeneration: ConfigGeneration,
++  requestId: PermissionV1.ID,
++  sessionId: Schema.String,
++  sessionIncarnation: SessionIncarnation,
++  requestIncarnation: RequestIncarnation,
++  expectedPermissionDigest: HostedDigest,
++  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
++})
++const HostedCapability = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  authentication: Schema.Literal("opencode-basic"),
++})
++const HostedObserve = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  sessionId: Schema.String,
++  permissions: Schema.Array(Schema.Struct({
++    requestId: PermissionV1.ID,
++    sessionId: Schema.String,
++    sessionIncarnation: SessionIncarnation,
++    requestIncarnation: RequestIncarnation,
++    permissionDigest: HostedDigest,
++    rawPermission: PermissionV1.Request,
++  })),
++})
++const HostedReplySuccess = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  status: Schema.Literal("applied"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  requestId: PermissionV1.ID,
++  sessionId: Schema.String,
++  sessionIncarnation: SessionIncarnation,
++  requestIncarnation: RequestIncarnation,
++  permissionDigest: HostedDigest,
++  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
++})
++
+ const root = "/permission"
+ const ReplyPayload = Schema.Struct({
+   reply: PermissionV1.Reply,
+@@ -18,6 +86,24 @@ export const PermissionApi = HttpApi.make("permission")
+   .add(
+     HttpApiGroup.make("permission")
+       .add(
++        HttpApiEndpoint.get("hostedCapability", "/experimental/agent-teams/hosted-approval-capability", {
++          query: WorkspaceRoutingQuery,
++          success: HostedCapability,
++          error: HostedUnavailableError,
++        }),
++        HttpApiEndpoint.get("hostedObserve", "/experimental/agent-teams/hosted-approval/session/:sessionID/permissions", {
++          params: { sessionID: Schema.String },
++          query: WorkspaceRoutingQuery,
++          success: HostedObserve,
++          error: [HostedUnavailableError, HttpApiError.InternalServerError],
++        }),
++        HttpApiEndpoint.post("hostedReply", "/experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply", {
++          params: { sessionID: Schema.String, requestID: PermissionV1.ID },
++          query: WorkspaceRoutingQuery,
++          payload: HostedReplyPayload,
++          success: HostedReplySuccess,
++          error: Schema.Union([HttpApiError.BadRequest, HostedConflictError, HostedPreconditionError, HostedUnavailableError]),
++        }),
+         HttpApiEndpoint.get("list", root, {
+           query: WorkspaceRoutingQuery,
+           success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
+index 3d0e8a06c09c6b3a2366b521ff05f7eaca63eff8..0ba6cd511d057757c30a53925cd8b37c8b81fb18 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
+@@ -5,19 +5,25 @@ import { Effect } from "effect"
+ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import { InstanceHttpApi } from "../api"
+ import { markInstanceForDisposal } from "../lifecycle"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (handlers) =>
+   Effect.gen(function* () {
+     const providerSvc = yield* Provider.Service
+     const configSvc = yield* Config.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
+ 
+     const get = Effect.fn("ConfigHttpApi.get")(function* () {
+       return yield* configSvc.get()
+     })
+ 
+     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
+-      yield* configSvc.update(ctx.payload)
+-      yield* markInstanceForDisposal(yield* InstanceState.context)
++      yield* hostedApproval.withConfigMutation(
++        Effect.gen(function* () {
++          yield* configSvc.update(ctx.payload)
++          yield* markInstanceForDisposal(yield* InstanceState.context)
++        }),
++      )
+       return ctx.payload
+     })
+ 
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
+index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc93197d13f 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
+@@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import * as Sse from "effect/unstable/encoding/Sse"
+ import { RootHttpApi } from "../api"
+ import { GlobalUpgradeInput } from "../groups/global"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ function eventData(data: unknown): Sse.Event {
+   return {
+@@ -70,6 +71,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+     const config = yield* Config.Service
+     const installation = yield* Installation.Service
+     const bridge = yield* EffectBridge.make()
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
+ 
+     const health = Effect.fn("GlobalHttpApi.health")(function* () {
+       return { healthy: true as const, version: InstallationVersion }
+@@ -84,7 +86,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+     })
+ 
+     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
+-      const result = yield* config.updateGlobal(ctx.payload)
++      const result = yield* hostedApproval.withConfigMutation(config.updateGlobal(ctx.payload), (value) => value.changed)
+       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
+       return result.info
+     })
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
+index cdb88490605f1311f02a7d8d0c69806a21ddc514..24fe6661578cc45c58011bad789abeb5b4f49cde 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
+@@ -1,13 +1,257 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+ import { Permission } from "@/permission"
+ import { Effect } from "effect"
+-import { HttpApiBuilder } from "effect/unstable/httpapi"
++import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+ import { InstanceHttpApi } from "../api"
+ import { PermissionNotFoundError } from "../errors"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
++import { digest, protocol, rawPermission } from "@/hosted-approval/protocol"
++import { HostedConflictError, HostedPreconditionError, HostedReplyPayload, HostedUnavailableError } from "../groups/permission"
++import { ServerAuth } from "@/server/auth"
++import { Schema, Stream } from "effect"
++import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
++
++function rejectDuplicateJsonKeys(text: string): void {
++  let offset = 0
++  const whitespace = () => { while (/\s/.test(text[offset] ?? "")) offset++ }
++  const string = () => {
++    const start = offset
++    if (text[offset++] !== '"') throw new Error("invalid string")
++    while (offset < text.length) {
++      const char = text[offset++]
++      if (char === '"') return JSON.parse(text.slice(start, offset)) as string
++      if (char === "\\") offset++
++    }
++    throw new Error("unterminated string")
++  }
++  const value = (): void => {
++    whitespace()
++    if (text[offset] === "{") {
++      offset++
++      const keys = new Set<string>()
++      whitespace()
++      if (text[offset] === "}") { offset++; return }
++      while (true) {
++        whitespace()
++        const key = string()
++        if (keys.has(key)) throw new Error("duplicate key")
++        keys.add(key)
++        whitespace()
++        if (text[offset++] !== ":") throw new Error("invalid object")
++        value()
++        whitespace()
++        const delimiter = text[offset++]
++        if (delimiter === "}") return
++        if (delimiter !== ",") throw new Error("invalid object")
++      }
++    }
++    if (text[offset] === "[") {
++      offset++
++      whitespace()
++      if (text[offset] === "]") { offset++; return }
++      while (true) {
++        value(); whitespace()
++        const delimiter = text[offset++]
++        if (delimiter === "]") return
++        if (delimiter !== ",") throw new Error("invalid array")
++      }
++    }
++    if (text[offset] === '"') { string(); return }
++    const match = text.slice(offset).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/)
++    if (!match) throw new Error("invalid value")
++    offset += match[0].length
++  }
++  value(); whitespace()
++  if (offset !== text.length) throw new Error("trailing data")
++}
++
++const HOSTED_REPLY_KEYS = [
++  "decision",
++  "expectedConfigGeneration",
++  "expectedPermissionDigest",
++  "protocol",
++  "requestId",
++  "requestIncarnation",
++  "runtimeInstanceId",
++  "schemaVersion",
++  "sessionId",
++  "sessionIncarnation",
++] as const
++
++export class HostedReplyBodyError extends Error {}
++
++export const readHostedReplyBody = Effect.fn("PermissionHttpApi.readHostedReplyBody")(
++  <E>(stream: Stream.Stream<Uint8Array, E>, limit = 16 * 1024) =>
++    Stream.runFoldEffect(
++      stream,
++      () => [] as Uint8Array[],
++      (chunks, chunk) => {
++        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
++        if (size + chunk.byteLength > limit) return Effect.fail(new HostedReplyBodyError("body too large"))
++        chunks.push(chunk)
++        return Effect.succeed(chunks)
++      },
++    ).pipe(
++      Effect.mapError((error) => error instanceof HostedReplyBodyError ? error : new HostedReplyBodyError("body read failed")),
++      Effect.map((chunks) => {
++        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
++        const bytes = new Uint8Array(size)
++        let offset = 0
++        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
++        return bytes
++      }),
++    ),
++)
+ 
+ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
+   Effect.gen(function* () {
+     const svc = yield* Permission.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
++    const serverAuth = yield* ServerAuth.Config
++
++    const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
++      if (!ServerAuth.required(serverAuth)) return yield* new HostedUnavailableError()
++      return yield* Effect.void
++    })
++
++    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
++      yield* requireHosted()
++      return yield* hostedApproval.withConditionalReply(
++        Effect.sync(() => ({
++          schemaVersion: 2 as const,
++          protocol,
++          ...hostedApproval.snapshot(),
++          authentication: "opencode-basic" as const,
++        })),
++      )
++    })
++
++    const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
++      params: { sessionID: string }
++    }) {
++      yield* requireHosted()
++      return yield* hostedApproval.withConditionalReply(
++        Effect.gen(function* () {
++          const snapshot = hostedApproval.snapshot()
++          const pending = yield* svc.hostedList()
++          const permissions = pending
++            .filter(({ request }) => request.sessionID === ctx.params.sessionID)
++            .map(({ request, sessionIncarnation, requestIncarnation }) => {
++              const raw = rawPermission(request)
++              return {
++                requestId: request.id,
++                sessionId: request.sessionID,
++                sessionIncarnation,
++                requestIncarnation,
++                permissionDigest: digest(raw),
++                rawPermission: raw,
++              }
++            })
++          const response = {
++            schemaVersion: 2 as const,
++            protocol,
++            ...snapshot,
++            sessionId: ctx.params.sessionID,
++            permissions,
++          }
++          const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
++          if (permissions.length > 256 || bytes > 1024 * 1024) {
++            yield* Effect.logWarning("hosted approval observe overflow", {
++              sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
++              droppedCount: permissions.length,
++              droppedBytes: bytes,
++            })
++            return yield* new HttpApiError.InternalServerError()
++          }
++          return response
++        }),
++      )
++    })
++
++    const hostedReply = Effect.fn("PermissionHttpApi.hostedReply")(function* (ctx: {
++      params: { sessionID: string; requestID: PermissionV1.ID }
++      payload: typeof HostedReplyPayload.Type
++    }) {
++      yield* requireHosted()
++      if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
++        return yield* new HttpApiError.BadRequest()
++      }
++      return yield* hostedApproval.withConditionalReply(
++        Effect.gen(function* () {
++          const snapshot = hostedApproval.snapshot()
++          if (
++            snapshot.runtimeInstanceId !== ctx.payload.runtimeInstanceId ||
++            snapshot.configGeneration !== ctx.payload.expectedConfigGeneration
++          ) return yield* new HostedPreconditionError()
++
++          const result = yield* svc.conditionalReply({
++            requestID: ctx.params.requestID,
++            sessionID: ctx.payload.sessionId as PermissionV1.Request["sessionID"],
++            sessionIncarnation: ctx.payload.sessionIncarnation,
++            requestIncarnation: ctx.payload.requestIncarnation,
++            reply: ctx.payload.decision === "allow_once" ? "once" : "reject",
++            matches: (request) => digest(rawPermission(request)) === ctx.payload.expectedPermissionDigest,
++          })
++          if (result.status === "mismatch") return yield* new HostedConflictError()
++          return {
++            schemaVersion: 2 as const,
++            protocol,
++            status: "applied" as const,
++            runtimeInstanceId: snapshot.runtimeInstanceId,
++            configGeneration: snapshot.configGeneration,
++            requestId: ctx.payload.requestId,
++            sessionId: ctx.payload.sessionId,
++            sessionIncarnation: ctx.payload.sessionIncarnation,
++            requestIncarnation: ctx.payload.requestIncarnation,
++            permissionDigest: ctx.payload.expectedPermissionDigest,
++            decision: ctx.payload.decision,
++          }
++        }),
++      )
++    })
++
++    const hostedReplyRaw = Effect.fn("PermissionHttpApi.hostedReplyRaw")(function* (ctx: {
++      params: { sessionID: string; requestID: PermissionV1.ID }
++      request: HttpServerRequest.HttpServerRequest
++    }) {
++      const unavailable = yield* requireHosted().pipe(
++        Effect.match({ onFailure: () => true, onSuccess: () => false }),
++      )
++      if (unavailable) return HttpServerResponse.empty({ status: 404 })
++      const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
++        Effect.catch(() => Effect.succeed(undefined)),
++      )
++      if (!bytes) return HttpServerResponse.empty({ status: 400 })
++      let text: string
++      try {
++        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
++        rejectDuplicateJsonKeys(text)
++      } catch {
++        return HttpServerResponse.empty({ status: 400 })
++      }
++      let untyped: unknown
++      try { untyped = JSON.parse(text) } catch { return HttpServerResponse.empty({ status: 400 }) }
++      if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) return HttpServerResponse.empty({ status: 400 })
++      const keys = Object.keys(untyped).sort()
++      if (keys.length !== HOSTED_REPLY_KEYS.length || keys.some((key, index) => key !== HOSTED_REPLY_KEYS[index])) {
++        return HttpServerResponse.empty({ status: 400 })
++      }
++      const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HostedReplyPayload))(text, {
++        onExcessProperty: "error",
++      }).pipe(
++        Effect.catch(() => Effect.succeed(undefined)),
++      )
++      if (!payload) return HttpServerResponse.empty({ status: 400 })
++      const result = yield* hostedReply({ params: ctx.params, payload }).pipe(
++        Effect.catchTags({
++          BadRequest: () => Effect.succeed(HttpServerResponse.empty({ status: 400 })),
++          HostedApprovalConflict: () => Effect.succeed(HttpServerResponse.empty({ status: 409 })),
++          HostedApprovalPreconditionFailed: () => Effect.succeed(HttpServerResponse.empty({ status: 412 })),
++        }),
++      )
++      if (HttpServerResponse.isHttpServerResponse(result)) return result
++      return HttpServerResponse.jsonUnsafe(result)
++    })
+ 
+     const list = Effect.fn("PermissionHttpApi.list")(function* () {
+       return yield* svc.list()
+@@ -36,6 +280,11 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
+       return true
+     })
+ 
+-    return handlers.handle("list", list).handle("reply", reply)
++    return handlers
++      .handle("hostedCapability", hostedCapability)
++      .handle("hostedObserve", hostedObserve)
++      .handleRaw("hostedReply", hostedReplyRaw)
++      .handle("list", list)
++      .handle("reply", reply)
+   }),
+ )
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/server.ts b/packages/opencode/src/server/routes/instance/httpapi/server.ts
+index fb9d2db65621540a514786f2061714f16b6c766c..d942753d204268d24d53a36804cd832ff6f884f5 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/server.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/server.ts
+@@ -49,6 +49,7 @@ import { ToolRegistry } from "@/tool/registry"
+ import { Truncate } from "@/tool/truncate"
+ import { Worktree } from "@/worktree"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
+ import { Database } from "@opencode-ai/core/database/database"
+ import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
+@@ -140,6 +141,7 @@ const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide(Serve
+ const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
+ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
+   Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++  Layer.provide(HostedApprovalCoordinator.layer),
+   Layer.provide(schemaErrorLayer),
+   Layer.provide(httpApiAuthLayer),
+ )
+@@ -169,6 +171,8 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
+     tuiHandlers,
+     workspaceHandlers,
+   ]),
++  Layer.provide(HostedApprovalCoordinator.layer),
++  Layer.provide(ServerAuth.Config.layer),
+ )
+ 
+ const instanceRoutes = instanceApiRoutes.pipe(
+@@ -237,6 +241,7 @@ const app = LayerNode.group([
+   SessionStatus.node,
+   BackgroundJob.node,
+   RuntimeFlags.node,
++  HostedApprovalCoordinator.node,
+   EventV2Bridge.node,
+   SessionRunState.node,
+   SessionProcessor.node,
+diff --git a/packages/opencode/test/config/config.test.ts b/packages/opencode/test/config/config.test.ts
+index 8f72c0cb7f6390450dc747d9d5b6a75829ad9919..fc05fb716c0894a6492c7ede415df6199bd356ac 100644
+--- a/packages/opencode/test/config/config.test.ts
++++ b/packages/opencode/test/config/config.test.ts
+@@ -371,6 +371,22 @@ it.instance("updates config and preserves empty shell sentinel", () =>
+   }),
+ )
+ 
++it.instance("serializes concurrent updates to the same config file", () =>
++  Effect.gen(function* () {
++    const test = yield* TestInstance
++    const config = yield* Config.Service
++    yield* Effect.all(
++      [config.update({ model: "test/model" }), config.update({ username: "test-user" })],
++      { concurrency: "unbounded" },
++    )
++
++    expect(yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))).toMatchObject({
++      model: "test/model",
++      username: "test-user",
++    })
++  }),
++)
++
+ it.effect("updates global config and omits empty shell key in json", () =>
+   withGlobalConfig({ config: { shell: "bash" } }, ({ dir }) =>
+     Effect.gen(function* () {
+diff --git a/packages/opencode/test/permission/next.test.ts b/packages/opencode/test/permission/next.test.ts
+index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..f79f20f9fc1df5bbcc6e734ddfa5a7f32829b101 100644
+--- a/packages/opencode/test/permission/next.test.ts
++++ b/packages/opencode/test/permission/next.test.ts
+@@ -1,4 +1,5 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { test, expect } from "bun:test"
+ import os from "os"
+ import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+@@ -68,12 +69,24 @@ const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
+     return yield* permission.reply(input)
+   })
+ 
++const conditionalReply = (input: Parameters<Permission.Interface["conditionalReply"]>[0]) =>
++  Effect.gen(function* () {
++    const permission = yield* Permission.Service
++    return yield* permission.conditionalReply(input)
++  })
++
+ const list = () =>
+   Effect.gen(function* () {
+     const permission = yield* Permission.Service
+     return yield* permission.list()
+   })
+ 
++const hostedList = () =>
++  Effect.gen(function* () {
++    const permission = yield* Permission.Service
++    return yield* permission.hostedList()
++  })
++
+ // fromConfig tests
+ 
+ test("fromConfig - string value becomes wildcard rule", () => {
+@@ -741,6 +754,266 @@ it.instance(
+   { git: true },
+ )
+ 
++it.instance(
++  "conditional reply - concurrent callers settle exactly once",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_conditional_concurrent")
++      const sessionID = SessionID.make("session_conditional_concurrent")
++      const asked = yield* ask({
++        id: requestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(1)
++      const [{ sessionIncarnation, requestIncarnation }] = yield* hostedList()
++      let matched = 0
++      const settle = conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => {
++          matched += 1
++          return true
++        },
++      }).pipe(Effect.exit)
++      const [left, right] = yield* Effect.all([settle, settle], { concurrency: "unbounded" })
++
++      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "applied")).toHaveLength(1)
++      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "mismatch")).toHaveLength(1)
++      expect(matched).toBe(1)
++      yield* Fiber.join(asked)
++      expect(yield* list()).toHaveLength(0)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "ask - duplicate live request ID cannot replace its incarnation",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_duplicate_live")
++      const first = yield* ask({
++        id: requestID,
++        sessionID: SessionID.make("session_duplicate_first"),
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(1)
++      const [before] = yield* hostedList()
++
++      const duplicate = yield* ask({
++        id: requestID,
++        sessionID: SessionID.make("session_duplicate_second"),
++        permission: "edit",
++        patterns: ["file.ts"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.exit)
++      expect(Exit.isFailure(duplicate)).toBe(true)
++      const [after] = yield* hostedList()
++      expect(after.request.sessionID).toBe(before.request.sessionID)
++      expect(after.requestIncarnation).toBe(before.requestIncarnation)
++
++      yield* conditionalReply({
++        requestID,
++        sessionID: before.request.sessionID,
++        sessionIncarnation: before.sessionIncarnation,
++        requestIncarnation: before.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(first)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - reject is scoped to one request",
++  () =>
++    Effect.gen(function* () {
++      const sessionID = SessionID.make("session_conditional_scoped")
++      const firstID = PermissionV1.ID.make("per_conditional_first")
++      const secondID = PermissionV1.ID.make("per_conditional_second")
++      const first = yield* ask({
++        id: firstID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      const second = yield* ask({
++        id: secondID,
++        sessionID,
++        permission: "edit",
++        patterns: ["file.ts"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(2)
++      const incarnations = new Map((yield* hostedList()).map((item) => [item.request.id, item]))
++      yield* conditionalReply({
++        requestID: firstID,
++        sessionID,
++        sessionIncarnation: incarnations.get(firstID)!.sessionIncarnation,
++        requestIncarnation: incarnations.get(firstID)!.requestIncarnation,
++        reply: "reject",
++        matches: () => true,
++      })
++
++      const firstExit = yield* Fiber.await(first)
++      expect(Exit.isFailure(firstExit)).toBe(true)
++      expect((yield* list()).map((request) => request.id)).toEqual([secondID])
++      yield* conditionalReply({
++        requestID: secondID,
++        sessionID,
++        sessionIncarnation: incarnations.get(secondID)!.sessionIncarnation,
++        requestIncarnation: incarnations.get(secondID)!.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(second)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - mismatched incarnation performs no effect",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_conditional_mismatch")
++      const sessionID = SessionID.make("session_conditional_mismatch")
++      const asked = yield* ask({
++        id: requestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(1)
++      const [{ sessionIncarnation, requestIncarnation }] = yield* hostedList()
++      const mismatch = yield* conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => false,
++      })
++      expect(mismatch.status).toBe("mismatch")
++      expect((yield* list()).map((request) => request.id)).toEqual([requestID])
++
++      yield* conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(asked)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - a still-live request is stale after session delete and recreate",
++  () =>
++    Effect.gen(function* () {
++      const staleRequestID = PermissionV1.ID.make("per_session_incarnation_stale")
++      const currentRequestID = PermissionV1.ID.make("per_session_incarnation_current")
++      const sessionID = SessionID.make("ses_incarnation_reuse")
++      const staleAsk = yield* ask({
++        id: staleRequestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(1)
++      const [stale] = yield* hostedList()
++
++      const events = yield* EventV2Bridge.Service
++      const info = {
++        id: sessionID,
++        slug: "session-incarnation-reuse",
++        projectID: "project-incarnation-reuse",
++        directory: "/tmp/session-incarnation-reuse",
++        cost: 0,
++        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++        title: "session incarnation reuse",
++        version: "test",
++        time: { created: Date.now(), updated: Date.now() },
++      }
++      yield* events.publish(
++        SessionV1.Event.Deleted,
++        { sessionID, info } as typeof SessionV1.Event.Deleted.data.Type,
++      )
++      yield* events.publish(
++        SessionV1.Event.Created,
++        { sessionID, info } as typeof SessionV1.Event.Created.data.Type,
++      )
++
++      const currentAsk = yield* ask({
++        id: currentRequestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["pwd"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(2)
++      const pending = new Map((yield* hostedList()).map((item) => [item.request.id, item]))
++      const current = pending.get(currentRequestID)!
++      expect(current.sessionIncarnation).not.toBe(stale.sessionIncarnation)
++
++      const result = yield* conditionalReply({
++        requestID: staleRequestID,
++        sessionID,
++        sessionIncarnation: stale.sessionIncarnation,
++        requestIncarnation: stale.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      expect(result.status).toBe("mismatch")
++      expect((yield* list()).map((request) => request.id)).toEqual([staleRequestID, currentRequestID])
++
++      yield* conditionalReply({
++        requestID: currentRequestID,
++        sessionID,
++        sessionIncarnation: current.sessionIncarnation,
++        requestIncarnation: current.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(currentAsk)
++      yield* reply({ requestID: staleRequestID, reply: "once" })
++      yield* Fiber.join(staleAsk)
++    }),
++  { git: true },
++)
++
+ it.instance(
+   "reply - reject with message throws CorrectedError",
+   () =>
+diff --git a/packages/opencode/test/server/httpapi-control-plane.test.ts b/packages/opencode/test/server/httpapi-control-plane.test.ts
+index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240924f4be3 100644
+--- a/packages/opencode/test/server/httpapi-control-plane.test.ts
++++ b/packages/opencode/test/server/httpapi-control-plane.test.ts
+@@ -17,6 +17,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
+ import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
+ import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+ import { testEffect } from "../lib/effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
+ 
+ const input = MoveSession.Input.make({
+   sessionID: SessionV2.ID.make("ses_move"),
+@@ -28,6 +29,7 @@ const called = Ref.makeUnsafe<MoveSession.Input | undefined>(undefined)
+ const apiLayer = HttpRouter.serve(
+   HttpApiBuilder.layer(RootHttpApi).pipe(
+     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++    Layer.provide(HostedApprovalCoordinator.layer),
+     Layer.provide([authorizationLayer, schemaErrorLayer]),
+     // Raw HttpApi routes expose an opaque handler context at the request boundary.
+     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
+index bcbe7aecbba4dca653d83c81658d3d08ff08f846..5651f16b50c72f3dd557e112751a258bdd1d1f30 100644
+--- a/packages/opencode/test/server/httpapi-global.test.ts
++++ b/packages/opencode/test/server/httpapi-global.test.ts
+@@ -16,10 +16,12 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
+ import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
+ import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+ import { testEffect } from "../lib/effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
+ 
+ const apiLayer = HttpRouter.serve(
+   HttpApiBuilder.layer(RootHttpApi).pipe(
+     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++    Layer.provide(HostedApprovalCoordinator.layer),
+     Layer.provide([authorizationLayer, schemaErrorLayer]),
+     // Raw HttpApi routes expose an opaque handler context at the request boundary.
+     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b798a4c23ef97e1ffd474674b6095166ae9453e
+--- /dev/null
++++ b/packages/opencode/docs/hosted-approval-v2.md
+@@ -0,0 +1,36 @@
++# Hosted approval v2
++
++OpenCode exposes hosted approval only when standard server Basic authentication
++is configured. The capability, observe, and conditional reply endpoints use the
++same Authorization and workspace routing middleware as `/permission`. Without a
++server password all three return 404; bad credentials return 401.
++
++The protocol identifier is `agent-teams-hosted-approval-v2`. One process-wide
++coordinator owns a random `runtime_instance_<32 lowercase hex>` and a random
++`config_generation_<32 lowercase hex>`. Each session observed by the permission
++service also owns a random `session_incarnation_<32 lowercase hex>` that changes
++after deletion/recreation and across process restarts. The generation changes after successful
++config writes and after an ordinary `always` reply changes approval policy.
++Credentials are outside this generation and must be bound separately by clients.
++
++Pending requests are observed per session at
++`GET /experimental/agent-teams/hosted-approval/session/:sessionID/permissions`.
++Each insertion receives a random `request_incarnation_<32 lowercase hex>` and is
++bound to its session incarnation.
++Responses are all-or-nothing, limited to 256 requests and 1 MiB JSON.
++
++Conditional replies use
++`POST /experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply`.
++Bodies are limited to 16 KiB, fatal UTF-8 decoded, checked for duplicate JSON
++keys, and exact-schema decoded. Runtime/config mismatches return 412 with no
++effect. Missing, replayed, wrong-session, stale-session-incarnation,
++wrong-request-incarnation, or digest mismatches
++return 409 with no effect. Successful replies settle exactly one request; reject
++never cascades and `always` is not supported.
++
++Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
++are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
++JSON primitives use `JSON.stringify`. Golden vectors:
++
++- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
++- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
 diff --git a/packages/opencode/src/hosted-approval/coordinator.ts b/packages/opencode/src/hosted-approval/coordinator.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..bc3fbbb4f24cccb90247376e182736f57f202d63
@@ -237,860 +1504,6 @@ index 0000000000000000000000000000000000000000..b37e769f07e1f6fbe2ffa14f7b6e562e
 +export function rawPermission<T>(value: T): T {
 +  return JSON.parse(JSON.stringify(value)) as T
 +}
-diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
-index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..09e4a40bd2d6167053479a8badaed81edc86aadb 100644
---- a/packages/opencode/src/permission/index.ts
-+++ b/packages/opencode/src/permission/index.ts
-@@ -2,21 +2,52 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
- import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
- import { InstanceState } from "@/effect/instance-state"
- import { Wildcard } from "@opencode-ai/core/util/wildcard"
--import { Deferred, Effect, Layer, Context } from "effect"
-+import { Deferred, Effect, Layer, Context, Semaphore } from "effect"
- import os from "os"
- import { PermissionV1 } from "@opencode-ai/core/v1/permission"
- import { EventV2Bridge } from "@/event-v2-bridge"
-+import { randomUUID } from "node:crypto"
-+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
- 
- export const Event = PermissionV1.Event
- 
- export interface Interface {
-   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
-   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
-+  /**
-+   * Claims and settles exactly one pending request when its full external
-+   * incarnation still matches. Unlike the interactive reply operation this
-+   * never cascades to other requests and never persists an approval rule.
-+   */
-+  readonly conditionalReply: (
-+    input: ConditionalReplyInput,
-+  ) => Effect.Effect<ConditionalReplyResult>
-   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
-+  readonly hostedList: () => Effect.Effect<ReadonlyArray<HostedPendingRequest>>
-+}
-+
-+export interface ConditionalReplyInput {
-+  readonly requestID: PermissionV1.ID
-+  readonly sessionID: PermissionV1.Request["sessionID"]
-+  readonly requestIncarnation: string
-+  readonly reply: "once" | "reject"
-+  readonly message?: string
-+  /** Runs synchronously while the permission state lock is held. */
-+  readonly matches: (request: PermissionV1.Request) => boolean
-+}
-+
-+export type ConditionalReplyResult =
-+  | { readonly status: "applied"; readonly request: PermissionV1.Request }
-+  | { readonly status: "mismatch" }
-+
-+export interface HostedPendingRequest {
-+  readonly request: PermissionV1.Request
-+  readonly requestIncarnation: string
- }
- 
- interface PendingEntry {
-   info: PermissionV1.Request
-+  requestIncarnation: string
-   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
- }
- 
-@@ -43,6 +74,8 @@ const layer = Layer.effect(
-   Service,
-   Effect.gen(function* () {
-     const events = yield* EventV2Bridge.Service
-+    const hostedApproval = yield* HostedApprovalCoordinator.Service
-+    const mutex = Semaphore.makeUnsafe(1)
-     const state = yield* InstanceState.make<State>(
-       Effect.fn("Permission.state")(function* (ctx) {
-         void ctx
-@@ -65,113 +98,182 @@ const layer = Layer.effect(
-     )
- 
-     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
--      const { approved, pending } = yield* InstanceState.get(state)
--      const { ruleset, ...request } = input
--      let needsAsk = false
--
--      for (const pattern of request.patterns) {
--        const rule = evaluate(request.permission, pattern, ruleset, approved)
--        yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
--        if (rule.action === "deny") {
--          return yield* new PermissionV1.DeniedError({
--            ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
--          })
--        }
--        if (rule.action === "allow") continue
--        needsAsk = true
--      }
--
--      if (!needsAsk) return
--
--      const id = request.id ?? PermissionV1.ID.ascending()
--      const info: PermissionV1.Request = {
--        id,
--        sessionID: request.sessionID,
--        permission: request.permission,
--        patterns: request.patterns,
--        metadata: request.metadata,
--        always: request.always,
--        tool: request.tool,
--      }
--      yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
--
-       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
--      pending.set(id, { info, deferred })
--      yield* events.publish(Event.Asked, info)
-+      const pendingID = yield* hostedApproval.withConditionalReply(mutex.withPermit(
-+        Effect.gen(function* () {
-+          const { approved, pending } = yield* InstanceState.get(state)
-+          const { ruleset, ...request } = input
-+          let needsAsk = false
-+          for (const pattern of request.patterns) {
-+            const rule = evaluate(request.permission, pattern, ruleset, approved)
-+            yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
-+            if (rule.action === "deny") {
-+              return yield* new PermissionV1.DeniedError({
-+                ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
-+              })
-+            }
-+            if (rule.action !== "allow") needsAsk = true
-+          }
-+          if (!needsAsk) return undefined
-+
-+          const id = request.id ?? PermissionV1.ID.ascending()
-+          // Caller-provided IDs are allowed by the public schema, but replacing
-+          // a live entry would enable request-incarnation ABA and orphan its deferred.
-+          if (pending.has(id)) return yield* new PermissionV1.DeniedError({ ruleset: [] })
-+          const info: PermissionV1.Request = {
-+            id,
-+            sessionID: request.sessionID,
-+            permission: request.permission,
-+            patterns: request.patterns,
-+            metadata: request.metadata,
-+            always: request.always,
-+            tool: request.tool,
-+          }
-+          yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
-+          pending.set(id, { info, requestIncarnation: `request_incarnation_${randomUUID().replaceAll("-", "")}`, deferred })
-+          yield* events.publish(Event.Asked, info)
-+          return id
-+        }),
-+      ))
-+      if (!pendingID) return
-       return yield* Effect.ensuring(
-         Deferred.await(deferred),
--        Effect.sync(() => {
--          pending.delete(id)
--        }),
-+        hostedApproval.withConditionalReply(mutex.withPermit(
-+          Effect.gen(function* () {
-+            // Delete only the exact entry owned by this ask. A future request
-+            // that reuses the ID must not be removed by this finalizer.
-+            const { pending } = yield* InstanceState.get(state)
-+            if (pending.get(pendingID)?.deferred === deferred) pending.delete(pendingID)
-+          }),
-+        )),
-       )
-     })
- 
--    const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
--      const { approved, pending } = yield* InstanceState.get(state)
--      const existing = pending.get(input.requestID)
--      if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
--
--      pending.delete(input.requestID)
--      yield* events.publish(Event.Replied, {
--        sessionID: existing.info.sessionID,
--        requestID: existing.info.id,
--        reply: input.reply,
--      })
--
--      if (input.reply === "reject") {
--        yield* Deferred.fail(
--          existing.deferred,
--          input.message
--            ? new PermissionV1.CorrectedError({ feedback: input.message })
--            : new PermissionV1.RejectedError(),
--        )
-+    const reply = Effect.fn("Permission.reply")((input: PermissionV1.ReplyInput) => {
-+      const settle = mutex.withPermit(
-+        Effect.gen(function* () {
-+          const { approved, pending } = yield* InstanceState.get(state)
-+          const existing = pending.get(input.requestID)
-+          if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
- 
--        for (const [id, item] of pending.entries()) {
--          if (item.info.sessionID !== existing.info.sessionID) continue
--          pending.delete(id)
-+          pending.delete(input.requestID)
-           yield* events.publish(Event.Replied, {
--            sessionID: item.info.sessionID,
--            requestID: item.info.id,
--            reply: "reject",
-+            sessionID: existing.info.sessionID,
-+            requestID: existing.info.id,
-+            reply: input.reply,
-           })
--          yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
--        }
--        return
--      }
--
--      yield* Deferred.succeed(existing.deferred, undefined)
--      if (input.reply === "once") return
--
--      for (const pattern of existing.info.always) {
--        approved.push({
--          permission: existing.info.permission,
--          pattern,
--          action: "allow",
--        })
--      }
--
--      for (const [id, item] of pending.entries()) {
--        if (item.info.sessionID !== existing.info.sessionID) continue
--        const ok = item.info.patterns.every(
--          (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
--        )
--        if (!ok) continue
--        pending.delete(id)
--        yield* events.publish(Event.Replied, {
--          sessionID: item.info.sessionID,
--          requestID: item.info.id,
--          reply: "always",
--        })
--        yield* Deferred.succeed(item.deferred, undefined)
--      }
--    })
- 
--    const list = Effect.fn("Permission.list")(function* () {
--      const pending = (yield* InstanceState.get(state)).pending
--      return Array.from(pending.values(), (item) => item.info)
-+          if (input.reply === "reject") {
-+            yield* Deferred.fail(
-+              existing.deferred,
-+              input.message
-+                ? new PermissionV1.CorrectedError({ feedback: input.message })
-+                : new PermissionV1.RejectedError(),
-+            )
-+
-+            for (const [id, item] of pending.entries()) {
-+              if (item.info.sessionID !== existing.info.sessionID) continue
-+              pending.delete(id)
-+              yield* events.publish(Event.Replied, {
-+                sessionID: item.info.sessionID,
-+                requestID: item.info.id,
-+                reply: "reject",
-+              })
-+              yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
-+            }
-+            return
-+          }
-+
-+          yield* Deferred.succeed(existing.deferred, undefined)
-+          if (input.reply === "once") return
-+
-+          for (const pattern of existing.info.always) {
-+            approved.push({
-+              permission: existing.info.permission,
-+              pattern,
-+              action: "allow",
-+            })
-+          }
-+
-+          for (const [id, item] of pending.entries()) {
-+            if (item.info.sessionID !== existing.info.sessionID) continue
-+            const ok = item.info.patterns.every(
-+              (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
-+            )
-+            if (!ok) continue
-+            pending.delete(id)
-+            yield* events.publish(Event.Replied, {
-+              sessionID: item.info.sessionID,
-+              requestID: item.info.id,
-+              reply: "always",
-+            })
-+            yield* Deferred.succeed(item.deferred, undefined)
-+          }
-+        }),
-+      )
-+      return input.reply === "always"
-+        ? hostedApproval.withConfigMutation(settle)
-+        : hostedApproval.withConditionalReply(settle)
-     })
- 
--    return Service.of({ ask, reply, list })
-+    const conditionalReply = Effect.fn("Permission.conditionalReply")((input: ConditionalReplyInput) =>
-+      Effect.uninterruptible(
-+        mutex.withPermit(
-+          Effect.gen(function* () {
-+            const { pending } = yield* InstanceState.get(state)
-+            const existing = pending.get(input.requestID)
-+            if (!existing) return { status: "mismatch" } as const
-+            if (
-+              existing.info.sessionID !== input.sessionID ||
-+              existing.requestIncarnation !== input.requestIncarnation ||
-+              !input.matches(existing.info)
-+            ) {
-+              return { status: "mismatch" } as const
-+            }
-+
-+            pending.delete(input.requestID)
-+            yield* events.publish(Event.Replied, {
-+              sessionID: existing.info.sessionID,
-+              requestID: existing.info.id,
-+              reply: input.reply,
-+            })
-+            if (input.reply === "once") yield* Deferred.succeed(existing.deferred, undefined)
-+            else {
-+              yield* Deferred.fail(
-+                existing.deferred,
-+                input.message
-+                  ? new PermissionV1.CorrectedError({ feedback: input.message })
-+                  : new PermissionV1.RejectedError(),
-+              )
-+            }
-+            return { status: "applied", request: existing.info } as const
-+          }),
-+        ),
-+      ),
-+    )
-+
-+    const list = Effect.fn("Permission.list")(() =>
-+      hostedApproval.withConditionalReply(mutex.withPermit(
-+        Effect.gen(function* () {
-+          const pending = (yield* InstanceState.get(state)).pending
-+          return Array.from(pending.values(), (item) => item.info)
-+        }),
-+      )),
-+    )
-+
-+    const hostedList = Effect.fn("Permission.hostedList")(() =>
-+      mutex.withPermit(
-+        Effect.gen(function* () {
-+          const pending = (yield* InstanceState.get(state)).pending
-+          return Array.from(pending.values(), ({ info: request, requestIncarnation }) => ({
-+            request,
-+            requestIncarnation,
-+          }))
-+        }),
-+      ),
-+    )
-+
-+    return Service.of({ ask, reply, conditionalReply, list, hostedList })
-   }),
- )
- 
-@@ -218,6 +320,10 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
-   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
- }
- 
--export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
-+export const node = LayerNode.make({
-+  service: Service,
-+  layer: layer,
-+  deps: [EventV2Bridge.node, HostedApprovalCoordinator.node],
-+})
- 
- export * as Permission from "."
-diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
-index 79959db499bd12a359ac84a9a189faebc84c016e..de13fa0210b6abce51bb44714b36d0bc3d43936e 100644
---- a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
-+++ b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
-@@ -8,6 +8,70 @@ import { InstanceContextMiddleware } from "../middleware/instance-context"
- import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
- import { described } from "./metadata"
- 
-+const RuntimeInstanceId = Schema.String.check(Schema.isPattern(/^runtime_instance_[0-9a-f]{32}$/))
-+const ConfigGeneration = Schema.String.check(Schema.isPattern(/^config_generation_[0-9a-f]{32}$/))
-+const RequestIncarnation = Schema.String.check(Schema.isPattern(/^request_incarnation_[0-9a-f]{32}$/))
-+const HostedDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
-+export class HostedConflictError extends Schema.TaggedErrorClass<HostedConflictError>()(
-+  "HostedApprovalConflict",
-+  {},
-+  { httpApiStatus: 409 },
-+) {}
-+export class HostedPreconditionError extends Schema.TaggedErrorClass<HostedPreconditionError>()(
-+  "HostedApprovalPreconditionFailed",
-+  {},
-+  { httpApiStatus: 412 },
-+) {}
-+export class HostedUnavailableError extends Schema.TaggedErrorClass<HostedUnavailableError>()(
-+  "HostedApprovalUnavailable",
-+  {},
-+  { httpApiStatus: 404 },
-+) {}
-+export const HostedReplyPayload = Schema.Struct({
-+  schemaVersion: Schema.Literal(2),
-+  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
-+  runtimeInstanceId: RuntimeInstanceId,
-+  expectedConfigGeneration: ConfigGeneration,
-+  requestId: PermissionV1.ID,
-+  sessionId: Schema.String,
-+  requestIncarnation: RequestIncarnation,
-+  expectedPermissionDigest: HostedDigest,
-+  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
-+})
-+const HostedCapability = Schema.Struct({
-+  schemaVersion: Schema.Literal(2),
-+  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
-+  runtimeInstanceId: RuntimeInstanceId,
-+  configGeneration: ConfigGeneration,
-+  authentication: Schema.Literal("opencode-basic"),
-+})
-+const HostedObserve = Schema.Struct({
-+  schemaVersion: Schema.Literal(2),
-+  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
-+  runtimeInstanceId: RuntimeInstanceId,
-+  configGeneration: ConfigGeneration,
-+  sessionId: Schema.String,
-+  permissions: Schema.Array(Schema.Struct({
-+    requestId: PermissionV1.ID,
-+    sessionId: Schema.String,
-+    requestIncarnation: RequestIncarnation,
-+    permissionDigest: HostedDigest,
-+    rawPermission: PermissionV1.Request,
-+  })),
-+})
-+const HostedReplySuccess = Schema.Struct({
-+  schemaVersion: Schema.Literal(2),
-+  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
-+  status: Schema.Literal("applied"),
-+  runtimeInstanceId: RuntimeInstanceId,
-+  configGeneration: ConfigGeneration,
-+  requestId: PermissionV1.ID,
-+  sessionId: Schema.String,
-+  requestIncarnation: RequestIncarnation,
-+  permissionDigest: HostedDigest,
-+  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
-+})
-+
- const root = "/permission"
- const ReplyPayload = Schema.Struct({
-   reply: PermissionV1.Reply,
-@@ -18,6 +82,24 @@ export const PermissionApi = HttpApi.make("permission")
-   .add(
-     HttpApiGroup.make("permission")
-       .add(
-+        HttpApiEndpoint.get("hostedCapability", "/experimental/agent-teams/hosted-approval-capability", {
-+          query: WorkspaceRoutingQuery,
-+          success: HostedCapability,
-+          error: HostedUnavailableError,
-+        }),
-+        HttpApiEndpoint.get("hostedObserve", "/experimental/agent-teams/hosted-approval/session/:sessionID/permissions", {
-+          params: { sessionID: Schema.String },
-+          query: WorkspaceRoutingQuery,
-+          success: HostedObserve,
-+          error: [HostedUnavailableError, HttpApiError.InternalServerError],
-+        }),
-+        HttpApiEndpoint.post("hostedReply", "/experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply", {
-+          params: { sessionID: Schema.String, requestID: PermissionV1.ID },
-+          query: WorkspaceRoutingQuery,
-+          payload: HostedReplyPayload,
-+          success: HostedReplySuccess,
-+          error: Schema.Union([HttpApiError.BadRequest, HostedConflictError, HostedPreconditionError, HostedUnavailableError]),
-+        }),
-         HttpApiEndpoint.get("list", root, {
-           query: WorkspaceRoutingQuery,
-           success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),
-diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
-index 3d0e8a06c09c6b3a2366b521ff05f7eaca63eff8..0ba6cd511d057757c30a53925cd8b37c8b81fb18 100644
---- a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
-+++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
-@@ -5,19 +5,25 @@ import { Effect } from "effect"
- import { HttpApiBuilder } from "effect/unstable/httpapi"
- import { InstanceHttpApi } from "../api"
- import { markInstanceForDisposal } from "../lifecycle"
-+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
- 
- export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (handlers) =>
-   Effect.gen(function* () {
-     const providerSvc = yield* Provider.Service
-     const configSvc = yield* Config.Service
-+    const hostedApproval = yield* HostedApprovalCoordinator.Service
- 
-     const get = Effect.fn("ConfigHttpApi.get")(function* () {
-       return yield* configSvc.get()
-     })
- 
-     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
--      yield* configSvc.update(ctx.payload)
--      yield* markInstanceForDisposal(yield* InstanceState.context)
-+      yield* hostedApproval.withConfigMutation(
-+        Effect.gen(function* () {
-+          yield* configSvc.update(ctx.payload)
-+          yield* markInstanceForDisposal(yield* InstanceState.context)
-+        }),
-+      )
-       return ctx.payload
-     })
- 
-diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc93197d13f 100644
---- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-+++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-@@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
- import * as Sse from "effect/unstable/encoding/Sse"
- import { RootHttpApi } from "../api"
- import { GlobalUpgradeInput } from "../groups/global"
-+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
- 
- function eventData(data: unknown): Sse.Event {
-   return {
-@@ -70,6 +71,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
-     const config = yield* Config.Service
-     const installation = yield* Installation.Service
-     const bridge = yield* EffectBridge.make()
-+    const hostedApproval = yield* HostedApprovalCoordinator.Service
- 
-     const health = Effect.fn("GlobalHttpApi.health")(function* () {
-       return { healthy: true as const, version: InstallationVersion }
-@@ -84,7 +86,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
-     })
- 
-     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
--      const result = yield* config.updateGlobal(ctx.payload)
-+      const result = yield* hostedApproval.withConfigMutation(config.updateGlobal(ctx.payload), (value) => value.changed)
-       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
-       return result.info
-     })
-diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
-index cdb88490605f1311f02a7d8d0c69806a21ddc514..34f93d917393437a83879b817531f550a15b5d38 100644
---- a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
-+++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
-@@ -1,13 +1,253 @@
- import { PermissionV1 } from "@opencode-ai/core/v1/permission"
- import { Permission } from "@/permission"
- import { Effect } from "effect"
--import { HttpApiBuilder } from "effect/unstable/httpapi"
-+import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
- import { InstanceHttpApi } from "../api"
- import { PermissionNotFoundError } from "../errors"
-+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
-+import { digest, protocol, rawPermission } from "@/hosted-approval/protocol"
-+import { HostedConflictError, HostedPreconditionError, HostedReplyPayload, HostedUnavailableError } from "../groups/permission"
-+import { ServerAuth } from "@/server/auth"
-+import { Schema, Stream } from "effect"
-+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
-+
-+function rejectDuplicateJsonKeys(text: string): void {
-+  let offset = 0
-+  const whitespace = () => { while (/\s/.test(text[offset] ?? "")) offset++ }
-+  const string = () => {
-+    const start = offset
-+    if (text[offset++] !== '"') throw new Error("invalid string")
-+    while (offset < text.length) {
-+      const char = text[offset++]
-+      if (char === '"') return JSON.parse(text.slice(start, offset)) as string
-+      if (char === "\\") offset++
-+    }
-+    throw new Error("unterminated string")
-+  }
-+  const value = (): void => {
-+    whitespace()
-+    if (text[offset] === "{") {
-+      offset++
-+      const keys = new Set<string>()
-+      whitespace()
-+      if (text[offset] === "}") { offset++; return }
-+      while (true) {
-+        whitespace()
-+        const key = string()
-+        if (keys.has(key)) throw new Error("duplicate key")
-+        keys.add(key)
-+        whitespace()
-+        if (text[offset++] !== ":") throw new Error("invalid object")
-+        value()
-+        whitespace()
-+        const delimiter = text[offset++]
-+        if (delimiter === "}") return
-+        if (delimiter !== ",") throw new Error("invalid object")
-+      }
-+    }
-+    if (text[offset] === "[") {
-+      offset++
-+      whitespace()
-+      if (text[offset] === "]") { offset++; return }
-+      while (true) {
-+        value(); whitespace()
-+        const delimiter = text[offset++]
-+        if (delimiter === "]") return
-+        if (delimiter !== ",") throw new Error("invalid array")
-+      }
-+    }
-+    if (text[offset] === '"') { string(); return }
-+    const match = text.slice(offset).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/)
-+    if (!match) throw new Error("invalid value")
-+    offset += match[0].length
-+  }
-+  value(); whitespace()
-+  if (offset !== text.length) throw new Error("trailing data")
-+}
-+
-+const HOSTED_REPLY_KEYS = [
-+  "decision",
-+  "expectedConfigGeneration",
-+  "expectedPermissionDigest",
-+  "protocol",
-+  "requestId",
-+  "requestIncarnation",
-+  "runtimeInstanceId",
-+  "schemaVersion",
-+  "sessionId",
-+] as const
-+
-+export class HostedReplyBodyError extends Error {}
-+
-+export const readHostedReplyBody = Effect.fn("PermissionHttpApi.readHostedReplyBody")(
-+  <E>(stream: Stream.Stream<Uint8Array, E>, limit = 16 * 1024) =>
-+    Stream.runFoldEffect(
-+      stream,
-+      () => [] as Uint8Array[],
-+      (chunks, chunk) => {
-+        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
-+        if (size + chunk.byteLength > limit) return Effect.fail(new HostedReplyBodyError("body too large"))
-+        chunks.push(chunk)
-+        return Effect.succeed(chunks)
-+      },
-+    ).pipe(
-+      Effect.mapError((error) => error instanceof HostedReplyBodyError ? error : new HostedReplyBodyError("body read failed")),
-+      Effect.map((chunks) => {
-+        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
-+        const bytes = new Uint8Array(size)
-+        let offset = 0
-+        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
-+        return bytes
-+      }),
-+    ),
-+)
- 
- export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
-   Effect.gen(function* () {
-     const svc = yield* Permission.Service
-+    const hostedApproval = yield* HostedApprovalCoordinator.Service
-+    const serverAuth = yield* ServerAuth.Config
-+
-+    const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
-+      if (!ServerAuth.required(serverAuth)) return yield* new HostedUnavailableError()
-+      return yield* Effect.void
-+    })
-+
-+    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
-+      yield* requireHosted()
-+      return yield* hostedApproval.withConditionalReply(
-+        Effect.sync(() => ({
-+          schemaVersion: 2 as const,
-+          protocol,
-+          ...hostedApproval.snapshot(),
-+          authentication: "opencode-basic" as const,
-+        })),
-+      )
-+    })
-+
-+    const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
-+      params: { sessionID: string }
-+    }) {
-+      yield* requireHosted()
-+      return yield* hostedApproval.withConditionalReply(
-+        Effect.gen(function* () {
-+          const snapshot = hostedApproval.snapshot()
-+          const pending = yield* svc.hostedList()
-+          const permissions = pending
-+            .filter(({ request }) => request.sessionID === ctx.params.sessionID)
-+            .map(({ request, requestIncarnation }) => {
-+              const raw = rawPermission(request)
-+              return {
-+                requestId: request.id,
-+                sessionId: request.sessionID,
-+                requestIncarnation,
-+                permissionDigest: digest(raw),
-+                rawPermission: raw,
-+              }
-+            })
-+          const response = {
-+            schemaVersion: 2 as const,
-+            protocol,
-+            ...snapshot,
-+            sessionId: ctx.params.sessionID,
-+            permissions,
-+          }
-+          const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
-+          if (permissions.length > 256 || bytes > 1024 * 1024) {
-+            yield* Effect.logWarning("hosted approval observe overflow", {
-+              sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
-+              droppedCount: permissions.length,
-+              droppedBytes: bytes,
-+            })
-+            return yield* new HttpApiError.InternalServerError()
-+          }
-+          return response
-+        }),
-+      )
-+    })
-+
-+    const hostedReply = Effect.fn("PermissionHttpApi.hostedReply")(function* (ctx: {
-+      params: { sessionID: string; requestID: PermissionV1.ID }
-+      payload: typeof HostedReplyPayload.Type
-+    }) {
-+      yield* requireHosted()
-+      if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
-+        return yield* new HttpApiError.BadRequest()
-+      }
-+      return yield* hostedApproval.withConditionalReply(
-+        Effect.gen(function* () {
-+          const snapshot = hostedApproval.snapshot()
-+          if (
-+            snapshot.runtimeInstanceId !== ctx.payload.runtimeInstanceId ||
-+            snapshot.configGeneration !== ctx.payload.expectedConfigGeneration
-+          ) return yield* new HostedPreconditionError()
-+
-+          const result = yield* svc.conditionalReply({
-+            requestID: ctx.params.requestID,
-+            sessionID: ctx.payload.sessionId as PermissionV1.Request["sessionID"],
-+            requestIncarnation: ctx.payload.requestIncarnation,
-+            reply: ctx.payload.decision === "allow_once" ? "once" : "reject",
-+            matches: (request) => digest(rawPermission(request)) === ctx.payload.expectedPermissionDigest,
-+          })
-+          if (result.status === "mismatch") return yield* new HostedConflictError()
-+          return {
-+            schemaVersion: 2 as const,
-+            protocol,
-+            status: "applied" as const,
-+            runtimeInstanceId: snapshot.runtimeInstanceId,
-+            configGeneration: snapshot.configGeneration,
-+            requestId: ctx.payload.requestId,
-+            sessionId: ctx.payload.sessionId,
-+            requestIncarnation: ctx.payload.requestIncarnation,
-+            permissionDigest: ctx.payload.expectedPermissionDigest,
-+            decision: ctx.payload.decision,
-+          }
-+        }),
-+      )
-+    })
-+
-+    const hostedReplyRaw = Effect.fn("PermissionHttpApi.hostedReplyRaw")(function* (ctx: {
-+      params: { sessionID: string; requestID: PermissionV1.ID }
-+      request: HttpServerRequest.HttpServerRequest
-+    }) {
-+      const unavailable = yield* requireHosted().pipe(
-+        Effect.match({ onFailure: () => true, onSuccess: () => false }),
-+      )
-+      if (unavailable) return HttpServerResponse.empty({ status: 404 })
-+      const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
-+        Effect.catch(() => Effect.succeed(undefined)),
-+      )
-+      if (!bytes) return HttpServerResponse.empty({ status: 400 })
-+      let text: string
-+      try {
-+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
-+        rejectDuplicateJsonKeys(text)
-+      } catch {
-+        return HttpServerResponse.empty({ status: 400 })
-+      }
-+      let untyped: unknown
-+      try { untyped = JSON.parse(text) } catch { return HttpServerResponse.empty({ status: 400 }) }
-+      if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) return HttpServerResponse.empty({ status: 400 })
-+      const keys = Object.keys(untyped).sort()
-+      if (keys.length !== HOSTED_REPLY_KEYS.length || keys.some((key, index) => key !== HOSTED_REPLY_KEYS[index])) {
-+        return HttpServerResponse.empty({ status: 400 })
-+      }
-+      const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HostedReplyPayload))(text, {
-+        onExcessProperty: "error",
-+      }).pipe(
-+        Effect.catch(() => Effect.succeed(undefined)),
-+      )
-+      if (!payload) return HttpServerResponse.empty({ status: 400 })
-+      const result = yield* hostedReply({ params: ctx.params, payload }).pipe(
-+        Effect.catchTags({
-+          BadRequest: () => Effect.succeed(HttpServerResponse.empty({ status: 400 })),
-+          HostedApprovalConflict: () => Effect.succeed(HttpServerResponse.empty({ status: 409 })),
-+          HostedApprovalPreconditionFailed: () => Effect.succeed(HttpServerResponse.empty({ status: 412 })),
-+        }),
-+      )
-+      if (HttpServerResponse.isHttpServerResponse(result)) return result
-+      return HttpServerResponse.jsonUnsafe(result)
-+    })
- 
-     const list = Effect.fn("PermissionHttpApi.list")(function* () {
-       return yield* svc.list()
-@@ -36,6 +276,11 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
-       return true
-     })
- 
--    return handlers.handle("list", list).handle("reply", reply)
-+    return handlers
-+      .handle("hostedCapability", hostedCapability)
-+      .handle("hostedObserve", hostedObserve)
-+      .handleRaw("hostedReply", hostedReplyRaw)
-+      .handle("list", list)
-+      .handle("reply", reply)
-   }),
- )
-diff --git a/packages/opencode/src/server/routes/instance/httpapi/server.ts b/packages/opencode/src/server/routes/instance/httpapi/server.ts
-index fb9d2db65621540a514786f2061714f16b6c766c..d942753d204268d24d53a36804cd832ff6f884f5 100644
---- a/packages/opencode/src/server/routes/instance/httpapi/server.ts
-+++ b/packages/opencode/src/server/routes/instance/httpapi/server.ts
-@@ -49,6 +49,7 @@ import { ToolRegistry } from "@/tool/registry"
- import { Truncate } from "@/tool/truncate"
- import { Worktree } from "@/worktree"
- import { RuntimeFlags } from "@/effect/runtime-flags"
-+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
- import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
- import { Database } from "@opencode-ai/core/database/database"
- import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
-@@ -140,6 +141,7 @@ const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide(Serve
- const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
- const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
-   Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
-+  Layer.provide(HostedApprovalCoordinator.layer),
-   Layer.provide(schemaErrorLayer),
-   Layer.provide(httpApiAuthLayer),
- )
-@@ -169,6 +171,8 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
-     tuiHandlers,
-     workspaceHandlers,
-   ]),
-+  Layer.provide(HostedApprovalCoordinator.layer),
-+  Layer.provide(ServerAuth.Config.layer),
- )
- 
- const instanceRoutes = instanceApiRoutes.pipe(
-@@ -237,6 +241,7 @@ const app = LayerNode.group([
-   SessionStatus.node,
-   BackgroundJob.node,
-   RuntimeFlags.node,
-+  HostedApprovalCoordinator.node,
-   EventV2Bridge.node,
-   SessionRunState.node,
-   SessionProcessor.node,
-diff --git a/packages/opencode/test/config/config.test.ts b/packages/opencode/test/config/config.test.ts
-index e281831ddfa8e09a70ddb37076b02dbf252701fc..2f3fa6f841dfeeb3f1044b0ff4a9125f26094996 100644
---- a/packages/opencode/test/config/config.test.ts
-+++ b/packages/opencode/test/config/config.test.ts
-@@ -371,6 +371,22 @@ it.instance("updates config and preserves empty shell sentinel", () =>
-   }),
- )
- 
-+it.instance("serializes concurrent updates to the same config file", () =>
-+  Effect.gen(function* () {
-+    const test = yield* TestInstance
-+    const config = yield* Config.Service
-+    yield* Effect.all(
-+      [config.update({ model: "test/model" }), config.update({ username: "test-user" })],
-+      { concurrency: "unbounded" },
-+    )
-+
-+    expect(yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))).toMatchObject({
-+      model: "test/model",
-+      username: "test-user",
-+    })
-+  }),
-+)
-+
- it.effect("updates global config and omits empty shell key in json", () =>
-   withGlobalConfig({ config: { shell: "bash" } }, ({ dir }) =>
-     Effect.gen(function* () {
 diff --git a/packages/opencode/test/hosted-approval/coordinator.test.ts b/packages/opencode/test/hosted-approval/coordinator.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..da099bdb34ca2b13345a369a89f57dd8bb34cc51
@@ -1294,270 +1707,38 @@ index 0000000000000000000000000000000000000000..66f91bf650a5d10bbb338c84982cefdd
 +  expect(exit._tag).toBe("Failure")
 +  expect(consumed).toBe(2)
 +})
-diff --git a/packages/opencode/test/permission/next.test.ts b/packages/opencode/test/permission/next.test.ts
-index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..7ee5651c9ff74a4dfaec704db2f6eb10e40052b6 100644
---- a/packages/opencode/test/permission/next.test.ts
-+++ b/packages/opencode/test/permission/next.test.ts
-@@ -68,12 +68,24 @@ const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
-     return yield* permission.reply(input)
-   })
- 
-+const conditionalReply = (input: Parameters<Permission.Interface["conditionalReply"]>[0]) =>
-+  Effect.gen(function* () {
-+    const permission = yield* Permission.Service
-+    return yield* permission.conditionalReply(input)
-+  })
-+
- const list = () =>
-   Effect.gen(function* () {
-     const permission = yield* Permission.Service
-     return yield* permission.list()
-   })
- 
-+const hostedList = () =>
-+  Effect.gen(function* () {
-+    const permission = yield* Permission.Service
-+    return yield* permission.hostedList()
-+  })
-+
- // fromConfig tests
- 
- test("fromConfig - string value becomes wildcard rule", () => {
-@@ -741,6 +753,174 @@ it.instance(
-   { git: true },
- )
- 
-+it.instance(
-+  "conditional reply - concurrent callers settle exactly once",
-+  () =>
-+    Effect.gen(function* () {
-+      const requestID = PermissionV1.ID.make("per_conditional_concurrent")
-+      const sessionID = SessionID.make("session_conditional_concurrent")
-+      const asked = yield* ask({
-+        id: requestID,
-+        sessionID,
-+        permission: "bash",
-+        patterns: ["ls"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.forkScoped)
-+
-+      yield* waitForPending(1)
-+      const [{ requestIncarnation }] = yield* hostedList()
-+      let matched = 0
-+      const settle = conditionalReply({
-+        requestID,
-+        sessionID,
-+        requestIncarnation,
-+        reply: "once",
-+        matches: () => {
-+          matched += 1
-+          return true
-+        },
-+      }).pipe(Effect.exit)
-+      const [left, right] = yield* Effect.all([settle, settle], { concurrency: "unbounded" })
-+
-+      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "applied")).toHaveLength(1)
-+      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "mismatch")).toHaveLength(1)
-+      expect(matched).toBe(1)
-+      yield* Fiber.join(asked)
-+      expect(yield* list()).toHaveLength(0)
-+    }),
-+  { git: true },
-+)
-+
-+it.instance(
-+  "ask - duplicate live request ID cannot replace its incarnation",
-+  () =>
-+    Effect.gen(function* () {
-+      const requestID = PermissionV1.ID.make("per_duplicate_live")
-+      const first = yield* ask({
-+        id: requestID,
-+        sessionID: SessionID.make("session_duplicate_first"),
-+        permission: "bash",
-+        patterns: ["ls"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.forkScoped)
-+      yield* waitForPending(1)
-+      const [before] = yield* hostedList()
-+
-+      const duplicate = yield* ask({
-+        id: requestID,
-+        sessionID: SessionID.make("session_duplicate_second"),
-+        permission: "edit",
-+        patterns: ["file.ts"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.exit)
-+      expect(Exit.isFailure(duplicate)).toBe(true)
-+      const [after] = yield* hostedList()
-+      expect(after.request.sessionID).toBe(before.request.sessionID)
-+      expect(after.requestIncarnation).toBe(before.requestIncarnation)
-+
-+      yield* conditionalReply({
-+        requestID,
-+        sessionID: before.request.sessionID,
-+        requestIncarnation: before.requestIncarnation,
-+        reply: "once",
-+        matches: () => true,
-+      })
-+      yield* Fiber.join(first)
-+    }),
-+  { git: true },
-+)
-+
-+it.instance(
-+  "conditional reply - reject is scoped to one request",
-+  () =>
-+    Effect.gen(function* () {
-+      const sessionID = SessionID.make("session_conditional_scoped")
-+      const firstID = PermissionV1.ID.make("per_conditional_first")
-+      const secondID = PermissionV1.ID.make("per_conditional_second")
-+      const first = yield* ask({
-+        id: firstID,
-+        sessionID,
-+        permission: "bash",
-+        patterns: ["ls"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.forkScoped)
-+      const second = yield* ask({
-+        id: secondID,
-+        sessionID,
-+        permission: "edit",
-+        patterns: ["file.ts"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.forkScoped)
-+
-+      yield* waitForPending(2)
-+      const incarnations = new Map((yield* hostedList()).map((item) => [item.request.id, item.requestIncarnation]))
-+      yield* conditionalReply({
-+        requestID: firstID,
-+        sessionID,
-+        requestIncarnation: incarnations.get(firstID)!,
-+        reply: "reject",
-+        matches: () => true,
-+      })
-+
-+      const firstExit = yield* Fiber.await(first)
-+      expect(Exit.isFailure(firstExit)).toBe(true)
-+      expect((yield* list()).map((request) => request.id)).toEqual([secondID])
-+      yield* conditionalReply({
-+        requestID: secondID,
-+        sessionID,
-+        requestIncarnation: incarnations.get(secondID)!,
-+        reply: "once",
-+        matches: () => true,
-+      })
-+      yield* Fiber.join(second)
-+    }),
-+  { git: true },
-+)
-+
-+it.instance(
-+  "conditional reply - mismatched incarnation performs no effect",
-+  () =>
-+    Effect.gen(function* () {
-+      const requestID = PermissionV1.ID.make("per_conditional_mismatch")
-+      const sessionID = SessionID.make("session_conditional_mismatch")
-+      const asked = yield* ask({
-+        id: requestID,
-+        sessionID,
-+        permission: "bash",
-+        patterns: ["ls"],
-+        metadata: {},
-+        always: [],
-+        ruleset: [],
-+      }).pipe(Effect.forkScoped)
-+
-+      yield* waitForPending(1)
-+      const [{ requestIncarnation }] = yield* hostedList()
-+      const mismatch = yield* conditionalReply({
-+        requestID,
-+        sessionID,
-+        requestIncarnation,
-+        reply: "once",
-+        matches: () => false,
-+      })
-+      expect(mismatch.status).toBe("mismatch")
-+      expect((yield* list()).map((request) => request.id)).toEqual([requestID])
-+
-+      yield* conditionalReply({ requestID, sessionID, requestIncarnation, reply: "once", matches: () => true })
-+      yield* Fiber.join(asked)
-+    }),
-+  { git: true },
-+)
-+
- it.instance(
-   "reply - reject with message throws CorrectedError",
-   () =>
-diff --git a/packages/opencode/test/server/httpapi-control-plane.test.ts b/packages/opencode/test/server/httpapi-control-plane.test.ts
-index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240924f4be3 100644
---- a/packages/opencode/test/server/httpapi-control-plane.test.ts
-+++ b/packages/opencode/test/server/httpapi-control-plane.test.ts
-@@ -17,6 +17,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
- import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
- import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
- import { testEffect } from "../lib/effect"
-+import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
- 
- const input = MoveSession.Input.make({
-   sessionID: SessionV2.ID.make("ses_move"),
-@@ -28,6 +29,7 @@ const called = Ref.makeUnsafe<MoveSession.Input | undefined>(undefined)
- const apiLayer = HttpRouter.serve(
-   HttpApiBuilder.layer(RootHttpApi).pipe(
-     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
-+    Layer.provide(HostedApprovalCoordinator.layer),
-     Layer.provide([authorizationLayer, schemaErrorLayer]),
-     // Raw HttpApi routes expose an opaque handler context at the request boundary.
-     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
-diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
-index bcbe7aecbba4dca653d83c81658d3d08ff08f846..5651f16b50c72f3dd557e112751a258bdd1d1f30 100644
---- a/packages/opencode/test/server/httpapi-global.test.ts
-+++ b/packages/opencode/test/server/httpapi-global.test.ts
-@@ -16,10 +16,12 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
- import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
- import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
- import { testEffect } from "../lib/effect"
-+import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
- 
- const apiLayer = HttpRouter.serve(
-   HttpApiBuilder.layer(RootHttpApi).pipe(
-     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
-+    Layer.provide(HostedApprovalCoordinator.layer),
-     Layer.provide([authorizationLayer, schemaErrorLayer]),
-     // Raw HttpApi routes expose an opaque handler context at the request boundary.
-     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf7bfc38a7
+index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7e1e2c385
 --- /dev/null
 +++ b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
-@@ -0,0 +1,157 @@
+@@ -0,0 +1,240 @@
 +import { afterEach, describe, expect, test } from "bun:test"
-+import { ConfigProvider, Layer } from "effect"
++import { ConfigProvider, Effect, Exit, Fiber, Layer } from "effect"
 +import { HttpRouter } from "effect/unstable/http"
++import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { AppRuntime } from "../../src/effect/app-runtime"
++import { memoMap } from "@opencode-ai/core/effect/memo-map"
++import { Permission } from "../../src/permission"
++import { InstanceStore } from "../../src/project/instance-store"
 +import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 +import { ServerAuth } from "../../src/server/auth"
++import { SessionID } from "../../src/session/schema"
 +import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 +import { resetDatabase } from "../fixture/db"
 +
++const apps = new Set<{ dispose: () => Promise<void> }>()
++
 +function app(password?: string) {
-+  const handler = HttpRouter.toWebHandler(
++  const web = HttpRouter.toWebHandler(
 +    HttpApiApp.routes.pipe(
 +      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
 +    ),
-+    { disableLogger: true },
-+  ).handler
++    { disableLogger: true, memoMap },
++  )
++  apps.add(web)
 +  return (path: string, init?: RequestInit) =>
-+    handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context)
++    web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context)
 +}
 +
 +function auth(password = "secret") {
@@ -1565,6 +1746,8 @@ index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf
 +}
 +
 +afterEach(async () => {
++  await Promise.all(Array.from(apps, (web) => web.dispose()))
++  apps.clear()
 +  await disposeAllInstances()
 +  await resetDatabase()
 +})
@@ -1636,6 +1819,7 @@ index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf
 +      expectedConfigGeneration: capability.configGeneration,
 +      requestId: "per_missing",
 +      sessionId: "ses_missing",
++      sessionIncarnation: `session_incarnation_${"3".repeat(32)}`,
 +      requestIncarnation: `request_incarnation_${"1".repeat(32)}`,
 +      expectedPermissionDigest: "2".repeat(64),
 +      decision: "allow_once",
@@ -1670,6 +1854,7 @@ index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf
 +      expectedConfigGeneration: capability.configGeneration,
 +      requestId: "per_missing",
 +      sessionId: "ses_missing",
++      sessionIncarnation: `session_incarnation_${"3".repeat(32)}`,
 +      requestIncarnation: `request_incarnation_${"1".repeat(32)}`,
 +      expectedPermissionDigest: "2".repeat(64),
 +      decision: "allow_once",
@@ -1678,8 +1863,78 @@ index 0000000000000000000000000000000000000000..33ab3bb80087d4baa8b9464b5745abdf
 +    expect((await post("{" )).status).toBe(400)
 +    expect((await post('{"schemaVersion":2,"schemaVersion":2}')).status).toBe(400)
 +    expect((await post("x".repeat(16 * 1024 + 1))).status).toBe(400)
++    const legacy = Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "sessionIncarnation"))
++    expect((await post(JSON.stringify(legacy))).status).toBe(400)
 +    expect((await post(JSON.stringify(valid))).status).toBe(409)
 +    expect((await post(JSON.stringify({ ...valid, runtimeInstanceId: `runtime_instance_${"f".repeat(32)}` }))).status).toBe(412)
++  })
++
++  test("authenticates and applies one real pending request exactly once", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const headers = {
++      "content-type": "application/json",
++      "x-opencode-directory": dir.path,
++      authorization: auth(),
++    }
++    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    const requestID = PermissionV1.ID.make("per_hosted_http_once")
++    const sessionID = SessionID.make("ses_hosted_http_once")
++    const asked = AppRuntime.runFork(
++      InstanceStore.Service.use((store) =>
++        store.provide(
++          { directory: dir.path },
++          Permission.Service.use((permission) =>
++            permission.ask({
++              id: requestID,
++              sessionID,
++              permission: "bash",
++              patterns: ["ls"],
++              metadata: {},
++              always: [],
++              ruleset: [],
++            }),
++          ),
++        ),
++      ),
++    )
++    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
++    const observed = await Effect.runPromise(
++      Effect.gen(function* () {
++        while (true) {
++          const response = yield* Effect.promise(() => request(observePath, { headers }))
++          const body = yield* Effect.promise(() => response.json())
++          if (body.permissions.length === 1) return body
++          yield* Effect.sleep("10 millis")
++        }
++      }).pipe(Effect.timeout("2 seconds")),
++    )
++    const pending = observed.permissions[0]
++    const body = {
++      schemaVersion: 2,
++      protocol: "agent-teams-hosted-approval-v2",
++      runtimeInstanceId: capability.runtimeInstanceId,
++      expectedConfigGeneration: capability.configGeneration,
++      requestId: pending.requestId,
++      sessionId: pending.sessionId,
++      sessionIncarnation: pending.sessionIncarnation,
++      requestIncarnation: pending.requestIncarnation,
++      expectedPermissionDigest: pending.permissionDigest,
++      decision: "allow_once",
++    }
++    const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
++    const applied = await request(path, { method: "POST", headers, body: JSON.stringify(body) })
++    expect(applied.status).toBe(200)
++    expect(await applied.json()).toMatchObject({
++      status: "applied",
++      requestId: requestID,
++      sessionId: sessionID,
++      permissionDigest: pending.permissionDigest,
++      decision: "allow_once",
++    })
++    expect((await request(path, { method: "POST", headers, body: JSON.stringify(body) })).status).toBe(409)
++    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
++    expect((await (await request(observePath, { headers })).json()).permissions).toEqual([])
 +  })
 +
 +  test("config mutation rotates the same authority observed by hosted routes", async () => {
