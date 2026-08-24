@@ -187,7 +187,31 @@ jobs:
         with:
           name: hardened-release-candidate
           path: release
-      - name: Refuse every existing tag, release, or asset collision
+      - name: Verify live hardened-release environment protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/hardened-release"
+          environment="$(mktemp)"
+          policies="$(mktemp)"
+          gh api "repos/$GITHUB_REPOSITORY/environments/hardened-release" >"$environment"
+          jq -e '
+            [.protection_rules[]? | select(.type == "required_reviewers")] as $review_rules
+            | ($review_rules | length) >= 1
+            and ([$review_rules[].reviewers[]?] | length) >= 1
+            and all($review_rules[]; (has("prevent_self_review") | not) or .prevent_self_review == true)
+            and .can_admins_bypass == false
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+          ' "$environment"
+          gh api "repos/$GITHUB_REPOSITORY/environments/hardened-release/deployment-branch-policies" >"$policies"
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and .branch_policies[0].name == "hardened-release"
+            and .branch_policies[0].type == "branch"
+          ' "$policies"
+      - name: Refuse an existing release and validate candidate assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -203,14 +227,21 @@ jobs:
               return 1
             fi
           }
-          require_absent "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"
           require_absent "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
           test "$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: release/*
-      - name: Create exact-source draft prerelease without clobbering
+      - name: Atomically own exact-source tag and create draft prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$TAG" release/* --draft --prerelease --target "$SOURCE_COMMIT" --title "$TAG" --notes "Hardened non-production prerelease. productionEligible=false."
+          created_ref="$(mktemp)"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$SOURCE_COMMIT" >"$created_ref"
+          test "$(jq -r .ref "$created_ref")" = "refs/tags/$TAG"
+          test "$(jq -r .object.type "$created_ref")" = "commit"
+          test "$(jq -r .object.sha "$created_ref")" = "$SOURCE_COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          gh release create "$TAG" release/* --verify-tag --draft --prerelease --title "$TAG" --notes "Hardened non-production prerelease. productionEligible=false."

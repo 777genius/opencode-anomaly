@@ -126,6 +126,14 @@ describe("hardened release contract", () => {
   test("keeps mutations in the protected dispatch-only final job", async () => {
     const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
     const parsed = Bun.YAML.parse(workflow) as any
+    const steps = parsed.jobs["hardened-release"].steps
+    const environmentGuard = steps.find(
+      (step: any) => step.name === "Verify live hardened-release environment protections",
+    )
+    const preflight = steps.find((step: any) => step.name === "Refuse an existing release and validate candidate assets")
+    const release = steps.find(
+      (step: any) => step.name === "Atomically own exact-source tag and create draft prerelease",
+    )
     expect(parsed.jobs["hardened-release"].if).toBe(
       "github.event_name == 'workflow_dispatch' && github.repository == '777genius/opencode-anomaly'",
     )
@@ -137,8 +145,28 @@ describe("hardened release contract", () => {
     })
     expect(workflow.match(/persist-credentials: false/g)).toHaveLength(9)
     expect(workflow).not.toContain("persist-credentials: true")
-    expect(workflow).toContain('require_absent "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"')
     expect(workflow).toContain("validate-manifest --manifest release/release-manifest.json")
+    expect(steps.indexOf(environmentGuard)).toBeLessThan(
+      steps.findIndex((step: any) => step.uses?.startsWith("actions/attest-build-provenance@")),
+    )
+    expect(environmentGuard.run).toContain('test "$GITHUB_REF" = "refs/heads/hardened-release"')
+    expect(environmentGuard.run).toContain('environments/hardened-release" >"$environment"')
+    expect(environmentGuard.run).toContain('select(.type == "required_reviewers")')
+    expect(environmentGuard.run).toContain('has("prevent_self_review")')
+    expect(environmentGuard.run).toContain(".can_admins_bypass == false")
+    expect(environmentGuard.run).toContain(".deployment_branch_policy.custom_branch_policies == true")
+    expect(environmentGuard.run).toContain('environments/hardened-release/deployment-branch-policies')
+    expect(environmentGuard.run).toContain('.total_count == 1')
+    expect(environmentGuard.run).toContain('.branch_policies[0].name == "hardened-release"')
+    expect(environmentGuard.run).toContain('.branch_policies[0].type == "branch"')
+    expect(preflight.run).toContain('require_absent "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"')
+    expect(preflight.run).not.toContain('require_absent "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"')
+    expect(release.run).toContain('gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"')
+    expect(release.run).toContain('-f ref="refs/tags/$TAG"')
+    expect(release.run).toContain('-f sha="$SOURCE_COMMIT"')
+    expect(release.run).toContain('commits/$TAG" --jq .sha')
+    expect(release.run).toContain('gh release create "$TAG" release/* --verify-tag')
+    expect(release.run).not.toContain("--target")
     for (const line of workflow.split("\n").filter((line) => line.trim().startsWith("uses:"))) {
       expect(line).toMatch(/@[0-9a-f]{40}(?:\s+#.*)?$/)
     }
