@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { ConfigProvider, Effect, Exit, Fiber, Layer } from "effect"
+import { ConfigProvider, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { AppRuntime } from "../../src/effect/app-runtime"
-import { memoMap } from "@opencode-ai/core/effect/memo-map"
+import { AppLayer } from "../../src/effect/app-runtime"
+import { attach } from "../../src/effect/run-service"
 import { Permission } from "../../src/permission"
 import { InstanceStore } from "../../src/project/instance-store"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
@@ -15,15 +15,28 @@ import { resetDatabase } from "../fixture/db"
 const apps = new Set<{ dispose: () => Promise<void> }>()
 
 function app(password?: string) {
+  const memoMap = Layer.makeMemoMapUnsafe()
+  const runtime = ManagedRuntime.make(AppLayer, { memoMap })
   const web = HttpRouter.toWebHandler(
     HttpApiApp.routes.pipe(
       Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
     ),
     { disableLogger: true, memoMap },
   )
-  apps.add(web)
-  return (path: string, init?: RequestInit) =>
-    web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context)
+  apps.add({
+    dispose: async () => {
+      await web.dispose()
+      await runtime.dispose()
+    },
+  })
+  return Object.assign(
+    (path: string, init?: RequestInit) =>
+      web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context),
+    {
+      runFork: <A, E>(effect: Effect.Effect<A, E, ManagedRuntime.ManagedRuntime.Services<typeof runtime>>) =>
+        runtime.runFork(attach(effect)),
+    },
+  )
 }
 
 function auth(password = "secret") {
@@ -68,6 +81,17 @@ describe("hosted approval v2 HttpApi", () => {
       },
     )
     expect(response.status).toBe(404)
+  })
+
+  test("isolates hosted availability between app runtimes", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const unavailable = app()
+    const available = app("secret")
+    const path = "/experimental/agent-teams/hosted-approval-capability"
+    const headers = { "x-opencode-directory": dir.path }
+
+    expect((await unavailable(path, { headers })).status).toBe(404)
+    expect((await available(path, { headers: { ...headers, authorization: auth() } })).status).toBe(200)
   })
 
   test("requires standard Basic auth for capability", async () => {
@@ -165,7 +189,7 @@ describe("hosted approval v2 HttpApi", () => {
     const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
     const requestID = PermissionV1.ID.make("per_hosted_http_once")
     const sessionID = SessionID.make("ses_hosted_http_once")
-    const asked = AppRuntime.runFork(
+    const asked = request.runFork(
       InstanceStore.Service.use((store) =>
         store.provide(
           { directory: dir.path },
