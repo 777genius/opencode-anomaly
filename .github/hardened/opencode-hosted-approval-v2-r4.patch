@@ -1,3 +1,45 @@
+diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b798a4c23ef97e1ffd474674b6095166ae9453e
+--- /dev/null
++++ b/packages/opencode/docs/hosted-approval-v2.md
+@@ -0,0 +1,36 @@
++# Hosted approval v2
++
++OpenCode exposes hosted approval only when standard server Basic authentication
++is configured. The capability, observe, and conditional reply endpoints use the
++same Authorization and workspace routing middleware as `/permission`. Without a
++server password all three return 404; bad credentials return 401.
++
++The protocol identifier is `agent-teams-hosted-approval-v2`. One process-wide
++coordinator owns a random `runtime_instance_<32 lowercase hex>` and a random
++`config_generation_<32 lowercase hex>`. Each session observed by the permission
++service also owns a random `session_incarnation_<32 lowercase hex>` that changes
++after deletion/recreation and across process restarts. The generation changes after successful
++config writes and after an ordinary `always` reply changes approval policy.
++Credentials are outside this generation and must be bound separately by clients.
++
++Pending requests are observed per session at
++`GET /experimental/agent-teams/hosted-approval/session/:sessionID/permissions`.
++Each insertion receives a random `request_incarnation_<32 lowercase hex>` and is
++bound to its session incarnation.
++Responses are all-or-nothing, limited to 256 requests and 1 MiB JSON.
++
++Conditional replies use
++`POST /experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply`.
++Bodies are limited to 16 KiB, fatal UTF-8 decoded, checked for duplicate JSON
++keys, and exact-schema decoded. Runtime/config mismatches return 412 with no
++effect. Missing, replayed, wrong-session, stale-session-incarnation,
++wrong-request-incarnation, or digest mismatches
++return 409 with no effect. Successful replies settle exactly one request; reject
++never cascades and `always` is not supported.
++
++Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
++are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
++JSON primitives use `JSON.stringify`. Golden vectors:
++
++- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
++- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
 diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
 index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1ee6ef29d 100644
 --- a/packages/opencode/src/config/config.ts
@@ -98,6 +140,107 @@ index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1
      })
  
      return Service.of({
+diff --git a/packages/opencode/src/hosted-approval/coordinator.ts b/packages/opencode/src/hosted-approval/coordinator.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc3fbbb4f24cccb90247376e182736f57f202d63
+--- /dev/null
++++ b/packages/opencode/src/hosted-approval/coordinator.ts
+@@ -0,0 +1,63 @@
++import { LayerNode } from "@opencode-ai/core/effect/layer-node"
++import { Context, Effect, Layer, Semaphore } from "effect"
++import { randomUUID } from "node:crypto"
++
++export interface Snapshot {
++  readonly runtimeInstanceId: string
++  readonly configGeneration: string
++}
++
++export interface Interface {
++  readonly snapshot: () => Snapshot
++  readonly withConfigMutation: <A, E, R>(
++    effect: Effect.Effect<A, E, R>,
++    changed?: (result: A) => boolean,
++  ) => Effect.Effect<A, E, R>
++  readonly withConditionalReply: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
++}
++
++export class Service extends Context.Service<Service, Interface>()("@opencode/HostedApprovalCoordinator") {}
++
++function token(prefix: string) {
++  return `${prefix}_${randomUUID().replaceAll("-", "")}`
++}
++
++export function makeTestLayer() {
++  return Layer.succeed(
++    Service,
++    (() => {
++      const mutex = Semaphore.makeUnsafe(1)
++      const runtimeInstanceId = token("runtime_instance")
++      let configGeneration = token("config_generation")
++      const service: Interface = {
++        snapshot: () => ({ runtimeInstanceId, configGeneration }),
++        withConfigMutation: (effect, changed = () => true) =>
++          Effect.uninterruptibleMask((restore) =>
++            Effect.gen(function* () {
++              // Config I/O remains interruptible and does not hold the process
++              // coordinator. Only the generation's linearization point is shared.
++              const result = yield* restore(effect)
++              if (changed(result)) {
++                yield* mutex.withPermit(
++                  Effect.sync(() => {
++                    configGeneration = token("config_generation")
++                  }),
++                )
++              }
++              return result
++            }),
++          ),
++        withConditionalReply: (effect) => mutex.withPermit(effect),
++      }
++      return Service.of(service)
++    })(),
++  )
++}
++
++// One process authority value. Reusing this Layer in independently assembled
++// route/service graphs cannot mint a second identity or mutex.
++export const layer = makeTestLayer()
++
++export const node = LayerNode.make({ service: Service, layer, deps: [] })
++
++export const HostedApprovalCoordinator = { Service, layer, makeTestLayer, node }
+diff --git a/packages/opencode/src/hosted-approval/protocol.ts b/packages/opencode/src/hosted-approval/protocol.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b37e769f07e1f6fbe2ffa14f7b6e562e115be395
+--- /dev/null
++++ b/packages/opencode/src/hosted-approval/protocol.ts
+@@ -0,0 +1,26 @@
++import { createHash } from "node:crypto"
++
++export const protocol = "agent-teams-hosted-approval-v2" as const
++
++export function canonicalJson(value: unknown): string {
++  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
++    const encoded = JSON.stringify(value)
++    if (encoded === undefined) throw new TypeError("Unsupported hosted approval canonical value")
++    return encoded
++  }
++  if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(",")}]`
++  if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
++  const record = value as Record<string, unknown>
++  return `{${Object.keys(record)
++    .sort()
++    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
++    .join(",")}}`
++}
++
++export function digest(value: unknown): string {
++  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")
++}
++
++export function rawPermission<T>(value: T): T {
++  return JSON.parse(JSON.stringify(value)) as T
++}
 diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
 index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..f58fcf3a19d983bb1d9173ac52a985b9e4b157ee 100644
 --- a/packages/opencode/src/permission/index.ts
@@ -654,7 +797,7 @@ index 3d0e8a06c09c6b3a2366b521ff05f7eaca63eff8..0ba6cd511d057757c30a53925cd8b37c
      })
  
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
-index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc93197d13f 100644
+index ac909032f90bf1f372a58cd39badb7f0ff62427c..94b34ec0a0e34bbe192e2848ef25f7e014a6be74 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
 +++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
 @@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -665,7 +808,7 @@ index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc9
  
  function eventData(data: unknown): Sse.Event {
    return {
-@@ -70,6 +71,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+@@ -62,6 +63,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
      const config = yield* Config.Service
      const installation = yield* Installation.Service
      const bridge = yield* EffectBridge.make()
@@ -673,7 +816,7 @@ index c1f588d5a146e66c85f560da20c030873dde2c7e..09f55adba5df7f1e7f45174846e26cc9
  
      const health = Effect.fn("GlobalHttpApi.health")(function* () {
        return { healthy: true as const, version: InstallationVersion }
-@@ -84,7 +86,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+@@ -76,7 +78,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
      })
  
      const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
@@ -1022,6 +1165,209 @@ index 8f72c0cb7f6390450dc747d9d5b6a75829ad9919..fc05fb716c0894a6492c7ede415df619
  it.effect("updates global config and omits empty shell key in json", () =>
    withGlobalConfig({ config: { shell: "bash" } }, ({ dir }) =>
      Effect.gen(function* () {
+diff --git a/packages/opencode/test/hosted-approval/coordinator.test.ts b/packages/opencode/test/hosted-approval/coordinator.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..da099bdb34ca2b13345a369a89f57dd8bb34cc51
+--- /dev/null
++++ b/packages/opencode/test/hosted-approval/coordinator.test.ts
+@@ -0,0 +1,130 @@
++import { expect, test } from "bun:test"
++import { Deferred, Effect, Fiber } from "effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
++
++test("coordinator uses process-unique tokens and rotates generation after mutation", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const before = coordinator.snapshot()
++    let visibleDuringMutation = ""
++    yield* coordinator.withConfigMutation(
++      Effect.sync(() => {
++        visibleDuringMutation = coordinator.snapshot().configGeneration
++      }),
++    )
++    return { before, after: coordinator.snapshot(), visibleDuringMutation }
++  }).pipe(Effect.provide(HostedApprovalCoordinator.layer), Effect.runPromise)
++
++  expect(result.before.runtimeInstanceId).toMatch(/^runtime_instance_[0-9a-f]{32}$/)
++  expect(result.before.configGeneration).toMatch(/^config_generation_[0-9a-f]{32}$/)
++  expect(result.after.runtimeInstanceId).toBe(result.before.runtimeInstanceId)
++  expect(result.after.configGeneration).not.toBe(result.before.configGeneration)
++  expect(result.visibleDuringMutation).toBe(result.before.configGeneration)
++})
++
++test("separate coordinator boots never reuse runtime or config incarnation", async () => {
++  const read = Effect.gen(function* () {
++    return (yield* HostedApprovalCoordinator.Service).snapshot()
++  })
++  const [first, second] = await Promise.all([
++    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
++    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
++  ])
++  expect(first.runtimeInstanceId).not.toBe(second.runtimeInstanceId)
++  expect(first.configGeneration).not.toBe(second.configGeneration)
++})
++
++test("all providers of the production layer share one process authority", async () => {
++  const snapshots = await Effect.all(
++    [
++      Effect.gen(function* () {
++        return (yield* HostedApprovalCoordinator.Service).snapshot()
++      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
++      Effect.gen(function* () {
++        return (yield* HostedApprovalCoordinator.Service).snapshot()
++      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
++    ],
++    { concurrency: "unbounded" },
++  ).pipe(Effect.runPromise)
++  expect(snapshots[0]).toEqual(snapshots[1])
++})
++
++test("cancellation cannot split a committed mutation from generation rotation", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const locked = yield* Deferred.make<void>()
++    const unlock = yield* Deferred.make<void>()
++    const committed = yield* Deferred.make<void>()
++    const before = coordinator.snapshot().configGeneration
++    const lock = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(locked, undefined)
++        yield* Deferred.await(unlock)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(locked)
++    const fiber = yield* coordinator.withConfigMutation(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(committed, undefined)
++        return true
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(committed)
++    yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped)
++    yield* Deferred.succeed(unlock, undefined)
++    yield* Fiber.await(lock)
++    yield* Fiber.await(fiber)
++    return { before, after: coordinator.snapshot().configGeneration }
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(result.after).not.toBe(result.before)
++})
++
++test("config work does not hold the process coordinator", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const started = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const before = coordinator.snapshot().configGeneration
++    const mutation = yield* coordinator.withConfigMutation(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(started, undefined)
++        yield* Deferred.await(release)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(started)
++    const during = yield* coordinator.withConditionalReply(
++      Effect.sync(() => coordinator.snapshot().configGeneration),
++    ).pipe(Effect.timeout("250 millis"))
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(mutation)
++    return { before, during, after: coordinator.snapshot().configGeneration }
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(result.during).toBe(result.before)
++  expect(result.after).not.toBe(result.before)
++})
++
++test("conditional operations remain single-writer atomic", async () => {
++  const order = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const entered = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const values: string[] = []
++    const first = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        values.push("first-enter")
++        yield* Deferred.succeed(entered, undefined)
++        yield* Deferred.await(release)
++        values.push("first-exit")
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(entered)
++    const second = yield* coordinator.withConditionalReply(
++      Effect.sync(() => values.push("second")),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(first)
++    yield* Fiber.join(second)
++    return values
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(order).toEqual(["first-enter", "first-exit", "second"])
++})
+diff --git a/packages/opencode/test/hosted-approval/protocol.test.ts b/packages/opencode/test/hosted-approval/protocol.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..66f91bf650a5d10bbb338c84982cefdd7a44c5e3
+--- /dev/null
++++ b/packages/opencode/test/hosted-approval/protocol.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, test } from "bun:test"
++import { canonicalJson, digest, rawPermission } from "../../src/hosted-approval/protocol"
++import { readHostedReplyBody } from "../../src/server/routes/instance/httpapi/handlers/permission"
++import { Effect, Stream } from "effect"
++
++describe("hosted approval protocol", () => {
++  test("canonical digest matches the frozen golden vector", () => {
++    expect(digest({ requestID: "permission_1", sessionID: "session_1", tool: "bash" })).toBe(
++      "bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2",
++    )
++  })
++
++  test("canonical digest matches the full permission golden vector", () => {
++    expect(digest({
++      always: [],
++      id: "per_1",
++      metadata: { cwd: "/tmp", risk: 1 },
++      patterns: ["ls", "pwd"],
++      permission: "bash",
++      sessionID: "ses_1",
++    })).toBe("04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca")
++  })
++
++  test("sorts object keys recursively while preserving arrays", () => {
++    expect(canonicalJson({ z: [{ b: 2, a: 1 }], a: true })).toBe('{"a":true,"z":[{"a":1,"b":2}]}')
++  })
++
++  test("digests the JSON wire projection without undefined fields", () => {
++    const internal = { id: "permission_1", tool: undefined, metadata: { value: 1, absent: undefined } }
++    const wire = rawPermission(internal) as unknown
++    expect(wire).toEqual({ id: "permission_1", metadata: { value: 1 } })
++    expect(() => digest(wire)).not.toThrow()
++  })
++
++  test("rejects unsupported canonical values", () => {
++    expect(() => canonicalJson({ value: BigInt(1) })).toThrow("Unsupported hosted approval canonical value")
++  })
++
++  test("rejects undefined at every nesting position", () => {
++    const sparse: unknown[] = []
++    sparse.length = 1
++    expect(() => canonicalJson(undefined)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson([undefined])).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson(sparse)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson({ nested: { value: undefined } })).toThrow(
++      "Unsupported hosted approval canonical value",
++    )
++  })
++})
++
++test("bounded request reader stops before consuming chunks after the limit", async () => {
++  let consumed = 0
++  const stream = Stream.fromIterable([
++    new Uint8Array(10),
++    new Uint8Array(7),
++    new Uint8Array(1),
++  ]).pipe(Stream.tap(() => Effect.sync(() => { consumed += 1 })))
++  const exit = await Effect.runPromiseExit(readHostedReplyBody(stream, 16))
++  expect(exit._tag).toBe("Failure")
++  expect(consumed).toBe(2)
++})
 diff --git a/packages/opencode/test/permission/next.test.ts b/packages/opencode/test/permission/next.test.ts
 index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..f79f20f9fc1df5bbcc6e734ddfa5a7f32829b101 100644
 --- a/packages/opencode/test/permission/next.test.ts
@@ -1345,7 +1691,7 @@ index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240
      // Raw HttpApi routes expose an opaque handler context at the request boundary.
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
-index bcbe7aecbba4dca653d83c81658d3d08ff08f846..5651f16b50c72f3dd557e112751a258bdd1d1f30 100644
+index 55bdcff4f59fbac80b0df6e4191c2e97a45d8633..8af98431fb8dcfe8ab17aa0955e4c97ce629cd29 100644
 --- a/packages/opencode/test/server/httpapi-global.test.ts
 +++ b/packages/opencode/test/server/httpapi-global.test.ts
 @@ -16,10 +16,12 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
@@ -1361,352 +1707,6 @@ index bcbe7aecbba4dca653d83c81658d3d08ff08f846..5651f16b50c72f3dd557e112751a258b
      Layer.provide([authorizationLayer, schemaErrorLayer]),
      // Raw HttpApi routes expose an opaque handler context at the request boundary.
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
-diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
-new file mode 100644
-index 0000000000000000000000000000000000000000..8b798a4c23ef97e1ffd474674b6095166ae9453e
---- /dev/null
-+++ b/packages/opencode/docs/hosted-approval-v2.md
-@@ -0,0 +1,36 @@
-+# Hosted approval v2
-+
-+OpenCode exposes hosted approval only when standard server Basic authentication
-+is configured. The capability, observe, and conditional reply endpoints use the
-+same Authorization and workspace routing middleware as `/permission`. Without a
-+server password all three return 404; bad credentials return 401.
-+
-+The protocol identifier is `agent-teams-hosted-approval-v2`. One process-wide
-+coordinator owns a random `runtime_instance_<32 lowercase hex>` and a random
-+`config_generation_<32 lowercase hex>`. Each session observed by the permission
-+service also owns a random `session_incarnation_<32 lowercase hex>` that changes
-+after deletion/recreation and across process restarts. The generation changes after successful
-+config writes and after an ordinary `always` reply changes approval policy.
-+Credentials are outside this generation and must be bound separately by clients.
-+
-+Pending requests are observed per session at
-+`GET /experimental/agent-teams/hosted-approval/session/:sessionID/permissions`.
-+Each insertion receives a random `request_incarnation_<32 lowercase hex>` and is
-+bound to its session incarnation.
-+Responses are all-or-nothing, limited to 256 requests and 1 MiB JSON.
-+
-+Conditional replies use
-+`POST /experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply`.
-+Bodies are limited to 16 KiB, fatal UTF-8 decoded, checked for duplicate JSON
-+keys, and exact-schema decoded. Runtime/config mismatches return 412 with no
-+effect. Missing, replayed, wrong-session, stale-session-incarnation,
-+wrong-request-incarnation, or digest mismatches
-+return 409 with no effect. Successful replies settle exactly one request; reject
-+never cascades and `always` is not supported.
-+
-+Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
-+are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
-+JSON primitives use `JSON.stringify`. Golden vectors:
-+
-+- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
-+- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
-diff --git a/packages/opencode/src/hosted-approval/coordinator.ts b/packages/opencode/src/hosted-approval/coordinator.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..bc3fbbb4f24cccb90247376e182736f57f202d63
---- /dev/null
-+++ b/packages/opencode/src/hosted-approval/coordinator.ts
-@@ -0,0 +1,63 @@
-+import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-+import { Context, Effect, Layer, Semaphore } from "effect"
-+import { randomUUID } from "node:crypto"
-+
-+export interface Snapshot {
-+  readonly runtimeInstanceId: string
-+  readonly configGeneration: string
-+}
-+
-+export interface Interface {
-+  readonly snapshot: () => Snapshot
-+  readonly withConfigMutation: <A, E, R>(
-+    effect: Effect.Effect<A, E, R>,
-+    changed?: (result: A) => boolean,
-+  ) => Effect.Effect<A, E, R>
-+  readonly withConditionalReply: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
-+}
-+
-+export class Service extends Context.Service<Service, Interface>()("@opencode/HostedApprovalCoordinator") {}
-+
-+function token(prefix: string) {
-+  return `${prefix}_${randomUUID().replaceAll("-", "")}`
-+}
-+
-+export function makeTestLayer() {
-+  return Layer.succeed(
-+    Service,
-+    (() => {
-+      const mutex = Semaphore.makeUnsafe(1)
-+      const runtimeInstanceId = token("runtime_instance")
-+      let configGeneration = token("config_generation")
-+      const service: Interface = {
-+        snapshot: () => ({ runtimeInstanceId, configGeneration }),
-+        withConfigMutation: (effect, changed = () => true) =>
-+          Effect.uninterruptibleMask((restore) =>
-+            Effect.gen(function* () {
-+              // Config I/O remains interruptible and does not hold the process
-+              // coordinator. Only the generation's linearization point is shared.
-+              const result = yield* restore(effect)
-+              if (changed(result)) {
-+                yield* mutex.withPermit(
-+                  Effect.sync(() => {
-+                    configGeneration = token("config_generation")
-+                  }),
-+                )
-+              }
-+              return result
-+            }),
-+          ),
-+        withConditionalReply: (effect) => mutex.withPermit(effect),
-+      }
-+      return Service.of(service)
-+    })(),
-+  )
-+}
-+
-+// One process authority value. Reusing this Layer in independently assembled
-+// route/service graphs cannot mint a second identity or mutex.
-+export const layer = makeTestLayer()
-+
-+export const node = LayerNode.make({ service: Service, layer, deps: [] })
-+
-+export const HostedApprovalCoordinator = { Service, layer, makeTestLayer, node }
-diff --git a/packages/opencode/src/hosted-approval/protocol.ts b/packages/opencode/src/hosted-approval/protocol.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..b37e769f07e1f6fbe2ffa14f7b6e562e115be395
---- /dev/null
-+++ b/packages/opencode/src/hosted-approval/protocol.ts
-@@ -0,0 +1,26 @@
-+import { createHash } from "node:crypto"
-+
-+export const protocol = "agent-teams-hosted-approval-v2" as const
-+
-+export function canonicalJson(value: unknown): string {
-+  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
-+    const encoded = JSON.stringify(value)
-+    if (encoded === undefined) throw new TypeError("Unsupported hosted approval canonical value")
-+    return encoded
-+  }
-+  if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(",")}]`
-+  if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
-+  const record = value as Record<string, unknown>
-+  return `{${Object.keys(record)
-+    .sort()
-+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
-+    .join(",")}}`
-+}
-+
-+export function digest(value: unknown): string {
-+  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")
-+}
-+
-+export function rawPermission<T>(value: T): T {
-+  return JSON.parse(JSON.stringify(value)) as T
-+}
-diff --git a/packages/opencode/test/hosted-approval/coordinator.test.ts b/packages/opencode/test/hosted-approval/coordinator.test.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..da099bdb34ca2b13345a369a89f57dd8bb34cc51
---- /dev/null
-+++ b/packages/opencode/test/hosted-approval/coordinator.test.ts
-@@ -0,0 +1,130 @@
-+import { expect, test } from "bun:test"
-+import { Deferred, Effect, Fiber } from "effect"
-+import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
-+
-+test("coordinator uses process-unique tokens and rotates generation after mutation", async () => {
-+  const result = await Effect.gen(function* () {
-+    const coordinator = yield* HostedApprovalCoordinator.Service
-+    const before = coordinator.snapshot()
-+    let visibleDuringMutation = ""
-+    yield* coordinator.withConfigMutation(
-+      Effect.sync(() => {
-+        visibleDuringMutation = coordinator.snapshot().configGeneration
-+      }),
-+    )
-+    return { before, after: coordinator.snapshot(), visibleDuringMutation }
-+  }).pipe(Effect.provide(HostedApprovalCoordinator.layer), Effect.runPromise)
-+
-+  expect(result.before.runtimeInstanceId).toMatch(/^runtime_instance_[0-9a-f]{32}$/)
-+  expect(result.before.configGeneration).toMatch(/^config_generation_[0-9a-f]{32}$/)
-+  expect(result.after.runtimeInstanceId).toBe(result.before.runtimeInstanceId)
-+  expect(result.after.configGeneration).not.toBe(result.before.configGeneration)
-+  expect(result.visibleDuringMutation).toBe(result.before.configGeneration)
-+})
-+
-+test("separate coordinator boots never reuse runtime or config incarnation", async () => {
-+  const read = Effect.gen(function* () {
-+    return (yield* HostedApprovalCoordinator.Service).snapshot()
-+  })
-+  const [first, second] = await Promise.all([
-+    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
-+    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
-+  ])
-+  expect(first.runtimeInstanceId).not.toBe(second.runtimeInstanceId)
-+  expect(first.configGeneration).not.toBe(second.configGeneration)
-+})
-+
-+test("all providers of the production layer share one process authority", async () => {
-+  const snapshots = await Effect.all(
-+    [
-+      Effect.gen(function* () {
-+        return (yield* HostedApprovalCoordinator.Service).snapshot()
-+      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
-+      Effect.gen(function* () {
-+        return (yield* HostedApprovalCoordinator.Service).snapshot()
-+      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
-+    ],
-+    { concurrency: "unbounded" },
-+  ).pipe(Effect.runPromise)
-+  expect(snapshots[0]).toEqual(snapshots[1])
-+})
-+
-+test("cancellation cannot split a committed mutation from generation rotation", async () => {
-+  const result = await Effect.gen(function* () {
-+    const coordinator = yield* HostedApprovalCoordinator.Service
-+    const locked = yield* Deferred.make<void>()
-+    const unlock = yield* Deferred.make<void>()
-+    const committed = yield* Deferred.make<void>()
-+    const before = coordinator.snapshot().configGeneration
-+    const lock = yield* coordinator.withConditionalReply(
-+      Effect.gen(function* () {
-+        yield* Deferred.succeed(locked, undefined)
-+        yield* Deferred.await(unlock)
-+      }),
-+    ).pipe(Effect.forkScoped)
-+    yield* Deferred.await(locked)
-+    const fiber = yield* coordinator.withConfigMutation(
-+      Effect.gen(function* () {
-+        yield* Deferred.succeed(committed, undefined)
-+        return true
-+      }),
-+    ).pipe(Effect.forkScoped)
-+    yield* Deferred.await(committed)
-+    yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped)
-+    yield* Deferred.succeed(unlock, undefined)
-+    yield* Fiber.await(lock)
-+    yield* Fiber.await(fiber)
-+    return { before, after: coordinator.snapshot().configGeneration }
-+  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
-+  expect(result.after).not.toBe(result.before)
-+})
-+
-+test("config work does not hold the process coordinator", async () => {
-+  const result = await Effect.gen(function* () {
-+    const coordinator = yield* HostedApprovalCoordinator.Service
-+    const started = yield* Deferred.make<void>()
-+    const release = yield* Deferred.make<void>()
-+    const before = coordinator.snapshot().configGeneration
-+    const mutation = yield* coordinator.withConfigMutation(
-+      Effect.gen(function* () {
-+        yield* Deferred.succeed(started, undefined)
-+        yield* Deferred.await(release)
-+      }),
-+    ).pipe(Effect.forkScoped)
-+    yield* Deferred.await(started)
-+    const during = yield* coordinator.withConditionalReply(
-+      Effect.sync(() => coordinator.snapshot().configGeneration),
-+    ).pipe(Effect.timeout("250 millis"))
-+    yield* Deferred.succeed(release, undefined)
-+    yield* Fiber.join(mutation)
-+    return { before, during, after: coordinator.snapshot().configGeneration }
-+  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
-+  expect(result.during).toBe(result.before)
-+  expect(result.after).not.toBe(result.before)
-+})
-+
-+test("conditional operations remain single-writer atomic", async () => {
-+  const order = await Effect.gen(function* () {
-+    const coordinator = yield* HostedApprovalCoordinator.Service
-+    const entered = yield* Deferred.make<void>()
-+    const release = yield* Deferred.make<void>()
-+    const values: string[] = []
-+    const first = yield* coordinator.withConditionalReply(
-+      Effect.gen(function* () {
-+        values.push("first-enter")
-+        yield* Deferred.succeed(entered, undefined)
-+        yield* Deferred.await(release)
-+        values.push("first-exit")
-+      }),
-+    ).pipe(Effect.forkScoped)
-+    yield* Deferred.await(entered)
-+    const second = yield* coordinator.withConditionalReply(
-+      Effect.sync(() => values.push("second")),
-+    ).pipe(Effect.forkScoped)
-+    yield* Deferred.succeed(release, undefined)
-+    yield* Fiber.join(first)
-+    yield* Fiber.join(second)
-+    return values
-+  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
-+  expect(order).toEqual(["first-enter", "first-exit", "second"])
-+})
-diff --git a/packages/opencode/test/hosted-approval/protocol.test.ts b/packages/opencode/test/hosted-approval/protocol.test.ts
-new file mode 100644
-index 0000000000000000000000000000000000000000..66f91bf650a5d10bbb338c84982cefdd7a44c5e3
---- /dev/null
-+++ b/packages/opencode/test/hosted-approval/protocol.test.ts
-@@ -0,0 +1,61 @@
-+import { describe, expect, test } from "bun:test"
-+import { canonicalJson, digest, rawPermission } from "../../src/hosted-approval/protocol"
-+import { readHostedReplyBody } from "../../src/server/routes/instance/httpapi/handlers/permission"
-+import { Effect, Stream } from "effect"
-+
-+describe("hosted approval protocol", () => {
-+  test("canonical digest matches the frozen golden vector", () => {
-+    expect(digest({ requestID: "permission_1", sessionID: "session_1", tool: "bash" })).toBe(
-+      "bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2",
-+    )
-+  })
-+
-+  test("canonical digest matches the full permission golden vector", () => {
-+    expect(digest({
-+      always: [],
-+      id: "per_1",
-+      metadata: { cwd: "/tmp", risk: 1 },
-+      patterns: ["ls", "pwd"],
-+      permission: "bash",
-+      sessionID: "ses_1",
-+    })).toBe("04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca")
-+  })
-+
-+  test("sorts object keys recursively while preserving arrays", () => {
-+    expect(canonicalJson({ z: [{ b: 2, a: 1 }], a: true })).toBe('{"a":true,"z":[{"a":1,"b":2}]}')
-+  })
-+
-+  test("digests the JSON wire projection without undefined fields", () => {
-+    const internal = { id: "permission_1", tool: undefined, metadata: { value: 1, absent: undefined } }
-+    const wire = rawPermission(internal) as unknown
-+    expect(wire).toEqual({ id: "permission_1", metadata: { value: 1 } })
-+    expect(() => digest(wire)).not.toThrow()
-+  })
-+
-+  test("rejects unsupported canonical values", () => {
-+    expect(() => canonicalJson({ value: BigInt(1) })).toThrow("Unsupported hosted approval canonical value")
-+  })
-+
-+  test("rejects undefined at every nesting position", () => {
-+    const sparse: unknown[] = []
-+    sparse.length = 1
-+    expect(() => canonicalJson(undefined)).toThrow("Unsupported hosted approval canonical value")
-+    expect(() => canonicalJson([undefined])).toThrow("Unsupported hosted approval canonical value")
-+    expect(() => canonicalJson(sparse)).toThrow("Unsupported hosted approval canonical value")
-+    expect(() => canonicalJson({ nested: { value: undefined } })).toThrow(
-+      "Unsupported hosted approval canonical value",
-+    )
-+  })
-+})
-+
-+test("bounded request reader stops before consuming chunks after the limit", async () => {
-+  let consumed = 0
-+  const stream = Stream.fromIterable([
-+    new Uint8Array(10),
-+    new Uint8Array(7),
-+    new Uint8Array(1),
-+  ]).pipe(Stream.tap(() => Effect.sync(() => { consumed += 1 })))
-+  const exit = await Effect.runPromiseExit(readHostedReplyBody(stream, 16))
-+  expect(exit._tag).toBe("Failure")
-+  expect(consumed).toBe(2)
-+})
 diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
 new file mode 100644
 index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7e1e2c385
