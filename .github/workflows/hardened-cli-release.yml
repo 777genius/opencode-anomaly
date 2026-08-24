@@ -199,7 +199,7 @@ jobs:
             [.protection_rules[]? | select(.type == "required_reviewers")] as $review_rules
             | ($review_rules | length) >= 1
             and ([$review_rules[].reviewers[]?] | length) >= 1
-            and all($review_rules[]; (has("prevent_self_review") | not) or .prevent_self_review == true)
+            and all($review_rules[]; has("prevent_self_review") and .prevent_self_review == true)
             and .can_admins_bypass == false
             and .deployment_branch_policy.protected_branches == false
             and .deployment_branch_policy.custom_branch_policies == true

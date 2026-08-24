@@ -12,6 +12,52 @@ import {
 } from "./hardened-artifacts"
 
 describe("hardened release contract", () => {
+  test("fails closed when required reviewers do not prevent self-review", async () => {
+    const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
+    const environmentFilter = workflow.match(/jq -e '([\s\S]*?)' "\$environment"/)?.[1]
+    expect(environmentFilter).toBeDefined()
+    const environment = {
+      protection_rules: [
+        {
+          type: "required_reviewers",
+          reviewers: [{ type: "User", reviewer: { login: "release-reviewer" } }],
+          prevent_self_review: true,
+        },
+      ],
+      can_admins_bypass: false,
+      deployment_branch_policy: {
+        protected_branches: false,
+        custom_branch_policies: true,
+      },
+    }
+    expect(
+      Bun.spawnSync([
+        "jq",
+        "-e",
+        "--null-input",
+        "--argjson",
+        "environment",
+        JSON.stringify(environment),
+        `$environment | ${environmentFilter}`,
+      ]).exitCode,
+    ).toBe(0)
+    for (const preventSelfReview of [undefined, false, null, "true"]) {
+      const requiredReviewers = { ...environment.protection_rules[0], prevent_self_review: preventSelfReview }
+      if (preventSelfReview === undefined) delete requiredReviewers.prevent_self_review
+      expect(
+        Bun.spawnSync([
+          "jq",
+          "-e",
+          "--null-input",
+          "--argjson",
+          "environment",
+          JSON.stringify({ ...environment, protection_rules: [requiredReviewers] }),
+          `$environment | ${environmentFilter}`,
+        ]).exitCode,
+      ).not.toBe(0)
+    }
+  })
+
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
@@ -152,7 +198,9 @@ describe("hardened release contract", () => {
     expect(environmentGuard.run).toContain('test "$GITHUB_REF" = "refs/heads/hardened-release"')
     expect(environmentGuard.run).toContain('environments/hardened-release" >"$environment"')
     expect(environmentGuard.run).toContain('select(.type == "required_reviewers")')
-    expect(environmentGuard.run).toContain('has("prevent_self_review")')
+    expect(environmentGuard.run).toContain(
+      'all($review_rules[]; has("prevent_self_review") and .prevent_self_review == true)',
+    )
     expect(environmentGuard.run).toContain(".can_admins_bypass == false")
     expect(environmentGuard.run).toContain(".deployment_branch_policy.custom_branch_policies == true")
     expect(environmentGuard.run).toContain('environments/hardened-release/deployment-branch-policies')
