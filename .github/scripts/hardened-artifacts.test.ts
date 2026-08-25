@@ -169,6 +169,94 @@ describe("hardened release contract", () => {
     expect(() => validateArchiveEntry("opencode")).not.toThrow()
   })
 
+  test("attests only the immutable same-repository pull request candidate", async () => {
+    const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
+    const parsed = Bun.YAML.parse(workflow) as any
+    const manifest = parsed.jobs.manifest
+    const provenance = parsed.jobs["pull-request-provenance"]
+    const candidate = manifest.steps.find((step: any) => step.id === "candidate")
+    const headGuard = provenance.steps.find(
+      (step: any) => step.name === "Reject non-same-repository pull request heads",
+    )
+    const download = provenance.steps.find((step: any) => step.uses?.startsWith("actions/download-artifact@"))
+    const verify = provenance.steps.find(
+      (step: any) => step.name === "Verify exact candidate files and manifest digests",
+    )
+    const attest = provenance.steps.find((step: any) => step.id === "provenance")
+    const upload = provenance.steps.find(
+      (step: any) =>
+        step.uses?.startsWith("actions/upload-artifact@") && step.with?.name === "hardened-release-provenance",
+    )
+    const subjects = [
+      "candidate/opencode-linux-x64.tar.gz",
+      "candidate/opencode-linux-arm64.tar.gz",
+      "candidate/opencode-darwin-x64.zip",
+      "candidate/opencode-darwin-arm64.zip",
+      "candidate/opencode-windows-x64.zip",
+      "candidate/release-manifest.json",
+    ]
+
+    expect(manifest.outputs).toEqual({
+      "candidate-artifact-id": "${{ steps.candidate.outputs.artifact-id }}",
+    })
+    expect(candidate.uses).toBe("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+    expect(candidate.with).toEqual({
+      name: "hardened-release-candidate",
+      path: "release",
+      "if-no-files-found": "error",
+      "retention-days": 7,
+    })
+    expect(provenance.needs).toBe("manifest")
+    expect(provenance.if).toBe("github.event_name == 'pull_request'")
+    expect(provenance.permissions).toEqual({
+      contents: "read",
+      "id-token": "write",
+      attestations: "write",
+    })
+    expect(provenance.steps).toHaveLength(5)
+    expect(headGuard.env).toEqual({
+      HEAD_REPOSITORY: "${{ github.event.pull_request.head.repo.full_name }}",
+    })
+    expect(headGuard.run).toBe('test "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"')
+    expect(provenance.steps.indexOf(headGuard)).toBeLessThan(provenance.steps.indexOf(download))
+    expect(download.uses).toBe("actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093")
+    expect(download.with).toEqual({
+      "artifact-ids": "${{ needs.manifest.outputs.candidate-artifact-id }}",
+      path: "candidate",
+      "merge-multiple": true,
+    })
+    expect(verify.run).toContain(
+      `test "$(find candidate -mindepth 1 -maxdepth 1 -printf x | wc -c | tr -d ' ')" = 6`,
+    )
+    expect(verify.run).toContain(
+      "test \"$(jq '.assets | length' candidate/release-manifest.json)\" = \"${#assets[@]}\"",
+    )
+    expect(verify.run).toContain(".archiveSha256")
+    expect(verify.run).toContain("| select(length == 1)")
+    expect(verify.run).toContain('| select(test("^[0-9a-f]{64}$"))')
+    expect(verify.run).toContain("sha256sum --check --strict -")
+    expect(verify.run).not.toMatch(
+      /(?:^|[|;&]|\$\()\s*(?:bun|node|deno|python|ruby|perl|bash|source|eval|exec|chmod|tar|unzip)\b/m,
+    )
+    expect(verify.run).not.toMatch(/^\s*(?:\.\/)?candidate\//m)
+    for (const subject of subjects) expect(verify.run).toContain(subject.replace("candidate/", ""))
+    expect(attest.uses).toBe("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8")
+    expect(attest.with["subject-path"].trim().split("\n")).toEqual(subjects)
+    expect(upload.uses).toBe("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02")
+    expect(upload.with).toEqual({
+      name: "hardened-release-provenance",
+      path: "${{ steps.provenance.outputs.bundle-path }}",
+      "if-no-files-found": "error",
+      "retention-days": 7,
+    })
+    expect(provenance.steps.filter((step: any) => step.uses).map((step: any) => step.uses)).toEqual([
+      "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+      "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
+      "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    ])
+    expect(provenance.steps.every((step: any) => step["working-directory"] === undefined)).toBe(true)
+  })
+
   test("keeps mutations in the protected dispatch-only final job", async () => {
     const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
     const parsed = Bun.YAML.parse(workflow) as any
@@ -180,6 +268,7 @@ describe("hardened release contract", () => {
     const release = steps.find(
       (step: any) => step.name === "Atomically own exact-source tag and create draft prerelease",
     )
+    const attest = steps.find((step: any) => step.uses?.startsWith("actions/attest-build-provenance@"))
     expect(parsed.jobs["hardened-release"].if).toBe(
       "github.event_name == 'workflow_dispatch' && github.repository == '777genius/opencode-anomaly'",
     )
@@ -209,14 +298,31 @@ describe("hardened release contract", () => {
     expect(environmentGuard.run).toContain('.branch_policies[0].type == "branch"')
     expect(preflight.run).toContain('require_absent "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"')
     expect(preflight.run).not.toContain('require_absent "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG"')
+    expect(preflight.run).toContain(
+      `test "$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6`,
+    )
+    expect(attest.with).toEqual({ "subject-path": "release/*" })
     expect(release.run).toContain('gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"')
     expect(release.run).toContain('-f ref="refs/tags/$TAG"')
     expect(release.run).toContain('-f sha="$SOURCE_COMMIT"')
     expect(release.run).toContain('commits/$TAG" --jq .sha')
     expect(release.run).toContain('gh release create "$TAG" release/* --verify-tag')
     expect(release.run).not.toContain("--target")
-    for (const line of workflow.split("\n").filter((line) => line.trim().startsWith("uses:"))) {
-      expect(line).toMatch(/@[0-9a-f]{40}(?:\s+#.*)?$/)
+    const actionPins = new Map([
+      ["actions/checkout", "11d5960a326750d5838078e36cf38b85af677262"],
+      ["oven-sh/setup-bun", "0c5077e51419868618aeaa5fe8019c62421857d6"],
+      ["actions/download-artifact", "d3f86a106a0bac45b974a628896c90dbdf5c8093"],
+      ["actions/upload-artifact", "ea165f8d65b6e75b540449e92b4886f43607fa02"],
+      ["actions/attest-build-provenance", "4d101475d8b20a2381f78447822ac1eab6504dd8"],
+    ])
+    const uses = workflow
+      .split("\n")
+      .flatMap((line) => line.trim().match(/^(?:- )?uses: (\S+)/)?.[1] ?? [])
+    expect([...new Set(uses.map((item) => item.split("@")[0]))].sort()).toEqual([...actionPins.keys()].sort())
+    for (const item of uses) {
+      const [action, pin] = item.split("@")
+      expect(pin).toBe(actionPins.get(action))
+      expect(pin).toMatch(/^[0-9a-f]{40}$/)
     }
   })
 })

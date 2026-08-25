@@ -144,6 +144,8 @@ jobs:
   manifest:
     needs: native-verify
     runs-on: ubuntu-24.04
+    outputs:
+      candidate-artifact-id: ${{ steps.candidate.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -157,10 +159,68 @@ jobs:
           path: release
       - run: bun .github/scripts/hardened-artifacts.ts manifest --assets release --patch "$PATCH" --schema .github/hardened/release-manifest.schema.json --output release/release-manifest.json
       - run: bun .github/scripts/hardened-artifacts.ts validate-manifest --manifest release/release-manifest.json --schema .github/hardened/release-manifest.schema.json
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - id: candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hardened-release-candidate
           path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  pull-request-provenance:
+    needs: manifest
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Reject non-same-repository pull request heads
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: test "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.manifest.outputs.candidate-artifact-id }}
+          path: candidate
+          merge-multiple: true
+      - name: Verify exact candidate files and manifest digests
+        run: |
+          assets=(
+            opencode-linux-x64.tar.gz
+            opencode-linux-arm64.tar.gz
+            opencode-darwin-x64.zip
+            opencode-darwin-arm64.zip
+            opencode-windows-x64.zip
+          )
+          test "$(find candidate -mindepth 1 -maxdepth 1 -printf x | wc -c | tr -d ' ')" = 6
+          test -f candidate/release-manifest.json
+          test "$(jq '.assets | length' candidate/release-manifest.json)" = "${#assets[@]}"
+          for asset in "${assets[@]}"; do
+            test -f "candidate/$asset"
+            digest="$(jq -er --arg asset "$asset" '
+              [.assets[] | select(.archive == $asset) | .archiveSha256]
+              | select(length == 1)
+              | .[0]
+              | select(test("^[0-9a-f]{64}$"))
+            ' candidate/release-manifest.json)"
+            printf '%s  %s\n' "$digest" "candidate/$asset" | sha256sum --check --strict -
+          done
+      - id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            candidate/opencode-linux-x64.tar.gz
+            candidate/opencode-linux-arm64.tar.gz
+            candidate/opencode-darwin-x64.zip
+            candidate/opencode-darwin-arm64.zip
+            candidate/opencode-windows-x64.zip
+            candidate/release-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-release-provenance
+          path: ${{ steps.provenance.outputs.bundle-path }}
           if-no-files-found: error
           retention-days: 7
 
