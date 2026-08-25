@@ -35,6 +35,10 @@ describe("Filesystem.contains", () => {
     expect(Filesystem.contains("/project", "/project-other/file")).toBe(false)
     expect(Filesystem.contains("/project", "/projectfile")).toBe(false)
   })
+
+  test.skipIf(process.platform !== "win32")("blocks paths on a different Windows drive", () => {
+    expect(Filesystem.contains("C:\\project", "D:\\project\\file.ts")).toBe(false)
+  })
 })
 
 /*
