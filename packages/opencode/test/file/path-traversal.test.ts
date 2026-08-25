@@ -192,16 +192,58 @@ describe("Instance.containsPath", () => {
     })
   })
 
-  test("non-git project does not allow arbitrary paths via worktree='/'", async () => {
-    await using tmp = await tmpdir() // no git: true
+  test("filesystem root worktrees do not allow fallback containment", async () => {
+    await using tmp = await tmpdir()
 
     await Instance.provide({
       directory: tmp.path,
       fn: () => {
-        // worktree is "/" for non-git projects, but containsPath should NOT allow all paths
-        expect(Instance.containsPath(path.join(tmp.path, "file.txt"))).toBe(true)
-        expect(Instance.containsPath("/etc/passwd")).toBe(false)
-        expect(Instance.containsPath("/tmp/other")).toBe(false)
+        const ctx = { ...Instance.current, worktree: "/" }
+        expect(Instance.containsPath(path.join(tmp.path, "file.txt"), ctx)).toBe(true)
+        expect(Instance.containsPath("/etc/passwd", ctx)).toBe(false)
+        expect(Instance.containsPath("/tmp/other", ctx)).toBe(false)
+
+        const roots = [
+          ["/", "/root-owned/file.txt"],
+          ["C:\\", "C:\\outside\\file.txt"],
+          ["D:/", "D:/outside/file.txt"],
+          ["\\\\server\\share", "\\\\server\\share\\outside\\file.txt"],
+          ["\\\\server\\share\\", "\\\\server\\share\\outside\\file.txt"],
+          ["//server/share/", "//server/share/outside/file.txt"],
+        ]
+        for (const [worktree, filepath] of roots) {
+          expect(Instance.containsPath(filepath, { ...ctx, worktree })).toBe(false)
+        }
+      },
+    })
+  })
+
+  test.skipIf(process.platform !== "win32")("enforces Windows volume and share boundaries", async () => {
+    await using tmp = await tmpdir()
+
+    await Instance.provide({
+      directory: tmp.path,
+      fn: () => {
+        const drive = {
+          ...Instance.current,
+          directory: "C:\\repo\\packages\\app",
+          worktree: "C:\\repo",
+        }
+        expect(Instance.containsPath("C:\\repo\\packages\\app\\file.ts", drive)).toBe(true)
+        expect(Instance.containsPath("C:\\repo\\packages\\other\\file.ts", drive)).toBe(true)
+        expect(Instance.containsPath("D:\\repo\\packages\\app\\file.ts", drive)).toBe(false)
+        expect(Instance.containsPath("\\\\server\\share\\repo\\file.ts", drive)).toBe(false)
+
+        const unc = {
+          ...Instance.current,
+          directory: "\\\\server\\share\\repo\\packages\\app",
+          worktree: "\\\\server\\share\\repo",
+        }
+        expect(Instance.containsPath("\\\\server\\share\\repo\\packages\\app\\file.ts", unc)).toBe(true)
+        expect(Instance.containsPath("\\\\server\\share\\repo\\packages\\other\\file.ts", unc)).toBe(true)
+        expect(Instance.containsPath("\\\\server\\other\\repo\\file.ts", unc)).toBe(false)
+        expect(Instance.containsPath("\\\\other-server\\share\\repo\\file.ts", unc)).toBe(false)
+        expect(Instance.containsPath("D:\\repo\\file.ts", unc)).toBe(false)
       },
     })
   })
