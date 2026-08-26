@@ -62,7 +62,7 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "e4b6665ff3bd17807040d319d62f80827fb714f2",
+      sourceCommit: "60337e40617c55f30b18fa4e9aea6e7b24613d4d",
       sourceTree: "3a1ad994a90347c5f9ab1977b31522b83bec5b10",
       artifactTree: "29fcc8d259281bd4d3aafe7ca30d0f9a615da928",
       baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
