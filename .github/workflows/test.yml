@@ -120,6 +120,10 @@ jobs:
             turbo-${{ runner.os }}-${{ hashFiles('turbo.json', '**/package.json') }}-
             turbo-${{ runner.os }}-
 
+      - name: Isolate Bun runtime transpiler cache on Windows
+        if: runner.os == 'Windows'
+        run: echo "BUN_RUNTIME_TRANSPILER_CACHE_PATH=0" >> "$GITHUB_ENV"
+
       - name: Run unit tests
         run: bun turbo test:ci
         env:
