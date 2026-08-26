@@ -23,6 +23,14 @@ runs:
         bun-version-file: ${{ !steps.bun-url.outputs.url && 'package.json' || '' }}
         bun-download-url: ${{ steps.bun-url.outputs.url }}
 
+    - name: Isolate Bun install cache on Windows
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        cache="$RUNNER_TEMP/bun-install-cache-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB"
+        mkdir -p "$cache"
+        echo "BUN_INSTALL_CACHE_DIR=$cache" >> "$GITHUB_ENV"
+
     - name: Get cache directory
       id: cache
       shell: bash

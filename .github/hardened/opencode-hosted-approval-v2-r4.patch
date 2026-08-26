@@ -1,3 +1,27 @@
+diff --git a/packages/app/e2e/performance/timeline-stability/fixture.ts b/packages/app/e2e/performance/timeline-stability/fixture.ts
+index 66edece4092e8b23d3a0e9b1c8222343f995b490..b3b809b822fc6d6fcfd94c115dbc853c0adb7799 100644
+--- a/packages/app/e2e/performance/timeline-stability/fixture.ts
++++ b/packages/app/e2e/performance/timeline-stability/fixture.ts
+@@ -105,6 +105,7 @@ export async function setupTimeline(
+     ...(input.seedHistory ? historyMessages(18) : []),
+     ...(input.messages ?? [userMessage(), assistantMessage()]),
+   ])
++  const readinessPart = messages.findLast((message) => message.parts.length)?.parts.at(-1)
+   const active = messages.findLast((message) => message.info.role === "assistant")
+   const initialStatus = decodeStatus(
+     active?.info.role === "assistant" && active.info.time.completed === undefined ? { type: "busy" } : { type: "idle" },
+@@ -162,6 +163,11 @@ export async function setupTimeline(
+   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+   await transport.waitForConnection()
+   await expectSessionTitle(page, title)
++  if (readinessPart) {
++    const part = page.locator(`[data-timeline-part-id="${readinessPart.id}"]`)
++    await expect(part).toHaveCount(1)
++    await expect(part).toBeVisible()
++  }
+   if (input.cpuRate && input.cpuRate > 1) {
+     const devtools = await page.context().newCDPSession(page)
+     await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
 diff --git a/packages/core/test/snapshot.test.ts b/packages/core/test/snapshot.test.ts
 index 5e01fefc17dc6cff7e49c89adb9c0d77c4262838..19d55a1688a009ea8f44dcd153e99ae885b21d9d 100644
 --- a/packages/core/test/snapshot.test.ts
