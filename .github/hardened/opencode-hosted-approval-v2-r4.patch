@@ -1771,6 +1771,58 @@ index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240
      Layer.provide([authorizationLayer, schemaErrorLayer]),
      // Raw HttpApi routes expose an opaque handler context at the request boundary.
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+diff --git a/packages/opencode/test/server/httpapi-exercise/index.ts b/packages/opencode/test/server/httpapi-exercise/index.ts
+index c8e11ea8451b84c674a650ab01e004dd958cf96c..a12364b165b78d4330ed4f45488c1cd3360b5ae4 100644
+--- a/packages/opencode/test/server/httpapi-exercise/index.ts
++++ b/packages/opencode/test/server/httpapi-exercise/index.ts
+@@ -279,6 +279,47 @@ const scenarios: Scenario[] = [
+       body: { method: "bad" },
+     }))
+     .status(400),
++  http.protected
++    .get("/experimental/agent-teams/hosted-approval-capability", "permission.hostedCapability")
++    .json(404, (body) => {
++      object(body)
++      check(body._tag === "HostedApprovalUnavailable", "hosted capability should require configured server auth")
++    }),
++  http.protected
++    .get(
++      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions",
++      "permission.hostedObserve",
++    )
++    .seeded((ctx) => ctx.session({ title: "Hosted approval observer" }))
++    .at((ctx) => ({
++      path: route("/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions", {
++        sessionID: ctx.state.id,
++      }),
++      headers: ctx.headers(),
++    }))
++    .json(404, (body) => {
++      object(body)
++      check(body._tag === "HostedApprovalUnavailable", "hosted observe should require configured server auth")
++    }),
++  http.protected
++    .post(
++      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
++      "permission.hostedReply",
++    )
++    .seeded((ctx) => ctx.session({ title: "Hosted approval reply owner" }))
++    .at((ctx) => ({
++      path: route(
++        "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
++        { sessionID: ctx.state.id, requestID: "per_httpapi_missing" },
++      ),
++      headers: ctx.headers(),
++      body: {},
++    }))
++    .status(404, (_ctx, result) =>
++      Effect.sync(() => {
++        check(result.text === "", "unavailable hosted reply should not parse or expose a response body")
++      }),
++    ),
+   http.protected.get("/permission", "permission.list").json(200, array),
+   http.protected
+     .post("/permission/{requestID}/reply", "permission.reply.invalid")
 diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
 index 55bdcff4f59fbac80b0df6e4191c2e97a45d8633..8af98431fb8dcfe8ab17aa0955e4c97ce629cd29 100644
 --- a/packages/opencode/test/server/httpapi-global.test.ts
@@ -1790,10 +1842,10 @@ index 55bdcff4f59fbac80b0df6e4191c2e97a45d8633..8af98431fb8dcfe8ab17aa0955e4c97c
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..a604b6abcd7d184cd313b32e8e9e9695544f8392
+index 0000000000000000000000000000000000000000..67d5e7768122ec9c463ea6919793a486ad00bc66
 --- /dev/null
 +++ b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,271 @@
 +import { afterEach, describe, expect, test } from "bun:test"
 +import { ConfigProvider, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
 +import { HttpRouter } from "effect/unstable/http"
@@ -1815,7 +1867,14 @@ index 0000000000000000000000000000000000000000..a604b6abcd7d184cd313b32e8e9e9695
 +  const runtime = ManagedRuntime.make(AppLayer, { memoMap })
 +  const web = HttpRouter.toWebHandler(
 +    HttpApiApp.routes.pipe(
-+      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
++      Layer.provide(
++        ConfigProvider.layer(
++          ConfigProvider.fromUnknown({
++            OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
++            OPENCODE_SERVER_PASSWORD: password,
++          }),
++        ),
++      ),
 +    ),
 +    { disableLogger: true, memoMap },
 +  )
