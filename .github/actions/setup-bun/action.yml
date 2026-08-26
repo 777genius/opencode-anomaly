@@ -67,7 +67,10 @@ runs:
         # e.g. ./patches/ for standard-openapi
         # https://github.com/oven-sh/bun/issues/28147
         if [ "$RUNNER_OS" = "Windows" ]; then
-          bun install --linker hoisted ${{ inputs.install-flags }}
+          # Bun 1.3.11 can race while moving multiple patched peer variants into
+          # the same cache entry. Serial downloads make patch-cache publication
+          # deterministic without retrying or discarding the frozen lockfile.
+          bun install --linker hoisted --network-concurrency 1 ${{ inputs.install-flags }}
         else
           bun install ${{ inputs.install-flags }}
         fi
