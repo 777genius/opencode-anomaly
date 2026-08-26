@@ -56,13 +56,29 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "archive": { "type": "string" },
+          "archive": {
+            "enum": [
+              "opencode-linux-x64.tar.gz",
+              "opencode-linux-arm64.tar.gz",
+              "opencode-darwin-x64.zip",
+              "opencode-darwin-arm64.zip",
+              "opencode-windows-x64.zip"
+            ]
+          },
           "archiveSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "archiveSize": { "type": "integer", "exclusiveMinimum": 0 },
           "binaryPath": { "enum": ["opencode", "opencode.exe"] },
           "binarySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "binarySize": { "type": "integer", "exclusiveMinimum": 0 },
-          "platform": { "type": "string" },
+          "platform": {
+            "enum": [
+              "opencode-linux-x64",
+              "opencode-linux-arm64",
+              "opencode-darwin-x64",
+              "opencode-darwin-arm64",
+              "opencode-windows-x64"
+            ]
+          },
           "os": { "enum": ["linux", "darwin", "windows"] },
           "arch": { "enum": ["x64", "arm64"] },
           "signing": {

@@ -362,6 +362,26 @@ const validateSchemaNode = (schema: JsonSchema, value: unknown, location = "$"):
 export const validateReleaseManifest = async (value: unknown, schemaPath = schemaFile) => {
   const schema = JSON.parse(await readFile(schemaPath, "utf8")) as JsonSchema
   validateSchemaNode(schema, value)
+  const assets = (value as { assets: Asset[] }).assets
+  const seen = new Set<string>()
+  assets.forEach((asset, index) => {
+    const location = `$.assets[${index}]`
+    const platform = PLATFORMS.find((item) => item.name === asset.platform)
+    if (!platform) fail(`${location}.platform is not a required platform`)
+    if (seen.has(platform.name)) fail(`${location}.platform duplicates ${platform.name}`)
+    seen.add(platform.name)
+    const expected = {
+      archive: `${platform.name}.${platform.archive}`,
+      os: platform.os,
+      arch: platform.arch,
+      binaryPath: platform.os === "windows" ? "opencode.exe" : "opencode",
+    }
+    for (const key of ["archive", "os", "arch", "binaryPath"] as const) {
+      if (asset[key] !== expected[key]) fail(`${location}.${key} does not match ${platform.name}`)
+    }
+  })
+  const missing = PLATFORMS.filter((platform) => !seen.has(platform.name)).map((platform) => platform.name)
+  if (missing.length) fail(`$.assets is missing required platforms: ${missing.join(", ")}`)
 }
 
 const validateManifest = async (args: string[]) => {

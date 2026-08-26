@@ -137,26 +137,30 @@ describe("hardened release contract", () => {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
     expect(schema.properties.release.properties.patchSize.const).toBe(199285)
+    expect(schema.properties.assets.items.properties.platform.enum).toEqual(PLATFORMS.map((item) => item.name))
+    expect(schema.properties.assets.items.properties.archive.enum).toEqual(
+      PLATFORMS.map((item) => `${item.name}.${item.archive}`),
+    )
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
-    const asset = {
-      archive: "opencode-linux-x64.tar.gz",
+    const assets = PLATFORMS.map((platform) => ({
+      archive: `${platform.name}.${platform.archive}`,
       archiveSha256: "a".repeat(64),
       archiveSize: 1,
-      binaryPath: "opencode",
+      binaryPath: platform.os === "windows" ? "opencode.exe" : "opencode",
       binarySha256: "b".repeat(64),
       binarySize: 1,
-      platform: "opencode-linux-x64",
-      os: "linux",
-      arch: "x64",
+      platform: platform.name,
+      os: platform.os,
+      arch: platform.arch,
       signing: {
         binaryStatus: "unsigned",
         reason: "non-production fork prerelease",
         provenanceAction: "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         provenanceStatus: "required-after-manifest",
       },
-    }
+    }))
     const value = {
       schemaVersion: 1,
       release: { ...RELEASE, patchSize: 199285 },
@@ -169,15 +173,50 @@ describe("hardened release contract", () => {
         ref: "local",
         sha: "local",
       },
-      assets: Array.from({ length: 5 }, () => ({ ...asset })),
+      assets,
     }
     await expect(validateReleaseManifest(value)).resolves.toBeUndefined()
     await expect(
-      validateReleaseManifest({ ...value, assets: [{ ...asset, archiveSize: "1" }, ...value.assets.slice(1)] }),
+      validateReleaseManifest({
+        ...value,
+        assets: [{ ...assets[0], archiveSize: "1" }, ...assets.slice(1)],
+      }),
     ).rejects.toThrow("$.assets[0].archiveSize must be integer")
     await expect(
-      validateReleaseManifest({ ...value, assets: [{ ...asset, unexpected: true }, ...value.assets.slice(1)] }),
+      validateReleaseManifest({ ...value, assets: [{ ...assets[0], unexpected: true }, ...assets.slice(1)] }),
     ).rejects.toThrow("$.assets[0].unexpected is not allowed")
+
+    await expect(validateReleaseManifest({ ...value, assets: assets.slice(0, -1) })).rejects.toThrow(
+      "$.assets has too few items",
+    )
+    await expect(validateReleaseManifest({ ...value, assets: [...assets, assets[0]] })).rejects.toThrow(
+      "$.assets has too many items",
+    )
+    await expect(
+      validateReleaseManifest({ ...value, assets: Array.from({ length: 5 }, () => assets[0]) }),
+    ).rejects.toThrow("$.assets[1].platform duplicates opencode-linux-x64")
+    await expect(
+      validateReleaseManifest({ ...value, assets: [assets[0], assets[0], ...assets.slice(2)] }),
+    ).rejects.toThrow("$.assets[1].platform duplicates opencode-linux-x64")
+    await expect(
+      validateReleaseManifest({
+        ...value,
+        assets: assets.map((asset, index) => ({
+          ...asset,
+          platform: `bogus-${index}`,
+        })),
+      }),
+    ).rejects.toThrow("$.assets[0].platform is not in its schema enum")
+    for (const [field, invalid] of [
+      ["archive", assets[1].archive],
+      ["os", "darwin"],
+      ["arch", "arm64"],
+      ["binaryPath", "opencode.exe"],
+    ] as const) {
+      await expect(
+        validateReleaseManifest({ ...value, assets: [{ ...assets[0], [field]: invalid }, ...assets.slice(1)] }),
+      ).rejects.toThrow(`$.assets[0].${field} does not match opencode-linux-x64`)
+    }
   })
 
   test("publishes only the explicit native verification matrix", () => {
