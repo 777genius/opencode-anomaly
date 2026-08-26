@@ -19,7 +19,14 @@ function app(password?: string) {
   const runtime = ManagedRuntime.make(AppLayer, { memoMap })
   const web = HttpRouter.toWebHandler(
     HttpApiApp.routes.pipe(
-      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
+      Layer.provide(
+        ConfigProvider.layer(
+          ConfigProvider.fromUnknown({
+            OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+            OPENCODE_SERVER_PASSWORD: password,
+          }),
+        ),
+      ),
     ),
     { disableLogger: true, memoMap },
   )
