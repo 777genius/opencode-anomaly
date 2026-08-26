@@ -49,15 +49,7 @@ runs:
       shell: bash
 
     - name: Install dependencies
-      run: |
-        # Windows still needs the hoisted linker for workspace compatibility.
-        # Bun 1.4.0 fixes the patched-peer cache publication race tracked in
-        # https://github.com/oven-sh/bun/issues/28147.
-        if [ "$RUNNER_OS" = "Windows" ]; then
-          bun install --frozen-lockfile --linker hoisted
-        else
-          bun install --frozen-lockfile
-        fi
+      run: bun install --frozen-lockfile
       shell: bash
 
     - name: Save Bun dependencies

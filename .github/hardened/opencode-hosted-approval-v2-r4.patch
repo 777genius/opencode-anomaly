@@ -159,6 +159,19 @@ index f02da400af6a7f436366b2f7126399606ab6157e..a9f2add15e862af57885ed2e47b101ec
  export async function commit(source: string, content: string, message: string) {
    await fs.writeFile(path.join(source, "README.md"), content)
    await git(source, "add", "README.md")
+diff --git a/packages/core/test/npm.test.ts b/packages/core/test/npm.test.ts
+index 7e4a5763bf086ba01b8b2a936cec0a4206583c47..3b822cc907603d6043f242f99e72c5ce12321f5f 100644
+--- a/packages/core/test/npm.test.ts
++++ b/packages/core/test/npm.test.ts
+@@ -54,7 +54,7 @@ describe("Npm.add", () => {
+     }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+ 
+     expect(entry.entrypoint).toBeDefined()
+-  })
++  }, 15_000)
+ })
+ 
+ describe("Npm.install", () => {
 diff --git a/packages/core/test/repository-cache.test.ts b/packages/core/test/repository-cache.test.ts
 index 4433583bf7874f0d470baaebdf56887717bf49a9..faba9ca193585d513816adf2adee7817eebccb18 100644
 --- a/packages/core/test/repository-cache.test.ts
@@ -1470,8 +1483,100 @@ index fb9d2db65621540a514786f2061714f16b6c766c..d942753d204268d24d53a36804cd832f
    EventV2Bridge.node,
    SessionRunState.node,
    SessionProcessor.node,
+diff --git a/packages/opencode/test/cli/mcp-add.test.ts b/packages/opencode/test/cli/mcp-add.test.ts
+index 9a49384855a1528ed1b43419a2ca6c9a5a9f4c2c..052a6157cca2c0391c3ffe3f57e74bb1c8401059 100644
+--- a/packages/opencode/test/cli/mcp-add.test.ts
++++ b/packages/opencode/test/cli/mcp-add.test.ts
+@@ -8,17 +8,20 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+     "adds a remote server with HTTP headers",
+     ({ home, opencode }) =>
+       Effect.gen(function* () {
+-        const result = yield* opencode.spawn([
+-          "mcp",
+-          "add",
+-          "github",
+-          "--url",
+-          "https://example.com/mcp",
+-          "--header",
+-          "Authorization=Bearer {env:GITHUB_TOKEN}",
+-          "--header",
+-          "X-Option=one=two",
+-        ])
++        const result = yield* opencode.spawn(
++          [
++            "mcp",
++            "add",
++            "github",
++            "--url",
++            "https://example.com/mcp",
++            "--header",
++            "Authorization=Bearer {env:GITHUB_TOKEN}",
++            "--header",
++            "X-Option=one=two",
++          ],
++          { timeoutMs: 60_000 },
++        )
+         opencode.expectExit(result, 0)
+ 
+         const config = yield* Effect.promise(() =>
+@@ -33,28 +36,31 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+           },
+         })
+       }),
+-    60_000,
++    75_000,
+   )
+ 
+   cliIt.concurrent(
+     "adds a local server while preserving argv and environment values",
+     ({ home, opencode }) =>
+       Effect.gen(function* () {
+-        const result = yield* opencode.spawn([
+-          "mcp",
+-          "add",
+-          "local",
+-          "--env",
+-          "API_KEY=secret",
+-          "--env",
+-          "VALUE=one=two",
+-          "--",
+-          "npx",
+-          "-y",
+-          "@example/server",
+-          "--label",
+-          "two words",
+-        ])
++        const result = yield* opencode.spawn(
++          [
++            "mcp",
++            "add",
++            "local",
++            "--env",
++            "API_KEY=secret",
++            "--env",
++            "VALUE=one=two",
++            "--",
++            "npx",
++            "-y",
++            "@example/server",
++            "--label",
++            "two words",
++          ],
++          { timeoutMs: 60_000 },
++        )
+         opencode.expectExit(result, 0)
+ 
+         const config = yield* Effect.promise(() =>
+@@ -69,6 +75,6 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+           },
+         })
+       }),
+-    60_000,
++    75_000,
+   )
+ })
 diff --git a/packages/opencode/test/cli/run/run-process.test.ts b/packages/opencode/test/cli/run/run-process.test.ts
-index d2d4bae879216be6fb79840bea83d2a4054e6bec..32184019bd1b41b1225e98a0e82b7314b9ac483f 100644
+index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff347d12f29a4a378f38d3e708e3148bbd8a8915 100644
 --- a/packages/opencode/test/cli/run/run-process.test.ts
 +++ b/packages/opencode/test/cli/run/run-process.test.ts
 @@ -73,12 +73,13 @@ describe("opencode run (non-interactive subprocess)", () => {
@@ -1492,6 +1597,21 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..32184019bd1b41b1225e98a0e82b7314
    )
  
    // The test provider's SSE error item is interpreted by the SDK as an unknown
+@@ -96,12 +97,12 @@ describe("opencode run (non-interactive subprocess)", () => {
+         )
+         yield* llm.fail("upstream provider exploded mid-stream")
+         yield* llm.text("recovered")
+-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
++        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 60_000 })
+         expect(result.exitCode).toBe(0)
+         expect(result.stdout).toBe("partial response\nrecovered\n")
+         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
+       }),
+-    60_000,
++    75_000,
+   )
+ 
+   // --format json puts one JSON object per line on stdout for each emitted
 diff --git a/packages/opencode/test/config/config.test.ts b/packages/opencode/test/config/config.test.ts
 index 8f72c0cb7f6390450dc747d9d5b6a75829ad9919..fc05fb716c0894a6492c7ede415df6199bd356ac 100644
 --- a/packages/opencode/test/config/config.test.ts

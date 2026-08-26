@@ -62,11 +62,11 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "cee24c1de70a220253c115822d8846b973b9e5a4",
-      sourceTree: "970e7191f1751dbc591333209607a8cc422b3204",
-      artifactTree: "c28c1abe9e5711579ee07be6ea00c4e4323f0faf",
+      sourceCommit: "0aab19b8295feb99f9c45c403e2cd46dbddc4b7b",
+      sourceTree: "da53426fec5bc794626a389e512e0c8abbef00ff",
+      artifactTree: "dc39bb88fc45702e305e9deb09d0ab5e4d892289",
       baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
-      patchSha256: "ebd5d063ee774a17f5f4aa64277a9d2b48d8648719b62e2f8ca6da569d49e30c",
+      patchSha256: "451990f173b1b8f47a0aa4fc3ac8c414b6df6474c97f6ea2db17a29489e71af7",
       version: "1.18.23-agentteams.1",
       tag: "v1.18.23-agentteams.1",
       bunVersion: "1.4.0",
@@ -74,11 +74,25 @@ describe("hardened release contract", () => {
     })
   })
 
+  test("pins Bun 1.4.0 and uses one frozen default-linker install on every OS", async () => {
+    const root = await Bun.file(new URL("../../package.json", import.meta.url)).json()
+    const action = Bun.YAML.parse(
+      await Bun.file(new URL("../actions/setup-bun/action.yml", import.meta.url)).text(),
+    ) as { runs: { steps: Array<{ name?: string; run?: string; with?: Record<string, string> }> } }
+    const step = (name: string) => action.runs.steps.find((item) => item.name === name)
+
+    expect(root.packageManager).toBe("bun@1.4.0")
+    expect(step("Setup Bun")?.with?.["bun-version-file"]).toContain("package.json")
+    expect(step("Verify pinned Bun version")?.run).toContain('test "$actual" = "$expected"')
+    expect(step("Install dependencies")?.run).toBe("bun install --frozen-lockfile")
+    expect(step("Install dependencies")?.run).not.toMatch(/--linker|--network-concurrency|BUN_INSTALL_CACHE_DIR|RUNNER_OS/)
+  })
+
   test("freezes an exact packages-only source patch", async () => {
     const patch = new URL("../hardened/opencode-hosted-approval-v2-r4.patch", import.meta.url)
     const bytes = await Bun.file(patch).bytes()
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(RELEASE.patchSha256)
-    expect(bytes.byteLength).toBe(190241)
+    expect(bytes.byteLength).toBe(194044)
     const numstat = Bun.spawnSync(["git", "apply", "--numstat", patch.pathname], {
       cwd: new URL("../..", import.meta.url).pathname,
       stdout: "pipe",
@@ -89,7 +103,7 @@ describe("hardened release contract", () => {
       .trim()
       .split("\n")
       .map((line) => line.split("\t")[2])
-    expect(paths).toHaveLength(29)
+    expect(paths).toHaveLength(31)
     expect(paths.every((item) => item.startsWith("packages/"))).toBe(true)
     expect(paths).toContain("packages/app/e2e/performance/timeline-stability/fixture.ts")
     expect(paths).toContain("packages/core/test/repository-cache.test.ts")
@@ -118,7 +132,7 @@ describe("hardened release contract", () => {
     for (const [key, value] of Object.entries(RELEASE)) {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
-    expect(schema.properties.release.properties.patchSize.const).toBe(190241)
+    expect(schema.properties.release.properties.patchSize.const).toBe(194044)
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
@@ -141,7 +155,7 @@ describe("hardened release contract", () => {
     }
     const value = {
       schemaVersion: 1,
-      release: { ...RELEASE, patchSize: 190241 },
+      release: { ...RELEASE, patchSize: 194044 },
       workflow: {
         repository: "local",
         workflow: "local",
