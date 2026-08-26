@@ -62,11 +62,11 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "45cc396ef33303b38fc533623627257ffd1c2d9b",
-      sourceTree: "77c9d1209b13759630130f05d89d69ec8c7286a0",
-      artifactTree: "586702bd8dd8a089e03786ff8bb81da1cd190fe7",
+      sourceCommit: "670dcc114ded9bc3c832d7eeec801f8d31cc0c4c",
+      sourceTree: "b8d7f7a70941ff615bf5af65c3745c26b17280b6",
+      artifactTree: "05f76c9826ba80490b58746e8389c00fbb7aa2ca",
       baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
-      patchSha256: "1693dba3d253c3e01a3524830ffaaa1fd840e2e653f278aeffec94d8330275af",
+      patchSha256: "20e9e84f70be9c4ff06dfe1133977f6ceae781768ce4af0d7ebb4ea8ae9cf8a5",
       version: "1.18.23-agentteams.1",
       tag: "v1.18.23-agentteams.1",
       bunVersion: "1.3.14",
@@ -78,7 +78,7 @@ describe("hardened release contract", () => {
     const patch = new URL("../hardened/opencode-hosted-approval-v2-r4.patch", import.meta.url)
     const bytes = await Bun.file(patch).bytes()
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(RELEASE.patchSha256)
-    expect(bytes.byteLength).toBe(180459)
+    expect(bytes.byteLength).toBe(181629)
     const numstat = Bun.spawnSync(["git", "apply", "--numstat", patch.pathname], {
       cwd: new URL("../..", import.meta.url).pathname,
       stdout: "pipe",
@@ -89,7 +89,7 @@ describe("hardened release contract", () => {
       .trim()
       .split("\n")
       .map((line) => line.split("\t")[2])
-    expect(paths).toHaveLength(25)
+    expect(paths).toHaveLength(26)
     expect(paths.every((item) => item.startsWith("packages/"))).toBe(true)
     expect(paths).toContain("packages/opencode/src/project/instance-context.ts")
     expect(paths).toContain("packages/opencode/test/project/instance.test.ts")
@@ -112,7 +112,7 @@ describe("hardened release contract", () => {
     for (const [key, value] of Object.entries(RELEASE)) {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
-    expect(schema.properties.release.properties.patchSize.const).toBe(180459)
+    expect(schema.properties.release.properties.patchSize.const).toBe(181629)
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
@@ -135,7 +135,7 @@ describe("hardened release contract", () => {
     }
     const value = {
       schemaVersion: 1,
-      release: { ...RELEASE, patchSize: 180459 },
+      release: { ...RELEASE, patchSize: 181629 },
       workflow: {
         repository: "local",
         workflow: "local",

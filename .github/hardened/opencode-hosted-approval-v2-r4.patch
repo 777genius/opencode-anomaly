@@ -22,6 +22,28 @@ index 66edece4092e8b23d3a0e9b1c8222343f995b490..b3b809b822fc6d6fcfd94c115dbc853c
    if (input.cpuRate && input.cpuRate > 1) {
      const devtools = await page.context().newCDPSession(page)
      await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
+diff --git a/packages/core/test/config/agent.test.ts b/packages/core/test/config/agent.test.ts
+index aa691648a32796f99529141258304c2525db5aed..1463e896d1d77f4153ed6a53bcb893fe09064aa7 100644
+--- a/packages/core/test/config/agent.test.ts
++++ b/packages/core/test/config/agent.test.ts
+@@ -68,7 +68,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
+                     permissions: [{ action: "bash", resource: "git *", effect: "allow" }],
+                   },
+                   reviewer: {
+-                    model: "openrouter/openai/gpt-5",
++                    model: "openrouter/openrouter/free",
+                     description: "Review changes",
+                     mode: "subagent",
+                     permissions: [
+@@ -117,7 +117,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
+         description: "Review changes",
+         mode: "subagent",
+         hidden: true,
+-        model: { providerID: "openrouter", id: "openai/gpt-5", variant: "high" },
++        model: { providerID: "openrouter", id: "openrouter/free", variant: "high" },
+       })
+       expect(reviewer.permissions).toEqual([
+         { action: "bash", resource: "*", effect: "ask" },
 diff --git a/packages/core/test/snapshot.test.ts b/packages/core/test/snapshot.test.ts
 index 5e01fefc17dc6cff7e49c89adb9c0d77c4262838..19d55a1688a009ea8f44dcd153e99ae885b21d9d 100644
 --- a/packages/core/test/snapshot.test.ts
