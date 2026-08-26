@@ -62,11 +62,11 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "670dcc114ded9bc3c832d7eeec801f8d31cc0c4c",
-      sourceTree: "b8d7f7a70941ff615bf5af65c3745c26b17280b6",
-      artifactTree: "05f76c9826ba80490b58746e8389c00fbb7aa2ca",
+      sourceCommit: "36af5b86f0a1229199b2aab8d7822dcdea7b6b8e",
+      sourceTree: "ee49d9aa9c552bf48a0af493c423d3381da3f8d9",
+      artifactTree: "c28c1abe9e5711579ee07be6ea00c4e4323f0faf",
       baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
-      patchSha256: "20e9e84f70be9c4ff06dfe1133977f6ceae781768ce4af0d7ebb4ea8ae9cf8a5",
+      patchSha256: "ebd5d063ee774a17f5f4aa64277a9d2b48d8648719b62e2f8ca6da569d49e30c",
       version: "1.18.23-agentteams.1",
       tag: "v1.18.23-agentteams.1",
       bunVersion: "1.3.14",
@@ -78,7 +78,7 @@ describe("hardened release contract", () => {
     const patch = new URL("../hardened/opencode-hosted-approval-v2-r4.patch", import.meta.url)
     const bytes = await Bun.file(patch).bytes()
     expect(createHash("sha256").update(bytes).digest("hex")).toBe(RELEASE.patchSha256)
-    expect(bytes.byteLength).toBe(181629)
+    expect(bytes.byteLength).toBe(190241)
     const numstat = Bun.spawnSync(["git", "apply", "--numstat", patch.pathname], {
       cwd: new URL("../..", import.meta.url).pathname,
       stdout: "pipe",
@@ -89,8 +89,10 @@ describe("hardened release contract", () => {
       .trim()
       .split("\n")
       .map((line) => line.split("\t")[2])
-    expect(paths).toHaveLength(26)
+    expect(paths).toHaveLength(29)
     expect(paths.every((item) => item.startsWith("packages/"))).toBe(true)
+    expect(paths).toContain("packages/app/e2e/performance/timeline-stability/fixture.ts")
+    expect(paths).toContain("packages/core/test/repository-cache.test.ts")
     expect(paths).toContain("packages/opencode/src/project/instance-context.ts")
     expect(paths).toContain("packages/opencode/test/project/instance.test.ts")
   })
@@ -112,7 +114,7 @@ describe("hardened release contract", () => {
     for (const [key, value] of Object.entries(RELEASE)) {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
-    expect(schema.properties.release.properties.patchSize.const).toBe(181629)
+    expect(schema.properties.release.properties.patchSize.const).toBe(190241)
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
@@ -135,7 +137,7 @@ describe("hardened release contract", () => {
     }
     const value = {
       schemaVersion: 1,
-      release: { ...RELEASE, patchSize: 181629 },
+      release: { ...RELEASE, patchSize: 190241 },
       workflow: {
         repository: "local",
         workflow: "local",

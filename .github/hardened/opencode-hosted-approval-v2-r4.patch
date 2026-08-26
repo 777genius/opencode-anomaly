@@ -1,27 +1,69 @@
 diff --git a/packages/app/e2e/performance/timeline-stability/fixture.ts b/packages/app/e2e/performance/timeline-stability/fixture.ts
-index 66edece4092e8b23d3a0e9b1c8222343f995b490..b3b809b822fc6d6fcfd94c115dbc853c0adb7799 100644
+index 66edece4092e8b23d3a0e9b1c8222343f995b490..4d7858cbfd65293fc482d671931b27da3e1500f5 100644
 --- a/packages/app/e2e/performance/timeline-stability/fixture.ts
 +++ b/packages/app/e2e/performance/timeline-stability/fixture.ts
 @@ -105,6 +105,7 @@ export async function setupTimeline(
      ...(input.seedHistory ? historyMessages(18) : []),
      ...(input.messages ?? [userMessage(), assistantMessage()]),
    ])
-+  const readinessPart = messages.findLast((message) => message.parts.length)?.parts.at(-1)
++  const readinessMessageID = timelineReadinessMessageID(messages)
    const active = messages.findLast((message) => message.info.role === "assistant")
    const initialStatus = decodeStatus(
      active?.info.role === "assistant" && active.info.time.completed === undefined ? { type: "busy" } : { type: "idle" },
-@@ -162,6 +163,11 @@ export async function setupTimeline(
+@@ -162,6 +163,9 @@ export async function setupTimeline(
    await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
    await transport.waitForConnection()
    await expectSessionTitle(page, title)
-+  if (readinessPart) {
-+    const part = page.locator(`[data-timeline-part-id="${readinessPart.id}"]`)
-+    await expect(part).toHaveCount(1)
-+    await expect(part).toBeVisible()
-+  }
++  const row = page.locator(`[data-message-id="${readinessMessageID}"]`).last()
++  await expect(row).toHaveCount(1)
++  await expect(row).toBeVisible()
    if (input.cpuRate && input.cpuRate > 1) {
      const devtools = await page.context().newCDPSession(page)
      await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
+@@ -204,6 +208,12 @@ export async function setupTimeline(
+   }
+ }
+ 
++export function timelineReadinessMessageID(messages: readonly TimelineMessage[]) {
++  const message = messages.findLast((item) => item.info.role === "user")
++  if (!message) throw new Error("Timeline fixture requires a user message")
++  return message.info.id
++}
++
+ function describeEvent(event: EventPayload) {
+   if (event.payload.type === "message.part.updated") {
+     const part = event.payload.properties.part
+diff --git a/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts b/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c61ac1f4e44c615a0180fd0d51147b6bc73913fb
+--- /dev/null
++++ b/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts
+@@ -0,0 +1,25 @@
++import { expect, test } from "bun:test"
++import {
++  assistantMessage,
++  textPart,
++  timelineReadinessMessageID,
++  toolPart,
++  userMessage,
++} from "../timeline-stability/fixture"
++
++test("keys fixture readiness to the latest user turn when the assistant has no visible part", () => {
++  const earlier = userMessage(undefined, { id: "msg_readiness_earlier" })
++  const current = userMessage(undefined, { id: "msg_readiness_current" })
++  const hidden = assistantMessage([toolPart("prt_hidden_question", "question", "running", { questions: [] })], {
++    id: "msg_readiness_assistant",
++    parentID: current.info.id,
++  })
++
++  const previous = assistantMessage([textPart("prt_old", "old")], { parentID: earlier.info.id })
++
++  expect(timelineReadinessMessageID([earlier, previous, current, hidden])).toBe(current.info.id)
++})
++
++test("rejects a fixture without a user turn", () => {
++  expect(() => timelineReadinessMessageID([assistantMessage()])).toThrow("Timeline fixture requires a user message")
++})
 diff --git a/packages/core/test/config/agent.test.ts b/packages/core/test/config/agent.test.ts
 index aa691648a32796f99529141258304c2525db5aed..1463e896d1d77f4153ed6a53bcb893fe09064aa7 100644
 --- a/packages/core/test/config/agent.test.ts
@@ -44,6 +86,153 @@ index aa691648a32796f99529141258304c2525db5aed..1463e896d1d77f4153ed6a53bcb893fe
        })
        expect(reviewer.permissions).toEqual([
          { action: "bash", resource: "*", effect: "ask" },
+diff --git a/packages/core/test/fixture/git.ts b/packages/core/test/fixture/git.ts
+index f02da400af6a7f436366b2f7126399606ab6157e..a9f2add15e862af57885ed2e47b101ec2c2714ff 100644
+--- a/packages/core/test/fixture/git.ts
++++ b/packages/core/test/fixture/git.ts
+@@ -1,4 +1,4 @@
+-import { execFile } from "child_process"
++import { execFile, spawn } from "child_process"
+ import fs from "fs/promises"
+ import path from "path"
+ import { promisify } from "util"
+@@ -7,9 +7,14 @@ import { Repository } from "@opencode-ai/core/repository"
+ 
+ const exec = promisify(execFile)
+ 
+-export async function gitRemote(root: string) {
++export async function gitRemote(root: string, input: { feature?: { name: string; content: string } } = {}) {
+   const origin = path.join(root, "origin.git")
+   const source = path.join(root, "source")
++  if (input.feature) {
++    await git(root, "init", "--bare", "--initial-branch=main", origin)
++    await fastImport(origin, input.feature)
++    return fixture(root, source, origin)
++  }
+   await git(root, "init", "--bare", origin)
+   await git(root, "init", source)
+   await git(source, "config", "user.email", "test@example.com")
+@@ -21,6 +26,10 @@ export async function gitRemote(root: string) {
+   await git(source, "remote", "add", "origin", pathToFileURL(origin).href)
+   await git(source, "push", "-u", "origin", "main")
+   await git(root, "--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main")
++  return fixture(root, source, origin)
++}
++
++function fixture(root: string, source: string, origin: string) {
+   return {
+     root,
+     source,
+@@ -29,6 +38,35 @@ export async function gitRemote(root: string) {
+   }
+ }
+ 
++async function fastImport(origin: string, feature: { name: string; content: string }) {
++  if (feature.name.includes("\n")) throw new Error("Fixture branch names cannot contain newlines")
++  const data = (value: string) => `data ${Buffer.byteLength(value)}\n${value}\n`
++  const identity = "Test <test@example.com> 1700000000 +0000"
++  const stream = [
++    "blob\nmark :1\n",
++    data("one\n"),
++    "commit refs/heads/main\nmark :2\n",
++    `author ${identity}\ncommitter ${identity}\n`,
++    data("initial"),
++    "M 100644 :1 README.md\n\n",
++    "blob\nmark :3\n",
++    data(feature.content),
++    `commit refs/heads/${feature.name}\nmark :4\nauthor ${identity}\ncommitter ${identity}\n`,
++    data(feature.name),
++    "from :2\nM 100644 :3 README.md\n\n",
++  ].join("")
++  await new Promise<void>((resolve, reject) => {
++    const child = spawn("git", ["fast-import", "--quiet"], { cwd: origin, stdio: ["pipe", "ignore", "pipe"] })
++    const errors: Buffer[] = []
++    child.stderr.on("data", (chunk) => errors.push(chunk))
++    child.on("error", reject)
++    child.on("close", (code) =>
++      code === 0 ? resolve() : reject(new Error(`git fast-import failed (${code}): ${Buffer.concat(errors)}`)),
++    )
++    child.stdin.end(stream)
++  })
++}
++
+ export async function commit(source: string, content: string, message: string) {
+   await fs.writeFile(path.join(source, "README.md"), content)
+   await git(source, "add", "README.md")
+diff --git a/packages/core/test/repository-cache.test.ts b/packages/core/test/repository-cache.test.ts
+index 4433583bf7874f0d470baaebdf56887717bf49a9..faba9ca193585d513816adf2adee7817eebccb18 100644
+--- a/packages/core/test/repository-cache.test.ts
++++ b/packages/core/test/repository-cache.test.ts
+@@ -8,7 +8,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { Global } from "@opencode-ai/core/global"
+ import { Repository } from "@opencode-ai/core/repository"
+ import { RepositoryCache } from "@opencode-ai/core/repository-cache"
+-import { branch, git, gitRemote } from "./fixture/git"
++import { git, gitRemote } from "./fixture/git"
+ import { tmpdir } from "./fixture/tmpdir"
+ import { testEffect } from "./lib/effect"
+ 
+@@ -67,24 +67,25 @@ describe("RepositoryCache", () => {
+   )
+ 
+   it.live("keeps branch checkouts isolated from branchless refreshes", () =>
+-    withRemote((fixture) =>
+-      Effect.gen(function* () {
+-        yield* Effect.promise(() => branch(fixture.source, "feature", "two\n"))
+-        const cache = yield* RepositoryCache.Service
+-
+-        const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+-        expect(featured.branch).toBe("feature")
+-        expect(featured.localPath.endsWith("repo@feature")).toBe(true)
+-        expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
+-
+-        const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
+-        expect(refreshed.localPath).not.toBe(featured.localPath)
+-        expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
+-
+-        const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+-        expect(cached.status).toBe("cached")
+-        expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
+-      }).pipe(Effect.provide(cacheLayer(fixture.root))),
++    withRemote(
++      (fixture) =>
++        Effect.gen(function* () {
++          const cache = yield* RepositoryCache.Service
++
++          const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
++          expect(featured.branch).toBe("feature")
++          expect(featured.localPath.endsWith("repo@feature")).toBe(true)
++          expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
++
++          const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
++          expect(refreshed.localPath).not.toBe(featured.localPath)
++          expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
++
++          const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
++          expect(cached.status).toBe("cached")
++          expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
++        }).pipe(Effect.provide(cacheLayer(fixture.root))),
++      { feature: { name: "feature", content: "two\n" } },
+     ),
+   )
+ 
+@@ -128,11 +129,14 @@ function cacheLayer(root: string) {
+   ])
+ }
+ 
+-function withRemote<A, E, R>(body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>) {
++function withRemote<A, E, R>(
++  body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>,
++  input?: Parameters<typeof gitRemote>[1],
++) {
+   return Effect.acquireUseRelease(
+     Effect.promise(async () => {
+       const root = await tmpdir()
+-      return { root, fixture: await gitRemote(root.path) }
++      return { root, fixture: await gitRemote(root.path, input) }
+     }),
+     (input) => body(input.fixture),
+     (input) => Effect.promise(() => input.root[Symbol.asyncDispose]()),
 diff --git a/packages/core/test/snapshot.test.ts b/packages/core/test/snapshot.test.ts
 index 5e01fefc17dc6cff7e49c89adb9c0d77c4262838..19d55a1688a009ea8f44dcd153e99ae885b21d9d 100644
 --- a/packages/core/test/snapshot.test.ts

@@ -21,12 +21,12 @@
         "productionEligible"
       ],
       "properties": {
-        "sourceCommit": { "const": "670dcc114ded9bc3c832d7eeec801f8d31cc0c4c" },
-        "sourceTree": { "const": "b8d7f7a70941ff615bf5af65c3745c26b17280b6" },
-        "artifactTree": { "const": "05f76c9826ba80490b58746e8389c00fbb7aa2ca" },
+        "sourceCommit": { "const": "36af5b86f0a1229199b2aab8d7822dcdea7b6b8e" },
+        "sourceTree": { "const": "ee49d9aa9c552bf48a0af493c423d3381da3f8d9" },
+        "artifactTree": { "const": "c28c1abe9e5711579ee07be6ea00c4e4323f0faf" },
         "baseCommit": { "const": "ef2880f379129aa048be9e9353e30aa168d42c17" },
-        "patchSha256": { "const": "20e9e84f70be9c4ff06dfe1133977f6ceae781768ce4af0d7ebb4ea8ae9cf8a5" },
-        "patchSize": { "const": 181629 },
+        "patchSha256": { "const": "ebd5d063ee774a17f5f4aa64277a9d2b48d8648719b62e2f8ca6da569d49e30c" },
+        "patchSize": { "const": 190241 },
         "version": { "const": "1.18.23-agentteams.1" },
         "tag": { "const": "v1.18.23-agentteams.1" },
         "bunVersion": { "const": "1.3.14" },
