@@ -1,10 +1,11 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Deferred, Effect, Fiber, Layer } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
+import { containsPath, type InstanceContext } from "../../src/project/instance-context"
 import { InstanceStore } from "../../src/project/instance-store"
 import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -37,6 +38,39 @@ const registerDisposerScoped = (disposer: (directory: string) => Promise<void>) 
     Effect.sync(() => registerDisposer(disposer)),
     (off) => Effect.sync(off),
   )
+
+const instanceContext = (directory: string, worktree: string) =>
+  ({ directory, worktree, project: {} as InstanceContext["project"] })
+
+describe("containsPath", () => {
+  test("allows paths in an ordinary worktree outside the instance directory", () => {
+    const ctx = instanceContext("/repo/packages/opencode", "/repo")
+
+    expect(containsPath("/repo/packages/core/src/index.ts", ctx)).toBe(true)
+  })
+
+  test.each([
+    ["POSIX", "/", "/outside/file.txt"],
+    ["Windows drive with backslashes", "C:\\", "C:\\outside\\file.txt"],
+    ["Windows drive with slashes", "C:/", "C:/outside/file.txt"],
+    ["UNC share with backslashes", "\\\\server\\share\\", "\\\\server\\share\\outside\\file.txt"],
+    ["UNC share with slashes", "//server/share/", "//server/share/outside/file.txt"],
+  ])("does not allow paths through a %s root worktree", (_name, worktree, filepath) => {
+    const ctx = instanceContext(`${worktree}project`, worktree)
+
+    expect(containsPath(ctx.directory, ctx)).toBe(true)
+    expect(containsPath(filepath, ctx)).toBe(false)
+  })
+
+  test.each([
+    ["Windows volume", "C:\\", "D:\\outside\\file.txt"],
+    ["UNC share", "\\\\server\\share\\", "\\\\other\\share\\outside\\file.txt"],
+  ])("denies paths on another %s", (_name, worktree, filepath) => {
+    const ctx = instanceContext(`${worktree}project`, worktree)
+
+    expect(containsPath(filepath, ctx)).toBe(false)
+  })
+})
 
 describe("InstanceStore", () => {
   it.live("loads instance context", () =>
