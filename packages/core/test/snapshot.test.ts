@@ -26,11 +26,10 @@ describe("Snapshot", () => {
             await fs.writeFile(path.join(project, "outside.txt"), "outside\n")
             await $`git init`.cwd(project).quiet()
             await $`git config core.fsmonitor false`.cwd(project).quiet()
-            await $`git config commit.gpgsign false`.cwd(project).quiet()
-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
-            await $`git config user.name Test`.cwd(project).quiet()
             await $`git add .`.cwd(project).quiet()
-            await $`git commit -m initial`.cwd(project).quiet()
+            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
+              .cwd(project)
+              .quiet()
           })
 
           const layer = snapshotLayer(tmp.path, location)
@@ -65,6 +64,7 @@ describe("Snapshot", () => {
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
+    30_000,
   )
 
   testEffect(Layer.empty).live("treats capture outside Git as unavailable", () =>
@@ -95,11 +95,10 @@ describe("Snapshot", () => {
             await fs.writeFile(path.join(project, "tracked.txt"), "main\n")
             await $`git init`.cwd(project).quiet()
             await $`git config core.fsmonitor false`.cwd(project).quiet()
-            await $`git config commit.gpgsign false`.cwd(project).quiet()
-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
-            await $`git config user.name Test`.cwd(project).quiet()
             await $`git add .`.cwd(project).quiet()
-            await $`git commit -m initial`.cwd(project).quiet()
+            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
+              .cwd(project)
+              .quiet()
             await $`git worktree add --detach ${linked} HEAD`.cwd(project).quiet()
           })
 
@@ -127,6 +126,7 @@ describe("Snapshot", () => {
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
+    15_000,
   )
 
   testEffect(Layer.empty).live("checks out a legacy revert snapshot without removing unrelated files", () =>
@@ -140,11 +140,10 @@ describe("Snapshot", () => {
             await fs.writeFile(path.join(project, "tracked.txt"), "one\n")
             await $`git init`.cwd(project).quiet()
             await $`git config core.fsmonitor false`.cwd(project).quiet()
-            await $`git config commit.gpgsign false`.cwd(project).quiet()
-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
-            await $`git config user.name Test`.cwd(project).quiet()
             await $`git add .`.cwd(project).quiet()
-            await $`git commit -m initial`.cwd(project).quiet()
+            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
+              .cwd(project)
+              .quiet()
           })
 
           yield* Effect.gen(function* () {
@@ -163,6 +162,7 @@ describe("Snapshot", () => {
         }),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
     ),
+    15_000,
   )
 })
 

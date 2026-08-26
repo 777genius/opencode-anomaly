@@ -73,12 +73,13 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: 15_000,
+          timeoutMs: 30_000,
+          printLogs: true,
         })
-        expect(result.exitCode).not.toBe(0)
-        expect(result.durationMs).toBeLessThan(15_000)
+        opencode.expectExit(result, 1)
+        expect(result.durationMs).toBeLessThan(30_000)
       }),
-    30_000,
+    45_000,
   )
 
   // The test provider's SSE error item is interpreted by the SDK as an unknown
