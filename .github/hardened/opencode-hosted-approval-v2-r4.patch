@@ -660,6 +660,30 @@ index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..f58fcf3a19d983bb1d9173ac52a985b9
 +})
  
  export * as Permission from "."
+diff --git a/packages/opencode/src/project/instance-context.ts b/packages/opencode/src/project/instance-context.ts
+index 18ea39e16e9175be15489d2593df26dec4c4f526..727985928bf06f5bcb3bd3a12d532f8547b06473 100644
+--- a/packages/opencode/src/project/instance-context.ts
++++ b/packages/opencode/src/project/instance-context.ts
+@@ -1,3 +1,4 @@
++import path from "path"
+ import { LocalContext } from "@/util/local-context"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import type * as Project from "./project"
+@@ -17,8 +18,11 @@ export const context = LocalContext.create<InstanceContext>("instance")
+  */
+ export function containsPath(filepath: string, ctx: InstanceContext): boolean {
+   if (FSUtil.contains(ctx.directory, filepath)) return true
+-  // Non-git projects set worktree to "/" which would match ANY absolute path.
+-  // Skip worktree check in this case to preserve external_directory permissions.
+-  if (ctx.worktree === "/") return false
++  // Non-git projects set worktree to the filesystem root, which would match every path on that volume or share.
++  if (
++    (path.posix.isAbsolute(ctx.worktree) && path.posix.parse(ctx.worktree).root === ctx.worktree) ||
++    (path.win32.isAbsolute(ctx.worktree) && path.win32.parse(ctx.worktree).root === ctx.worktree)
++  )
++    return false
+   return FSUtil.contains(ctx.worktree, filepath)
+ }
 diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
 index 79959db499bd12a359ac84a9a189faebc84c016e..80ff005def818509dd6fa2b95417f7a58766115e 100644
 --- a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
@@ -1670,6 +1694,63 @@ index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..f79f20f9fc1df5bbcc6e734ddfa5a7f3
  it.instance(
    "reply - reject with message throws CorrectedError",
    () =>
+diff --git a/packages/opencode/test/project/instance.test.ts b/packages/opencode/test/project/instance.test.ts
+index f78b99ef7d9b9193a4097f836df2aa7354905a8a..3cd3f7710f2c09c62f54d078f88a000a4cf845cd 100644
+--- a/packages/opencode/test/project/instance.test.ts
++++ b/packages/opencode/test/project/instance.test.ts
+@@ -1,10 +1,11 @@
+-import { describe, expect } from "bun:test"
++import { describe, expect, test } from "bun:test"
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+ import { Deferred, Effect, Fiber, Layer } from "effect"
+ import { InstanceRef } from "../../src/effect/instance-ref"
+ import { registerDisposer } from "../../src/effect/instance-registry"
+ import { InstanceBootstrap } from "../../src/project/bootstrap"
++import { containsPath, type InstanceContext } from "../../src/project/instance-context"
+ import { InstanceStore } from "../../src/project/instance-store"
+ import { tmpdirScoped } from "../fixture/fixture"
+ import { testEffect } from "../lib/effect"
+@@ -38,6 +39,39 @@ const registerDisposerScoped = (disposer: (directory: string) => Promise<void>)
+     (off) => Effect.sync(off),
+   )
+ 
++const instanceContext = (directory: string, worktree: string) =>
++  ({ directory, worktree, project: {} as InstanceContext["project"] })
++
++describe("containsPath", () => {
++  test("allows paths in an ordinary worktree outside the instance directory", () => {
++    const ctx = instanceContext("/repo/packages/opencode", "/repo")
++
++    expect(containsPath("/repo/packages/core/src/index.ts", ctx)).toBe(true)
++  })
++
++  test.each([
++    ["POSIX", "/", "/outside/file.txt"],
++    ["Windows drive with backslashes", "C:\\", "C:\\outside\\file.txt"],
++    ["Windows drive with slashes", "C:/", "C:/outside/file.txt"],
++    ["UNC share with backslashes", "\\\\server\\share\\", "\\\\server\\share\\outside\\file.txt"],
++    ["UNC share with slashes", "//server/share/", "//server/share/outside/file.txt"],
++  ])("does not allow paths through a %s root worktree", (_name, worktree, filepath) => {
++    const ctx = instanceContext(`${worktree}project`, worktree)
++
++    expect(containsPath(ctx.directory, ctx)).toBe(true)
++    expect(containsPath(filepath, ctx)).toBe(false)
++  })
++
++  test.each([
++    ["Windows volume", "C:\\", "D:\\outside\\file.txt"],
++    ["UNC share", "\\\\server\\share\\", "\\\\other\\share\\outside\\file.txt"],
++  ])("denies paths on another %s", (_name, worktree, filepath) => {
++    const ctx = instanceContext(`${worktree}project`, worktree)
++
++    expect(containsPath(filepath, ctx)).toBe(false)
++  })
++})
++
+ describe("InstanceStore", () => {
+   it.live("loads instance context", () =>
+     Effect.gen(function* () {
 diff --git a/packages/opencode/test/server/httpapi-control-plane.test.ts b/packages/opencode/test/server/httpapi-control-plane.test.ts
 index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240924f4be3 100644
 --- a/packages/opencode/test/server/httpapi-control-plane.test.ts
@@ -1709,16 +1790,16 @@ index 55bdcff4f59fbac80b0df6e4191c2e97a45d8633..8af98431fb8dcfe8ab17aa0955e4c97c
      // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
 diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
 new file mode 100644
-index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7e1e2c385
+index 0000000000000000000000000000000000000000..a604b6abcd7d184cd313b32e8e9e9695544f8392
 --- /dev/null
 +++ b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
-@@ -0,0 +1,240 @@
+@@ -0,0 +1,264 @@
 +import { afterEach, describe, expect, test } from "bun:test"
-+import { ConfigProvider, Effect, Exit, Fiber, Layer } from "effect"
++import { ConfigProvider, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
 +import { HttpRouter } from "effect/unstable/http"
 +import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-+import { AppRuntime } from "../../src/effect/app-runtime"
-+import { memoMap } from "@opencode-ai/core/effect/memo-map"
++import { AppLayer } from "../../src/effect/app-runtime"
++import { attach } from "../../src/effect/run-service"
 +import { Permission } from "../../src/permission"
 +import { InstanceStore } from "../../src/project/instance-store"
 +import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
@@ -1730,15 +1811,28 @@ index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7
 +const apps = new Set<{ dispose: () => Promise<void> }>()
 +
 +function app(password?: string) {
++  const memoMap = Layer.makeMemoMapUnsafe()
++  const runtime = ManagedRuntime.make(AppLayer, { memoMap })
 +  const web = HttpRouter.toWebHandler(
 +    HttpApiApp.routes.pipe(
 +      Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ OPENCODE_SERVER_PASSWORD: password }))),
 +    ),
 +    { disableLogger: true, memoMap },
 +  )
-+  apps.add(web)
-+  return (path: string, init?: RequestInit) =>
-+    web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context)
++  apps.add({
++    dispose: async () => {
++      await web.dispose()
++      await runtime.dispose()
++    },
++  })
++  return Object.assign(
++    (path: string, init?: RequestInit) =>
++      web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context),
++    {
++      runFork: <A, E>(effect: Effect.Effect<A, E, ManagedRuntime.ManagedRuntime.Services<typeof runtime>>) =>
++        runtime.runFork(attach(effect)),
++    },
++  )
 +}
 +
 +function auth(password = "secret") {
@@ -1783,6 +1877,17 @@ index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7
 +      },
 +    )
 +    expect(response.status).toBe(404)
++  })
++
++  test("isolates hosted availability between app runtimes", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const unavailable = app()
++    const available = app("secret")
++    const path = "/experimental/agent-teams/hosted-approval-capability"
++    const headers = { "x-opencode-directory": dir.path }
++
++    expect((await unavailable(path, { headers })).status).toBe(404)
++    expect((await available(path, { headers: { ...headers, authorization: auth() } })).status).toBe(200)
 +  })
 +
 +  test("requires standard Basic auth for capability", async () => {
@@ -1880,7 +1985,7 @@ index 0000000000000000000000000000000000000000..6634507c14f9238f9ef0bee4e6d51fd7
 +    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
 +    const requestID = PermissionV1.ID.make("per_hosted_http_once")
 +    const sessionID = SessionID.make("ses_hosted_http_once")
-+    const asked = AppRuntime.runFork(
++    const asked = request.runFork(
 +      InstanceStore.Service.use((store) =>
 +        store.provide(
 +          { directory: dir.path },

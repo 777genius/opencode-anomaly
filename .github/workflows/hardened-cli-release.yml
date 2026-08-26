@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: 3186244c3103eb02d95a255b593847b14488b070
+  SOURCE_COMMIT: 044bb4a47b6c2e4cecfb7d790f6be5f5efe3a0b1
   BASE_COMMIT: 47b6b6f5f4f9b42d2bce7af1c4e5bf6efaf22ba7
   VERSION: 1.18.22-agentteams.1
   TAG: v1.18.22-agentteams.1
@@ -36,7 +36,7 @@ jobs:
         with:
           ref: ${{ env.SOURCE_COMMIT }}
           path: source
-          fetch-depth: 3
+          fetch-depth: 0
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -61,13 +61,15 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ env.SOURCE_COMMIT }}
+          ref: ${{ env.BASE_COMMIT }}
           path: source
           persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
       - run: test "$(bun --version)" = "$BUN_VERSION"
+      - name: Materialize exact accepted source change
+        run: bun infra/.github/scripts/hardened-artifacts.ts materialize --repo source --patch "infra/$PATCH"
       - run: bun install --frozen-lockfile
         working-directory: source
       - name: Clean build

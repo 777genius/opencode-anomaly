@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
@@ -61,10 +62,11 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "3186244c3103eb02d95a255b593847b14488b070",
-      sourceTree: "8fba45aecd63ec61f334a856694cbd3da037df90",
+      sourceCommit: "044bb4a47b6c2e4cecfb7d790f6be5f5efe3a0b1",
+      sourceTree: "4873a6eda63b8a78d6cd4badb70c3a3a5532bfc6",
+      artifactTree: "6b0442241c0fe40c6711352952766602b1904f97",
       baseCommit: "47b6b6f5f4f9b42d2bce7af1c4e5bf6efaf22ba7",
-      patchSha256: "3845fdf3b5991ac7b798cd74e8fa50bdfa2007f863d54b76565d92b8585c3d4c",
+      patchSha256: "da46d1d5b59297ce60dbf7be15fdbbee201460a3c9f52a9a081cbffe32482cb8",
       version: "1.18.22-agentteams.1",
       tag: "v1.18.22-agentteams.1",
       bunVersion: "1.3.14",
@@ -72,12 +74,45 @@ describe("hardened release contract", () => {
     })
   })
 
+  test("freezes an exact packages-only source patch", async () => {
+    const patch = new URL("../hardened/opencode-hosted-approval-v2-r4.patch", import.meta.url)
+    const bytes = await Bun.file(patch).bytes()
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(RELEASE.patchSha256)
+    expect(bytes.byteLength).toBe(90137)
+    const numstat = Bun.spawnSync(["git", "apply", "--numstat", patch.pathname], {
+      cwd: new URL("../..", import.meta.url).pathname,
+      stdout: "pipe",
+    })
+    expect(numstat.exitCode).toBe(0)
+    const paths = numstat.stdout
+      .toString()
+      .trim()
+      .split("\n")
+      .map((line) => line.split("\t")[2])
+    expect(paths).toHaveLength(19)
+    expect(paths.every((item) => item.startsWith("packages/"))).toBe(true)
+    expect(paths).toContain("packages/opencode/src/project/instance-context.ts")
+    expect(paths).toContain("packages/opencode/test/project/instance.test.ts")
+  })
+
+  test("builds the frozen artifact from the exact base plus patch", async () => {
+    const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
+    const build = workflow.match(/\n  build:\n([\s\S]*?)\n  reproducible:/)?.[1]
+    if (!build) throw new Error("build job is missing")
+    expect(workflow).toContain(`SOURCE_COMMIT: ${RELEASE.sourceCommit}`)
+    expect(workflow).toContain(`BASE_COMMIT: ${RELEASE.baseCommit}`)
+    expect(build).toContain("ref: ${{ env.BASE_COMMIT }}")
+    expect(build).not.toContain("ref: ${{ env.SOURCE_COMMIT }}")
+    expect(build).toContain('materialize --repo source --patch "infra/$PATCH"')
+    expect(build.indexOf("materialize --repo source")).toBeLessThan(build.indexOf("bun install --frozen-lockfile"))
+  })
+
   test("keeps schema identity constants synchronized with RELEASE", async () => {
     const schema = await Bun.file(new URL("../hardened/release-manifest.schema.json", import.meta.url)).json()
     for (const [key, value] of Object.entries(RELEASE)) {
       expect(schema.properties.release.properties[key].const).toBe(value)
     }
-    expect(schema.properties.release.properties.patchSize.const).toBe(85072)
+    expect(schema.properties.release.properties.patchSize.const).toBe(90137)
   })
 
   test("enforces the manifest schema and rejects malformed assets", async () => {
@@ -100,7 +135,7 @@ describe("hardened release contract", () => {
     }
     const value = {
       schemaVersion: 1,
-      release: { ...RELEASE, patchSize: 85072 },
+      release: { ...RELEASE, patchSize: 90137 },
       workflow: {
         repository: "local",
         workflow: "local",

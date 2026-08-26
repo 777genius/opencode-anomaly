@@ -2,8 +2,12 @@
 
 This directory freezes the reviewed patch used by the isolated hardened release
 workflow. The patch is applied to base commit
-`47b6b6f5f4f9b42d2bce7af1c4e5bf6efaf22ba7`; its resulting tree must equal source
-commit `3186244c3103eb02d95a255b593847b14488b070`.
+`47b6b6f5f4f9b42d2bce7af1c4e5bf6efaf22ba7`. It is byte-for-byte the `packages/`
+diff to accepted PR3 source commit
+`044bb4a47b6c2e4cecfb7d790f6be5f5efe3a0b1`; the commit tree is
+`4873a6eda63b8a78d6cd4badb70c3a3a5532bfc6`, and applying the patch produces the
+frozen artifact tree `6b0442241c0fe40c6711352952766602b1904f97`. PR3's `.github/`
+runner changes are deliberately excluded from the release source artifact.
 
 The workflow intentionally produces a draft prerelease that is never production
 eligible. It does not replace or modify the upstream publish workflow. Release

@@ -5,10 +5,11 @@ import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/pr
 import path from "node:path"
 
 export const RELEASE = {
-  sourceCommit: "3186244c3103eb02d95a255b593847b14488b070",
-  sourceTree: "8fba45aecd63ec61f334a856694cbd3da037df90",
+  sourceCommit: "044bb4a47b6c2e4cecfb7d790f6be5f5efe3a0b1",
+  sourceTree: "4873a6eda63b8a78d6cd4badb70c3a3a5532bfc6",
+  artifactTree: "6b0442241c0fe40c6711352952766602b1904f97",
   baseCommit: "47b6b6f5f4f9b42d2bce7af1c4e5bf6efaf22ba7",
-  patchSha256: "3845fdf3b5991ac7b798cd74e8fa50bdfa2007f863d54b76565d92b8585c3d4c",
+  patchSha256: "da46d1d5b59297ce60dbf7be15fdbbee201460a3c9f52a9a081cbffe32482cb8",
   version: "1.18.22-agentteams.1",
   tag: "v1.18.22-agentteams.1",
   bunVersion: "1.3.14",
@@ -66,7 +67,7 @@ const requireValue = (args: string[], flag: string) => {
 export const validateConstants = () => {
   if (RELEASE.productionEligible !== false) fail("productionEligible must remain hardcoded false")
   if (RELEASE.tag !== `v${RELEASE.version}`) fail("tag/version mismatch")
-  for (const key of ["sourceCommit", "sourceTree", "baseCommit"] as const) {
+  for (const key of ["sourceCommit", "sourceTree", "artifactTree", "baseCommit"] as const) {
     if (!/^[0-9a-f]{40}$/.test(RELEASE[key])) fail(`invalid ${key}`)
   }
   if (!/^[0-9a-f]{64}$/.test(RELEASE.patchSha256)) fail("invalid patchSha256")
@@ -82,17 +83,40 @@ const identity = async (args: string[]) => {
     fail("checkout is not exact source commit")
   if (run(["git", "merge-base", RELEASE.baseCommit, RELEASE.sourceCommit], repository) !== RELEASE.baseCommit)
     fail("source does not descend from exact base commit")
+  if (run(["git", "rev-parse", `${RELEASE.sourceCommit}^{tree}`], repository) !== RELEASE.sourceTree)
+    fail("source commit tree differs from frozen source tree")
+  const expected = Bun.spawnSync(
+    [
+      "git",
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-ext-diff",
+      "--no-textconv",
+      "--no-renames",
+      "--diff-algorithm=myers",
+      "--no-color",
+      "--src-prefix=a/",
+      "--dst-prefix=b/",
+      RELEASE.baseCommit,
+      RELEASE.sourceCommit,
+      "--",
+      "packages",
+    ],
+    { cwd: repository, stdout: "pipe", stderr: "pipe", env: process.env },
+  )
+  if (expected.exitCode !== 0) fail(`exact source diff failed: ${expected.stderr.toString().trim()}`)
+  if (!expected.stdout.equals(await readFile(patch)))
+    fail("patch is not the exact packages diff from base to accepted source commit")
 
   const temporary = await Bun.$`mktemp -d`.text().then((value) => value.trim())
   try {
     run(["git", "worktree", "add", "--detach", temporary, RELEASE.baseCommit], repository)
-    run(["git", "apply", "--check", patch], temporary)
-    run(["git", "apply", "--index", patch], temporary)
+    run(["git", "apply", "--check", "--whitespace=error-all", patch], temporary)
+    run(["git", "apply", "--index", "--whitespace=error-all", patch], temporary)
     const patchedTree = run(["git", "write-tree"], temporary)
-    const sourceTree = run(["git", "rev-parse", `${RELEASE.sourceCommit}^{tree}`], repository)
-    if (sourceTree !== RELEASE.sourceTree)
-      fail(`source tree ${sourceTree} differs from frozen tree ${RELEASE.sourceTree}`)
-    if (patchedTree !== sourceTree) fail(`patch tree ${patchedTree} differs from source tree ${sourceTree}`)
+    if (patchedTree !== RELEASE.artifactTree)
+      fail(`patch tree ${patchedTree} differs from frozen artifact tree ${RELEASE.artifactTree}`)
   } finally {
     Bun.spawnSync(["git", "worktree", "remove", "--force", temporary], {
       cwd: repository,
@@ -100,6 +124,20 @@ const identity = async (args: string[]) => {
       stderr: "ignore",
     })
   }
+}
+
+const materialize = async (args: string[]) => {
+  validateConstants()
+  const patch = path.resolve(requireValue(args, "--patch"))
+  const repository = path.resolve(requireValue(args, "--repo"))
+  if ((await sha256(patch)) !== RELEASE.patchSha256) fail("immutable patch SHA-256 mismatch")
+  if (run(["git", "rev-parse", "HEAD"], repository) !== RELEASE.baseCommit)
+    fail("materialization checkout is not exact base commit")
+  run(["git", "apply", "--check", "--whitespace=error-all", patch], repository)
+  run(["git", "apply", "--index", "--whitespace=error-all", patch], repository)
+  const tree = run(["git", "write-tree"], repository)
+  if (tree !== RELEASE.artifactTree)
+    fail(`materialized tree ${tree} differs from frozen artifact tree ${RELEASE.artifactTree}`)
 }
 
 export const archive = async (args: string[]) => {
@@ -335,6 +373,7 @@ const validateManifest = async (args: string[]) => {
 const main = async () => {
   const [command, ...args] = process.argv.slice(2)
   if (command === "identity") return identity(args)
+  if (command === "materialize") return materialize(args)
   if (command === "archive") return archive(args)
   if (command === "compare") return compare(args)
   if (command === "verify") return verify(args)
