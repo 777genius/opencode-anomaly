@@ -62,14 +62,14 @@ describe("hardened release contract", () => {
   test("freezes identity and non-production eligibility", () => {
     expect(validateConstants()).toBeUndefined()
     expect(RELEASE).toEqual({
-      sourceCommit: "36af5b86f0a1229199b2aab8d7822dcdea7b6b8e",
-      sourceTree: "ee49d9aa9c552bf48a0af493c423d3381da3f8d9",
+      sourceCommit: "cee24c1de70a220253c115822d8846b973b9e5a4",
+      sourceTree: "970e7191f1751dbc591333209607a8cc422b3204",
       artifactTree: "c28c1abe9e5711579ee07be6ea00c4e4323f0faf",
       baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
       patchSha256: "ebd5d063ee774a17f5f4aa64277a9d2b48d8648719b62e2f8ca6da569d49e30c",
       version: "1.18.23-agentteams.1",
       tag: "v1.18.23-agentteams.1",
-      bunVersion: "1.3.14",
+      bunVersion: "1.4.0",
       productionEligible: false,
     })
   })
@@ -99,12 +99,16 @@ describe("hardened release contract", () => {
 
   test("builds the frozen artifact from the exact base plus patch", async () => {
     const workflow = await Bun.file(new URL("../workflows/hardened-cli-release.yml", import.meta.url)).text()
+    const root = await Bun.file(new URL("../../package.json", import.meta.url)).json()
     const build = workflow.match(/\n  build:\n([\s\S]*?)\n  reproducible:/)?.[1]
     if (!build) throw new Error("build job is missing")
+    expect(root.packageManager).toBe(`bun@${RELEASE.bunVersion}`)
     expect(workflow).toContain(`SOURCE_COMMIT: ${RELEASE.sourceCommit}`)
     expect(workflow).toContain(`BASE_COMMIT: ${RELEASE.baseCommit}`)
+    expect(workflow).toContain(`BUN_VERSION: ${RELEASE.bunVersion}`)
     expect(build).toContain("ref: ${{ env.BASE_COMMIT }}")
     expect(build).not.toContain("ref: ${{ env.SOURCE_COMMIT }}")
+    expect(build).toContain('test "$(bun --version)" = "$BUN_VERSION"')
     expect(build).toContain('materialize --repo source --patch "infra/$PATCH"')
     expect(build.indexOf("materialize --repo source")).toBeLessThan(build.indexOf("bun install --frozen-lockfile"))
   })

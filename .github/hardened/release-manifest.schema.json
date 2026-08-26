@@ -21,15 +21,15 @@
         "productionEligible"
       ],
       "properties": {
-        "sourceCommit": { "const": "36af5b86f0a1229199b2aab8d7822dcdea7b6b8e" },
-        "sourceTree": { "const": "ee49d9aa9c552bf48a0af493c423d3381da3f8d9" },
+        "sourceCommit": { "const": "cee24c1de70a220253c115822d8846b973b9e5a4" },
+        "sourceTree": { "const": "970e7191f1751dbc591333209607a8cc422b3204" },
         "artifactTree": { "const": "c28c1abe9e5711579ee07be6ea00c4e4323f0faf" },
         "baseCommit": { "const": "ef2880f379129aa048be9e9353e30aa168d42c17" },
         "patchSha256": { "const": "ebd5d063ee774a17f5f4aa64277a9d2b48d8648719b62e2f8ca6da569d49e30c" },
         "patchSize": { "const": 190241 },
         "version": { "const": "1.18.23-agentteams.1" },
         "tag": { "const": "v1.18.23-agentteams.1" },
-        "bunVersion": { "const": "1.3.14" },
+        "bunVersion": { "const": "1.4.0" },
         "productionEligible": { "const": false }
       },
       "additionalProperties": false

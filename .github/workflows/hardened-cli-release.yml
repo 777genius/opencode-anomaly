@@ -17,11 +17,11 @@ permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: 36af5b86f0a1229199b2aab8d7822dcdea7b6b8e
+  SOURCE_COMMIT: cee24c1de70a220253c115822d8846b973b9e5a4
   BASE_COMMIT: ef2880f379129aa048be9e9353e30aa168d42c17
   VERSION: 1.18.23-agentteams.1
   TAG: v1.18.23-agentteams.1
-  BUN_VERSION: 1.3.14
+  BUN_VERSION: 1.4.0
   PATCH: .github/hardened/opencode-hosted-approval-v2-r4.patch
 
 jobs:
