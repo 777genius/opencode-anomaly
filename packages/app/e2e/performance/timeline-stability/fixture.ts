@@ -105,6 +105,7 @@ export async function setupTimeline(
     ...(input.seedHistory ? historyMessages(18) : []),
     ...(input.messages ?? [userMessage(), assistantMessage()]),
   ])
+  const readinessPart = messages.findLast((message) => message.parts.length)?.parts.at(-1)
   const active = messages.findLast((message) => message.info.role === "assistant")
   const initialStatus = decodeStatus(
     active?.info.role === "assistant" && active.info.time.completed === undefined ? { type: "busy" } : { type: "idle" },
@@ -162,6 +163,11 @@ export async function setupTimeline(
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await transport.waitForConnection()
   await expectSessionTitle(page, title)
+  if (readinessPart) {
+    const part = page.locator(`[data-timeline-part-id="${readinessPart.id}"]`)
+    await expect(part).toHaveCount(1)
+    await expect(part).toBeVisible()
+  }
   if (input.cpuRate && input.cpuRate > 1) {
     const devtools = await page.context().newCDPSession(page)
     await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
