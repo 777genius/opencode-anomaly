@@ -5,12 +5,15 @@ import { Effect, Layer } from "effect"
 import { Instance } from "../../src/project/instance"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
 import { ToolRegistry } from "../../src/tool"
-import { provideTmpdirInstance } from "../fixture/fixture"
+import { prepareTestDependencies, provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
+import { Global } from "../../src/global"
 
 const node = CrossSpawnSpawner.defaultLayer
 
 const it = testEffect(Layer.mergeAll(ToolRegistry.defaultLayer, node))
+
+await prepareTestDependencies(Global.Path.config)
 
 afterEach(async () => {
   await Instance.disposeAll()
@@ -23,6 +26,7 @@ describe("tool.registry", () => {
         const opencode = path.join(dir, ".opencode")
         const tool = path.join(opencode, "tool")
         yield* Effect.promise(() => fs.mkdir(tool, { recursive: true }))
+        yield* Effect.promise(() => prepareTestDependencies(opencode))
         yield* Effect.promise(() =>
           Bun.write(
             path.join(tool, "hello.ts"),
@@ -51,6 +55,7 @@ describe("tool.registry", () => {
         const opencode = path.join(dir, ".opencode")
         const tools = path.join(opencode, "tools")
         yield* Effect.promise(() => fs.mkdir(tools, { recursive: true }))
+        yield* Effect.promise(() => prepareTestDependencies(opencode))
         yield* Effect.promise(() =>
           Bun.write(
             path.join(tools, "hello.ts"),

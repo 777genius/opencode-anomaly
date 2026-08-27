@@ -120,16 +120,6 @@ jobs:
             turbo-${{ runner.os }}-${{ hashFiles('turbo.json', '**/package.json') }}-
             turbo-${{ runner.os }}-
 
-      - name: Configure Bun runtime transpiler cache (Windows)
-        if: runner.os == 'Windows'
-        run: echo "BUN_RUNTIME_TRANSPILER_CACHE_PATH=$RUNNER_TEMP/bun-runtime-transpiler-cache" >> "$GITHUB_ENV"
-
-      - name: Prewarm Bun runtime transpiler cache (Windows)
-        if: runner.os == 'Windows'
-        working-directory: packages/opencode
-        run: bun test test/plugin/loader.test.ts --test-name-pattern "loads a file:// plugin function export"
-        timeout-minutes: 3
-
       - name: Run unit tests
         run: bun turbo test:ci
         env:

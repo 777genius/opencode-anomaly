@@ -3,8 +3,9 @@ import { Effect } from "effect"
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
-import { tmpdir } from "../fixture/fixture"
+import { prepareTestDependencies, tmpdir } from "../fixture/fixture"
 import { Filesystem } from "../../src/util"
+import { Global } from "../../src/global"
 
 const disableDefault = process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
 process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "1"
@@ -14,6 +15,8 @@ const { PluginLoader } = await import("../../src/plugin/loader")
 const { readPackageThemes } = await import("../../src/plugin/shared")
 const { Instance } = await import("../../src/project/instance")
 const { Npm } = await import("../../src/npm")
+
+await prepareTestDependencies(Global.Path.config)
 
 afterAll(() => {
   if (disableDefault === undefined) {
@@ -39,8 +42,6 @@ async function load(dir: string) {
 }
 
 describe("plugin.loader.shared", () => {
-  // Bun 1.4.0's first Windows file:// TypeScript transpile exceeded 60 seconds with an isolated cache.
-  // Keep the normal deadline everywhere else while bounding that upstream cold start to two minutes.
   test("loads a file:// plugin function export", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
@@ -68,7 +69,7 @@ describe("plugin.loader.shared", () => {
 
     await load(tmp.path)
     expect(await fs.readFile(tmp.extra.mark, "utf8")).toBe("called")
-  }, process.platform === "win32" ? 120_000 : 30_000)
+  })
 
   test("deduplicates same function exported as default and named", async () => {
     await using tmp = await tmpdir({

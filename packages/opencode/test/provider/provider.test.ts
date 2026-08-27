@@ -1,8 +1,8 @@
-import { test, expect } from "bun:test"
+import { afterEach, test, expect } from "bun:test"
 import { mkdir, unlink } from "fs/promises"
 import path from "path"
 
-import { tmpdir } from "../fixture/fixture"
+import { prepareTestDependencies, tmpdir } from "../fixture/fixture"
 import { Global } from "../../src/global"
 import { Instance } from "../../src/project/instance"
 import { Plugin } from "../../src/plugin/index"
@@ -17,6 +17,12 @@ import { makeRuntime } from "../../src/effect/run-service"
 
 const env = makeRuntime(Env.Service, Env.defaultLayer)
 const set = (k: string, v: string) => env.runSync((svc) => svc.set(k, v))
+
+await prepareTestDependencies(Global.Path.config)
+
+afterEach(async () => {
+  await Instance.disposeAll()
+})
 
 async function run<A, E>(fn: (provider: Provider.Interface) => Effect.Effect<A, E, never>) {
   return AppRuntime.runPromise(
@@ -2441,6 +2447,7 @@ test("plugin config providers persist after instance dispose", async () => {
     init: async (dir) => {
       const root = path.join(dir, ".opencode", "plugin")
       await mkdir(root, { recursive: true })
+      await prepareTestDependencies(path.dirname(root))
       await Bun.write(
         path.join(root, "demo-provider.ts"),
         [
@@ -2500,6 +2507,7 @@ test("plugin config enabled and disabled providers are honored", async () => {
     init: async (dir) => {
       const root = path.join(dir, ".opencode", "plugin")
       await mkdir(root, { recursive: true })
+      await prepareTestDependencies(path.dirname(root))
       await Bun.write(
         path.join(root, "provider-filter.ts"),
         [
