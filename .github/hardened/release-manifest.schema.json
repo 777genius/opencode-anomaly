@@ -11,6 +11,7 @@
       "required": [
         "sourceCommit",
         "sourceTree",
+        "packagesTree",
         "artifactTree",
         "baseCommit",
         "patchSha256",
@@ -21,12 +22,13 @@
         "productionEligible"
       ],
       "properties": {
-        "sourceCommit": { "const": "8977acfd7fc823cbde41b864a9657bee5ca1334c" },
-        "sourceTree": { "const": "3a346b6ce7d81c50858595260bed5840f519cf6b" },
-        "artifactTree": { "const": "6a34a25669a72df44842f5f3581283553a60f7d0" },
+        "sourceCommit": { "const": "0aab19b8295feb99f9c45c403e2cd46dbddc4b7b" },
+        "sourceTree": { "const": "da53426fec5bc794626a389e512e0c8abbef00ff" },
+        "packagesTree": { "const": "7c7567243a25d53cd911be507a9c0499344ca963" },
+        "artifactTree": { "const": "dc39bb88fc45702e305e9deb09d0ab5e4d892289" },
         "baseCommit": { "const": "ef2880f379129aa048be9e9353e30aa168d42c17" },
-        "patchSha256": { "const": "782cd6af8a122b9734c08ec3971044135c33e754712a7a530739b2571280a1fe" },
-        "patchSize": { "const": 199285 },
+        "patchSha256": { "const": "451990f173b1b8f47a0aa4fc3ac8c414b6df6474c97f6ea2db17a29489e71af7" },
+        "patchSize": { "const": 194044 },
         "version": { "const": "1.18.23-agentteams.1" },
         "tag": { "const": "v1.18.23-agentteams.1" },
         "bunVersion": { "const": "1.4.0" },

@@ -1,13 +1,17 @@
 # Hardened OpenCode CLI prerelease
 
 This directory freezes the reviewed patch used by the isolated hardened release
-workflow. The patch is applied to base commit
-`ef2880f379129aa048be9e9353e30aa168d42c17` (upstream `v1.18.23`). It is byte-for-byte the `packages/`
-diff to accepted PR3 source commit
-`8977acfd7fc823cbde41b864a9657bee5ca1334c`; the commit tree is
-`3a346b6ce7d81c50858595260bed5840f519cf6b`, and applying the patch produces the
-frozen artifact tree `6a34a25669a72df44842f5f3581283553a60f7d0`. PR3's `.github/`
-runner changes are deliberately excluded from the release source artifact.
+workflow. The artifact is upstream base commit
+`ef2880f379129aa048be9e9353e30aa168d42c17` (upstream `v1.18.23`) plus the exact
+`packages/` projection from accepted PR3 source commit
+`0aab19b8295feb99f9c45c403e2cd46dbddc4b7b`. The patch is byte-for-byte the
+canonical `packages/` diff between those commits. The source commit tree is
+`da53426fec5bc794626a389e512e0c8abbef00ff`, its `packages/` subtree is
+`7c7567243a25d53cd911be507a9c0499344ca963`, and applying the patch produces the
+frozen artifact tree `dc39bb88fc45702e305e9deb09d0ab5e4d892289`. PR3's `.github/`
+runner changes are deliberately excluded from the release source artifact. Bun
+`1.4.0` is separately pinned by the workflow and is not taken from the projected
+PR3 tree.
 
 The workflow intentionally produces a draft prerelease that is never production
 eligible. It does not replace or modify the upstream publish workflow. Release

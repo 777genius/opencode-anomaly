@@ -5,11 +5,12 @@ import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/pr
 import path from "node:path"
 
 export const RELEASE = {
-  sourceCommit: "8977acfd7fc823cbde41b864a9657bee5ca1334c",
-  sourceTree: "3a346b6ce7d81c50858595260bed5840f519cf6b",
-  artifactTree: "6a34a25669a72df44842f5f3581283553a60f7d0",
+  sourceCommit: "0aab19b8295feb99f9c45c403e2cd46dbddc4b7b",
+  sourceTree: "da53426fec5bc794626a389e512e0c8abbef00ff",
+  packagesTree: "7c7567243a25d53cd911be507a9c0499344ca963",
+  artifactTree: "dc39bb88fc45702e305e9deb09d0ab5e4d892289",
   baseCommit: "ef2880f379129aa048be9e9353e30aa168d42c17",
-  patchSha256: "782cd6af8a122b9734c08ec3971044135c33e754712a7a530739b2571280a1fe",
+  patchSha256: "451990f173b1b8f47a0aa4fc3ac8c414b6df6474c97f6ea2db17a29489e71af7",
   version: "1.18.23-agentteams.1",
   tag: "v1.18.23-agentteams.1",
   bunVersion: "1.4.0",
@@ -67,7 +68,7 @@ const requireValue = (args: string[], flag: string) => {
 export const validateConstants = () => {
   if (RELEASE.productionEligible !== false) fail("productionEligible must remain hardcoded false")
   if (RELEASE.tag !== `v${RELEASE.version}`) fail("tag/version mismatch")
-  for (const key of ["sourceCommit", "sourceTree", "artifactTree", "baseCommit"] as const) {
+  for (const key of ["sourceCommit", "sourceTree", "packagesTree", "artifactTree", "baseCommit"] as const) {
     if (!/^[0-9a-f]{40}$/.test(RELEASE[key])) fail(`invalid ${key}`)
   }
   if (!/^[0-9a-f]{64}$/.test(RELEASE.patchSha256)) fail("invalid patchSha256")
@@ -85,6 +86,8 @@ const identity = async (args: string[]) => {
     fail("source does not descend from exact base commit")
   if (run(["git", "rev-parse", `${RELEASE.sourceCommit}^{tree}`], repository) !== RELEASE.sourceTree)
     fail("source commit tree differs from frozen source tree")
+  if (run(["git", "rev-parse", `${RELEASE.sourceCommit}:packages`], repository) !== RELEASE.packagesTree)
+    fail("source packages subtree differs from frozen packages tree")
   const expected = Bun.spawnSync(
     [
       "git",
@@ -117,6 +120,8 @@ const identity = async (args: string[]) => {
     const patchedTree = run(["git", "write-tree"], temporary)
     if (patchedTree !== RELEASE.artifactTree)
       fail(`patch tree ${patchedTree} differs from frozen artifact tree ${RELEASE.artifactTree}`)
+    if (run(["git", "rev-parse", `${patchedTree}:packages`], temporary) !== RELEASE.packagesTree)
+      fail("patched packages subtree differs from frozen packages tree")
   } finally {
     Bun.spawnSync(["git", "worktree", "remove", "--force", temporary], {
       cwd: repository,
@@ -138,6 +143,8 @@ const materialize = async (args: string[]) => {
   const tree = run(["git", "write-tree"], repository)
   if (tree !== RELEASE.artifactTree)
     fail(`materialized tree ${tree} differs from frozen artifact tree ${RELEASE.artifactTree}`)
+  if (run(["git", "rev-parse", `${tree}:packages`], repository) !== RELEASE.packagesTree)
+    fail("materialized packages subtree differs from frozen packages tree")
 }
 
 export const archive = async (args: string[]) => {
