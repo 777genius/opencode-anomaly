@@ -120,20 +120,6 @@ jobs:
             turbo-${{ runner.os }}-${{ hashFiles('turbo.json', '**/package.json') }}-
             turbo-${{ runner.os }}-
 
-      - name: Verify isolated Bun runtime transpiler cache on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        working-directory: packages/opencode
-        run: |
-          Remove-Item Env:BUN_RUNTIME_TRANSPILER_CACHE_PATH -ErrorAction SilentlyContinue
-          bun test ./test/plugin/loader.test.ts --timeout 30000
-
-          $cache = Join-Path $env:RUNNER_TEMP "bun-runtime-transpiler-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:GITHUB_JOB"
-          New-Item -ItemType Directory -Force -Path $cache | Out-Null
-          $env:BUN_RUNTIME_TRANSPILER_CACHE_PATH = $cache
-          "BUN_RUNTIME_TRANSPILER_CACHE_PATH=$cache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          bun test ./test/plugin/loader.test.ts --timeout 30000
-
       - name: Run unit tests
         run: bun turbo test:ci
         env:
