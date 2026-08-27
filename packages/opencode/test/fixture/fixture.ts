@@ -80,6 +80,26 @@ export async function tmpdir<T>(options?: TmpDirOptions<T>) {
   return result
 }
 
+export async function prepareTestDependencies(dir: string) {
+  await fs.mkdir(path.join(dir, "node_modules"), { recursive: true })
+  await Bun.write(
+    path.join(dir, "package.json"),
+    JSON.stringify({ private: true, dependencies: { "@opencode-ai/plugin": "*" } }, null, 2),
+  )
+  await Bun.write(
+    path.join(dir, "package-lock.json"),
+    JSON.stringify(
+      {
+        name: "opencode-test-fixture",
+        lockfileVersion: 3,
+        packages: { "": { dependencies: { "@opencode-ai/plugin": "*" } } },
+      },
+      null,
+      2,
+    ),
+  )
+}
+
 /** Effectful scoped tmpdir. Cleaned up when the scope closes. Make sure these stay in sync */
 export function tmpdirScoped(options?: { git?: boolean; config?: Partial<Config.Info> }) {
   return Effect.gen(function* () {

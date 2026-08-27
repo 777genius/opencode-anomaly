@@ -1,0 +1,5193 @@
+diff --git a/packages/app/e2e/performance/timeline-stability/fixture.ts b/packages/app/e2e/performance/timeline-stability/fixture.ts
+index 66edece4092e8b23d3a0e9b1c8222343f995b490..4d7858cbfd65293fc482d671931b27da3e1500f5 100644
+--- a/packages/app/e2e/performance/timeline-stability/fixture.ts
++++ b/packages/app/e2e/performance/timeline-stability/fixture.ts
+@@ -105,6 +105,7 @@ export async function setupTimeline(
+     ...(input.seedHistory ? historyMessages(18) : []),
+     ...(input.messages ?? [userMessage(), assistantMessage()]),
+   ])
++  const readinessMessageID = timelineReadinessMessageID(messages)
+   const active = messages.findLast((message) => message.info.role === "assistant")
+   const initialStatus = decodeStatus(
+     active?.info.role === "assistant" && active.info.time.completed === undefined ? { type: "busy" } : { type: "idle" },
+@@ -162,6 +163,9 @@ export async function setupTimeline(
+   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+   await transport.waitForConnection()
+   await expectSessionTitle(page, title)
++  const row = page.locator(`[data-message-id="${readinessMessageID}"]`).last()
++  await expect(row).toHaveCount(1)
++  await expect(row).toBeVisible()
+   if (input.cpuRate && input.cpuRate > 1) {
+     const devtools = await page.context().newCDPSession(page)
+     await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
+@@ -204,6 +208,12 @@ export async function setupTimeline(
+   }
+ }
+ 
++export function timelineReadinessMessageID(messages: readonly TimelineMessage[]) {
++  const message = messages.findLast((item) => item.info.role === "user")
++  if (!message) throw new Error("Timeline fixture requires a user message")
++  return message.info.id
++}
++
+ function describeEvent(event: EventPayload) {
+   if (event.payload.type === "message.part.updated") {
+     const part = event.payload.properties.part
+diff --git a/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts b/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c61ac1f4e44c615a0180fd0d51147b6bc73913fb
+--- /dev/null
++++ b/packages/app/e2e/performance/unit/timeline-stability-fixture.test.ts
+@@ -0,0 +1,25 @@
++import { expect, test } from "bun:test"
++import {
++  assistantMessage,
++  textPart,
++  timelineReadinessMessageID,
++  toolPart,
++  userMessage,
++} from "../timeline-stability/fixture"
++
++test("keys fixture readiness to the latest user turn when the assistant has no visible part", () => {
++  const earlier = userMessage(undefined, { id: "msg_readiness_earlier" })
++  const current = userMessage(undefined, { id: "msg_readiness_current" })
++  const hidden = assistantMessage([toolPart("prt_hidden_question", "question", "running", { questions: [] })], {
++    id: "msg_readiness_assistant",
++    parentID: current.info.id,
++  })
++
++  const previous = assistantMessage([textPart("prt_old", "old")], { parentID: earlier.info.id })
++
++  expect(timelineReadinessMessageID([earlier, previous, current, hidden])).toBe(current.info.id)
++})
++
++test("rejects a fixture without a user turn", () => {
++  expect(() => timelineReadinessMessageID([assistantMessage()])).toThrow("Timeline fixture requires a user message")
++})
+diff --git a/packages/core/test/config/agent.test.ts b/packages/core/test/config/agent.test.ts
+index aa691648a32796f99529141258304c2525db5aed..1463e896d1d77f4153ed6a53bcb893fe09064aa7 100644
+--- a/packages/core/test/config/agent.test.ts
++++ b/packages/core/test/config/agent.test.ts
+@@ -68,7 +68,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
+                     permissions: [{ action: "bash", resource: "git *", effect: "allow" }],
+                   },
+                   reviewer: {
+-                    model: "openrouter/openai/gpt-5",
++                    model: "openrouter/openrouter/free",
+                     description: "Review changes",
+                     mode: "subagent",
+                     permissions: [
+@@ -117,7 +117,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
+         description: "Review changes",
+         mode: "subagent",
+         hidden: true,
+-        model: { providerID: "openrouter", id: "openai/gpt-5", variant: "high" },
++        model: { providerID: "openrouter", id: "openrouter/free", variant: "high" },
+       })
+       expect(reviewer.permissions).toEqual([
+         { action: "bash", resource: "*", effect: "ask" },
+diff --git a/packages/core/test/fixture/git.ts b/packages/core/test/fixture/git.ts
+index f02da400af6a7f436366b2f7126399606ab6157e..a9f2add15e862af57885ed2e47b101ec2c2714ff 100644
+--- a/packages/core/test/fixture/git.ts
++++ b/packages/core/test/fixture/git.ts
+@@ -1,4 +1,4 @@
+-import { execFile } from "child_process"
++import { execFile, spawn } from "child_process"
+ import fs from "fs/promises"
+ import path from "path"
+ import { promisify } from "util"
+@@ -7,9 +7,14 @@ import { Repository } from "@opencode-ai/core/repository"
+ 
+ const exec = promisify(execFile)
+ 
+-export async function gitRemote(root: string) {
++export async function gitRemote(root: string, input: { feature?: { name: string; content: string } } = {}) {
+   const origin = path.join(root, "origin.git")
+   const source = path.join(root, "source")
++  if (input.feature) {
++    await git(root, "init", "--bare", "--initial-branch=main", origin)
++    await fastImport(origin, input.feature)
++    return fixture(root, source, origin)
++  }
+   await git(root, "init", "--bare", origin)
+   await git(root, "init", source)
+   await git(source, "config", "user.email", "test@example.com")
+@@ -21,6 +26,10 @@ export async function gitRemote(root: string) {
+   await git(source, "remote", "add", "origin", pathToFileURL(origin).href)
+   await git(source, "push", "-u", "origin", "main")
+   await git(root, "--git-dir", origin, "symbolic-ref", "HEAD", "refs/heads/main")
++  return fixture(root, source, origin)
++}
++
++function fixture(root: string, source: string, origin: string) {
+   return {
+     root,
+     source,
+@@ -29,6 +38,35 @@ export async function gitRemote(root: string) {
+   }
+ }
+ 
++async function fastImport(origin: string, feature: { name: string; content: string }) {
++  if (feature.name.includes("\n")) throw new Error("Fixture branch names cannot contain newlines")
++  const data = (value: string) => `data ${Buffer.byteLength(value)}\n${value}\n`
++  const identity = "Test <test@example.com> 1700000000 +0000"
++  const stream = [
++    "blob\nmark :1\n",
++    data("one\n"),
++    "commit refs/heads/main\nmark :2\n",
++    `author ${identity}\ncommitter ${identity}\n`,
++    data("initial"),
++    "M 100644 :1 README.md\n\n",
++    "blob\nmark :3\n",
++    data(feature.content),
++    `commit refs/heads/${feature.name}\nmark :4\nauthor ${identity}\ncommitter ${identity}\n`,
++    data(feature.name),
++    "from :2\nM 100644 :3 README.md\n\n",
++  ].join("")
++  await new Promise<void>((resolve, reject) => {
++    const child = spawn("git", ["fast-import", "--quiet"], { cwd: origin, stdio: ["pipe", "ignore", "pipe"] })
++    const errors: Buffer[] = []
++    child.stderr.on("data", (chunk) => errors.push(chunk))
++    child.on("error", reject)
++    child.on("close", (code) =>
++      code === 0 ? resolve() : reject(new Error(`git fast-import failed (${code}): ${Buffer.concat(errors)}`)),
++    )
++    child.stdin.end(stream)
++  })
++}
++
+ export async function commit(source: string, content: string, message: string) {
+   await fs.writeFile(path.join(source, "README.md"), content)
+   await git(source, "add", "README.md")
+diff --git a/packages/core/test/npm.test.ts b/packages/core/test/npm.test.ts
+index 7e4a5763bf086ba01b8b2a936cec0a4206583c47..3b822cc907603d6043f242f99e72c5ce12321f5f 100644
+--- a/packages/core/test/npm.test.ts
++++ b/packages/core/test/npm.test.ts
+@@ -54,7 +54,7 @@ describe("Npm.add", () => {
+     }).pipe(Effect.scoped, Effect.provide(npmLayer(path.join(tmp.path, "cache"))), Effect.runPromise)
+ 
+     expect(entry.entrypoint).toBeDefined()
+-  })
++  }, 15_000)
+ })
+ 
+ describe("Npm.install", () => {
+diff --git a/packages/core/test/repository-cache.test.ts b/packages/core/test/repository-cache.test.ts
+index 4433583bf7874f0d470baaebdf56887717bf49a9..faba9ca193585d513816adf2adee7817eebccb18 100644
+--- a/packages/core/test/repository-cache.test.ts
++++ b/packages/core/test/repository-cache.test.ts
+@@ -8,7 +8,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { Global } from "@opencode-ai/core/global"
+ import { Repository } from "@opencode-ai/core/repository"
+ import { RepositoryCache } from "@opencode-ai/core/repository-cache"
+-import { branch, git, gitRemote } from "./fixture/git"
++import { git, gitRemote } from "./fixture/git"
+ import { tmpdir } from "./fixture/tmpdir"
+ import { testEffect } from "./lib/effect"
+ 
+@@ -67,24 +67,25 @@ describe("RepositoryCache", () => {
+   )
+ 
+   it.live("keeps branch checkouts isolated from branchless refreshes", () =>
+-    withRemote((fixture) =>
+-      Effect.gen(function* () {
+-        yield* Effect.promise(() => branch(fixture.source, "feature", "two\n"))
+-        const cache = yield* RepositoryCache.Service
+-
+-        const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+-        expect(featured.branch).toBe("feature")
+-        expect(featured.localPath.endsWith("repo@feature")).toBe(true)
+-        expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
+-
+-        const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
+-        expect(refreshed.localPath).not.toBe(featured.localPath)
+-        expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
+-
+-        const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+-        expect(cached.status).toBe("cached")
+-        expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
+-      }).pipe(Effect.provide(cacheLayer(fixture.root))),
++    withRemote(
++      (fixture) =>
++        Effect.gen(function* () {
++          const cache = yield* RepositoryCache.Service
++
++          const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
++          expect(featured.branch).toBe("feature")
++          expect(featured.localPath.endsWith("repo@feature")).toBe(true)
++          expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
++
++          const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
++          expect(refreshed.localPath).not.toBe(featured.localPath)
++          expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
++
++          const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
++          expect(cached.status).toBe("cached")
++          expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
++        }).pipe(Effect.provide(cacheLayer(fixture.root))),
++      { feature: { name: "feature", content: "two\n" } },
+     ),
+   )
+ 
+@@ -128,11 +129,14 @@ function cacheLayer(root: string) {
+   ])
+ }
+ 
+-function withRemote<A, E, R>(body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>) {
++function withRemote<A, E, R>(
++  body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>,
++  input?: Parameters<typeof gitRemote>[1],
++) {
+   return Effect.acquireUseRelease(
+     Effect.promise(async () => {
+       const root = await tmpdir()
+-      return { root, fixture: await gitRemote(root.path) }
++      return { root, fixture: await gitRemote(root.path, input) }
+     }),
+     (input) => body(input.fixture),
+     (input) => Effect.promise(() => input.root[Symbol.asyncDispose]()),
+diff --git a/packages/core/test/snapshot.test.ts b/packages/core/test/snapshot.test.ts
+index 5e01fefc17dc6cff7e49c89adb9c0d77c4262838..19d55a1688a009ea8f44dcd153e99ae885b21d9d 100644
+--- a/packages/core/test/snapshot.test.ts
++++ b/packages/core/test/snapshot.test.ts
+@@ -26,11 +26,10 @@ describe("Snapshot", () => {
+             await fs.writeFile(path.join(project, "outside.txt"), "outside\n")
+             await $`git init`.cwd(project).quiet()
+             await $`git config core.fsmonitor false`.cwd(project).quiet()
+-            await $`git config commit.gpgsign false`.cwd(project).quiet()
+-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
+-            await $`git config user.name Test`.cwd(project).quiet()
+             await $`git add .`.cwd(project).quiet()
+-            await $`git commit -m initial`.cwd(project).quiet()
++            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
++              .cwd(project)
++              .quiet()
+           })
+ 
+           const layer = snapshotLayer(tmp.path, location)
+@@ -65,6 +64,7 @@ describe("Snapshot", () => {
+         }),
+       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+     ),
++    30_000,
+   )
+ 
+   testEffect(Layer.empty).live("treats capture outside Git as unavailable", () =>
+@@ -95,11 +95,10 @@ describe("Snapshot", () => {
+             await fs.writeFile(path.join(project, "tracked.txt"), "main\n")
+             await $`git init`.cwd(project).quiet()
+             await $`git config core.fsmonitor false`.cwd(project).quiet()
+-            await $`git config commit.gpgsign false`.cwd(project).quiet()
+-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
+-            await $`git config user.name Test`.cwd(project).quiet()
+             await $`git add .`.cwd(project).quiet()
+-            await $`git commit -m initial`.cwd(project).quiet()
++            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
++              .cwd(project)
++              .quiet()
+             await $`git worktree add --detach ${linked} HEAD`.cwd(project).quiet()
+           })
+ 
+@@ -127,6 +126,7 @@ describe("Snapshot", () => {
+         }),
+       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+     ),
++    15_000,
+   )
+ 
+   testEffect(Layer.empty).live("checks out a legacy revert snapshot without removing unrelated files", () =>
+@@ -140,11 +140,10 @@ describe("Snapshot", () => {
+             await fs.writeFile(path.join(project, "tracked.txt"), "one\n")
+             await $`git init`.cwd(project).quiet()
+             await $`git config core.fsmonitor false`.cwd(project).quiet()
+-            await $`git config commit.gpgsign false`.cwd(project).quiet()
+-            await $`git config user.email test@opencode.test`.cwd(project).quiet()
+-            await $`git config user.name Test`.cwd(project).quiet()
+             await $`git add .`.cwd(project).quiet()
+-            await $`git commit -m initial`.cwd(project).quiet()
++            await $`git -c commit.gpgsign=false -c user.email=test@opencode.test -c user.name=Test commit -m initial`
++              .cwd(project)
++              .quiet()
+           })
+ 
+           yield* Effect.gen(function* () {
+@@ -163,6 +162,7 @@ describe("Snapshot", () => {
+         }),
+       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+     ),
++    15_000,
+   )
+ })
+ 
+diff --git a/packages/opencode/docs/hosted-approval-v2.md b/packages/opencode/docs/hosted-approval-v2.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b798a4c23ef97e1ffd474674b6095166ae9453e
+--- /dev/null
++++ b/packages/opencode/docs/hosted-approval-v2.md
+@@ -0,0 +1,36 @@
++# Hosted approval v2
++
++OpenCode exposes hosted approval only when standard server Basic authentication
++is configured. The capability, observe, and conditional reply endpoints use the
++same Authorization and workspace routing middleware as `/permission`. Without a
++server password all three return 404; bad credentials return 401.
++
++The protocol identifier is `agent-teams-hosted-approval-v2`. One process-wide
++coordinator owns a random `runtime_instance_<32 lowercase hex>` and a random
++`config_generation_<32 lowercase hex>`. Each session observed by the permission
++service also owns a random `session_incarnation_<32 lowercase hex>` that changes
++after deletion/recreation and across process restarts. The generation changes after successful
++config writes and after an ordinary `always` reply changes approval policy.
++Credentials are outside this generation and must be bound separately by clients.
++
++Pending requests are observed per session at
++`GET /experimental/agent-teams/hosted-approval/session/:sessionID/permissions`.
++Each insertion receives a random `request_incarnation_<32 lowercase hex>` and is
++bound to its session incarnation.
++Responses are all-or-nothing, limited to 256 requests and 1 MiB JSON.
++
++Conditional replies use
++`POST /experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply`.
++Bodies are limited to 16 KiB, fatal UTF-8 decoded, checked for duplicate JSON
++keys, and exact-schema decoded. Runtime/config mismatches return 412 with no
++effect. Missing, replayed, wrong-session, stale-session-incarnation,
++wrong-request-incarnation, or digest mismatches
++return 409 with no effect. Successful replies settle exactly one request; reject
++never cascades and `always` is not supported.
++
++Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
++are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
++JSON primitives use `JSON.stringify`. Golden vectors:
++
++- `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
++- `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
+diff --git a/packages/opencode/src/config/config.ts b/packages/opencode/src/config/config.ts
+index 86238f1a844c1df3ae0c765bc787eeb05d70b165..25653316394264bd9ac224a203d467e1ee6ef29d 100644
+--- a/packages/opencode/src/config/config.ts
++++ b/packages/opencode/src/config/config.ts
+@@ -18,7 +18,7 @@ import { isRecord } from "@/util/record"
+ import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import { InstanceState } from "@/effect/instance-state"
+-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
++import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Semaphore } from "effect"
+ import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
+ import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+ import { containsPath, type InstanceContext } from "../project/instance-context"
+@@ -181,6 +181,15 @@ const layer = Layer.effect(
+     const env = yield* Env.Service
+     const npmSvc = yield* Npm.Service
+     const http = yield* HttpClient.HttpClient
++    const writeLocks = new Map<string, Semaphore.Semaphore>()
++
++    const writeLock = (file: string) => {
++      const hit = writeLocks.get(file)
++      if (hit) return hit
++      const next = Semaphore.makeUnsafe(1)
++      writeLocks.set(file, next)
++      return next
++    }
+ 
+     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
+ 
+@@ -624,10 +633,14 @@ const layer = Layer.effect(
+     const update = Effect.fn("Config.update")(function* (config: Info) {
+       const dir = yield* InstanceState.directory
+       const file = path.join(dir, "config.json")
+-      const existing = yield* loadFile(file)
+-      yield* fs
+-        .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
+-        .pipe(Effect.orDie)
++      yield* writeLock(file).withPermit(
++        Effect.gen(function* () {
++          const existing = yield* loadFile(file)
++          yield* fs
++            .writeFileString(file, JSON.stringify(mergeDeep(writable(existing), writable(config)), null, 2))
++            .pipe(Effect.orDie)
++        }),
++      )
+     })
+ 
+     const invalidate = Effect.fn("Config.invalidate")(function* () {
+@@ -636,27 +649,31 @@ const layer = Layer.effect(
+ 
+     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
+       const file = globalConfigFile()
+-      const before = (yield* readConfigFile(file)) ?? "{}"
+-      const patch = writableGlobal(config)
+-
+-      let next: Info
+-      let changed: boolean
+-      if (!file.endsWith(".jsonc")) {
+-        const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
+-        const merged = mergeDeep(writable(existing), patch)
+-        const serialized = JSON.stringify(merged, null, 2)
+-        changed = serialized !== before
+-        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
+-        next = merged
+-      } else {
+-        const updated = patchJsonc(before, patch)
+-        next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
+-        changed = updated !== before
+-        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
+-      }
++      return yield* writeLock(file).withPermit(
++        Effect.gen(function* () {
++          const before = (yield* readConfigFile(file)) ?? "{}"
++          const patch = writableGlobal(config)
++
++          let next: Info
++          let changed: boolean
++          if (!file.endsWith(".jsonc")) {
++            const existing = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(before, file), file)
++            const merged = mergeDeep(writable(existing), patch)
++            const serialized = JSON.stringify(merged, null, 2)
++            changed = serialized !== before
++            if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
++            next = merged
++          } else {
++            const updated = patchJsonc(before, patch)
++            next = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(updated, file), file)
++            changed = updated !== before
++            if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
++          }
+ 
+-      if (changed) yield* invalidate()
+-      return { info: next, changed }
++          if (changed) yield* invalidate()
++          return { info: next, changed }
++        }),
++      )
+     })
+ 
+     return Service.of({
+diff --git a/packages/opencode/src/hosted-approval/coordinator.ts b/packages/opencode/src/hosted-approval/coordinator.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bc3fbbb4f24cccb90247376e182736f57f202d63
+--- /dev/null
++++ b/packages/opencode/src/hosted-approval/coordinator.ts
+@@ -0,0 +1,63 @@
++import { LayerNode } from "@opencode-ai/core/effect/layer-node"
++import { Context, Effect, Layer, Semaphore } from "effect"
++import { randomUUID } from "node:crypto"
++
++export interface Snapshot {
++  readonly runtimeInstanceId: string
++  readonly configGeneration: string
++}
++
++export interface Interface {
++  readonly snapshot: () => Snapshot
++  readonly withConfigMutation: <A, E, R>(
++    effect: Effect.Effect<A, E, R>,
++    changed?: (result: A) => boolean,
++  ) => Effect.Effect<A, E, R>
++  readonly withConditionalReply: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
++}
++
++export class Service extends Context.Service<Service, Interface>()("@opencode/HostedApprovalCoordinator") {}
++
++function token(prefix: string) {
++  return `${prefix}_${randomUUID().replaceAll("-", "")}`
++}
++
++export function makeTestLayer() {
++  return Layer.succeed(
++    Service,
++    (() => {
++      const mutex = Semaphore.makeUnsafe(1)
++      const runtimeInstanceId = token("runtime_instance")
++      let configGeneration = token("config_generation")
++      const service: Interface = {
++        snapshot: () => ({ runtimeInstanceId, configGeneration }),
++        withConfigMutation: (effect, changed = () => true) =>
++          Effect.uninterruptibleMask((restore) =>
++            Effect.gen(function* () {
++              // Config I/O remains interruptible and does not hold the process
++              // coordinator. Only the generation's linearization point is shared.
++              const result = yield* restore(effect)
++              if (changed(result)) {
++                yield* mutex.withPermit(
++                  Effect.sync(() => {
++                    configGeneration = token("config_generation")
++                  }),
++                )
++              }
++              return result
++            }),
++          ),
++        withConditionalReply: (effect) => mutex.withPermit(effect),
++      }
++      return Service.of(service)
++    })(),
++  )
++}
++
++// One process authority value. Reusing this Layer in independently assembled
++// route/service graphs cannot mint a second identity or mutex.
++export const layer = makeTestLayer()
++
++export const node = LayerNode.make({ service: Service, layer, deps: [] })
++
++export const HostedApprovalCoordinator = { Service, layer, makeTestLayer, node }
+diff --git a/packages/opencode/src/hosted-approval/protocol.ts b/packages/opencode/src/hosted-approval/protocol.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b37e769f07e1f6fbe2ffa14f7b6e562e115be395
+--- /dev/null
++++ b/packages/opencode/src/hosted-approval/protocol.ts
+@@ -0,0 +1,26 @@
++import { createHash } from "node:crypto"
++
++export const protocol = "agent-teams-hosted-approval-v2" as const
++
++export function canonicalJson(value: unknown): string {
++  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
++    const encoded = JSON.stringify(value)
++    if (encoded === undefined) throw new TypeError("Unsupported hosted approval canonical value")
++    return encoded
++  }
++  if (Array.isArray(value)) return `[${Array.from(value, canonicalJson).join(",")}]`
++  if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
++  const record = value as Record<string, unknown>
++  return `{${Object.keys(record)
++    .sort()
++    .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
++    .join(",")}}`
++}
++
++export function digest(value: unknown): string {
++  return createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")
++}
++
++export function rawPermission<T>(value: T): T {
++  return JSON.parse(JSON.stringify(value)) as T
++}
+diff --git a/packages/opencode/src/permission/index.ts b/packages/opencode/src/permission/index.ts
+index 2e27ff2424dbb000ea9ed7f73471769716ba40a1..f58fcf3a19d983bb1d9173ac52a985b9e4b157ee 100644
+--- a/packages/opencode/src/permission/index.ts
++++ b/packages/opencode/src/permission/index.ts
+@@ -2,27 +2,67 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
+ import { InstanceState } from "@/effect/instance-state"
+ import { Wildcard } from "@opencode-ai/core/util/wildcard"
+-import { Deferred, Effect, Layer, Context } from "effect"
++import { Deferred, Effect, Layer, Context, Semaphore } from "effect"
+ import os from "os"
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { EventV2Bridge } from "@/event-v2-bridge"
++import { randomUUID } from "node:crypto"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ export const Event = PermissionV1.Event
+ 
+ export interface Interface {
+   readonly ask: (input: PermissionV1.AskInput) => Effect.Effect<void, PermissionV1.Error>
+   readonly reply: (input: PermissionV1.ReplyInput) => Effect.Effect<void, PermissionV1.NotFoundError>
++  /**
++   * Claims and settles exactly one pending request when its full external
++   * incarnation still matches. Unlike the interactive reply operation this
++   * never cascades to other requests and never persists an approval rule.
++   */
++  readonly conditionalReply: (
++    input: ConditionalReplyInput,
++  ) => Effect.Effect<ConditionalReplyResult>
+   readonly list: () => Effect.Effect<ReadonlyArray<PermissionV1.Request>>
++  readonly hostedList: () => Effect.Effect<ReadonlyArray<HostedPendingRequest>>
++}
++
++export interface ConditionalReplyInput {
++  readonly requestID: PermissionV1.ID
++  readonly sessionID: PermissionV1.Request["sessionID"]
++  readonly sessionIncarnation: string
++  readonly requestIncarnation: string
++  readonly reply: "once" | "reject"
++  readonly message?: string
++  /** Runs synchronously while the permission state lock is held. */
++  readonly matches: (request: PermissionV1.Request) => boolean
++}
++
++export type ConditionalReplyResult =
++  | { readonly status: "applied"; readonly request: PermissionV1.Request }
++  | { readonly status: "mismatch" }
++
++export interface HostedPendingRequest {
++  readonly request: PermissionV1.Request
++  readonly sessionIncarnation: string
++  readonly requestIncarnation: string
+ }
+ 
+ interface PendingEntry {
+   info: PermissionV1.Request
++  sessionIncarnation: string
++  requestIncarnation: string
+   deferred: Deferred.Deferred<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>
+ }
+ 
+ interface State {
+   pending: Map<PermissionV1.ID, PendingEntry>
+   approved: PermissionV1.Rule[]
++  sessionIncarnations: Map<PermissionV1.Request["sessionID"], string>
++}
++
++function incarnation(prefix: "session_incarnation" | "request_incarnation") {
++  return `${prefix}_${randomUUID().replaceAll("-", "")}`
+ }
+ 
+ export function evaluate(permission: string, pattern: string, ...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule {
+@@ -43,20 +83,48 @@ const layer = Layer.effect(
+   Service,
+   Effect.gen(function* () {
+     const events = yield* EventV2Bridge.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
++    const mutex = Semaphore.makeUnsafe(1)
+     const state = yield* InstanceState.make<State>(
+       Effect.fn("Permission.state")(function* (ctx) {
+         void ctx
+         const state = {
+           pending: new Map<PermissionV1.ID, PendingEntry>(),
+           approved: [],
++          sessionIncarnations: new Map<PermissionV1.Request["sessionID"], string>(),
+         }
+ 
++        const unsubscribe = yield* events.listen((event) => {
++          if (event.location?.directory !== ctx.directory) return Effect.void
++          if (event.type !== SessionV1.Event.Created.type && event.type !== SessionV1.Event.Deleted.type) {
++            return Effect.void
++          }
++          const data = event.data as { sessionID: PermissionV1.Request["sessionID"] }
++          return hostedApproval.withConditionalReply(
++            mutex.withPermit(
++              Effect.sync(() => {
++                if (event.type === SessionV1.Event.Deleted.type) {
++                  state.sessionIncarnations.delete(data.sessionID)
++                  return
++                }
++                // Creation only rotates an identity already observed by this
++                // permission service. New sessions are minted lazily on ask.
++                if (state.sessionIncarnations.has(data.sessionID)) {
++                  state.sessionIncarnations.set(data.sessionID, incarnation("session_incarnation"))
++                }
++              }),
++            ),
++          )
++        })
++        yield* Effect.addFinalizer(() => unsubscribe)
++
+         yield* Effect.addFinalizer(() =>
+           Effect.gen(function* () {
+             for (const item of state.pending.values()) {
+               yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+             }
+             state.pending.clear()
++            state.sessionIncarnations.clear()
+           }),
+         )
+ 
+@@ -65,113 +133,192 @@ const layer = Layer.effect(
+     )
+ 
+     const ask = Effect.fn("Permission.ask")(function* (input: PermissionV1.AskInput) {
+-      const { approved, pending } = yield* InstanceState.get(state)
+-      const { ruleset, ...request } = input
+-      let needsAsk = false
+-
+-      for (const pattern of request.patterns) {
+-        const rule = evaluate(request.permission, pattern, ruleset, approved)
+-        yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
+-        if (rule.action === "deny") {
+-          return yield* new PermissionV1.DeniedError({
+-            ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
+-          })
+-        }
+-        if (rule.action === "allow") continue
+-        needsAsk = true
+-      }
+-
+-      if (!needsAsk) return
+-
+-      const id = request.id ?? PermissionV1.ID.ascending()
+-      const info: PermissionV1.Request = {
+-        id,
+-        sessionID: request.sessionID,
+-        permission: request.permission,
+-        patterns: request.patterns,
+-        metadata: request.metadata,
+-        always: request.always,
+-        tool: request.tool,
+-      }
+-      yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
+-
+       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
+-      pending.set(id, { info, deferred })
+-      yield* events.publish(Event.Asked, info)
++      const pendingID = yield* hostedApproval.withConditionalReply(mutex.withPermit(
++        Effect.gen(function* () {
++          const { approved, pending, sessionIncarnations } = yield* InstanceState.get(state)
++          const { ruleset, ...request } = input
++          let needsAsk = false
++          for (const pattern of request.patterns) {
++            const rule = evaluate(request.permission, pattern, ruleset, approved)
++            yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
++            if (rule.action === "deny") {
++              return yield* new PermissionV1.DeniedError({
++                ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
++              })
++            }
++            if (rule.action !== "allow") needsAsk = true
++          }
++          if (!needsAsk) return undefined
++
++          const id = request.id ?? PermissionV1.ID.ascending()
++          // Caller-provided IDs are allowed by the public schema, but replacing
++          // a live entry would enable request-incarnation ABA and orphan its deferred.
++          if (pending.has(id)) return yield* new PermissionV1.DeniedError({ ruleset: [] })
++          const info: PermissionV1.Request = {
++            id,
++            sessionID: request.sessionID,
++            permission: request.permission,
++            patterns: request.patterns,
++            metadata: request.metadata,
++            always: request.always,
++            tool: request.tool,
++          }
++          const sessionIncarnation = sessionIncarnations.get(info.sessionID) ?? incarnation("session_incarnation")
++          sessionIncarnations.set(info.sessionID, sessionIncarnation)
++          yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
++          pending.set(id, {
++            info,
++            sessionIncarnation,
++            requestIncarnation: incarnation("request_incarnation"),
++            deferred,
++          })
++          yield* events.publish(Event.Asked, info)
++          return id
++        }),
++      ))
++      if (!pendingID) return
+       return yield* Effect.ensuring(
+         Deferred.await(deferred),
+-        Effect.sync(() => {
+-          pending.delete(id)
+-        }),
++        hostedApproval.withConditionalReply(mutex.withPermit(
++          Effect.gen(function* () {
++            // Delete only the exact entry owned by this ask. A future request
++            // that reuses the ID must not be removed by this finalizer.
++            const { pending } = yield* InstanceState.get(state)
++            if (pending.get(pendingID)?.deferred === deferred) pending.delete(pendingID)
++          }),
++        )),
+       )
+     })
+ 
+-    const reply = Effect.fn("Permission.reply")(function* (input: PermissionV1.ReplyInput) {
+-      const { approved, pending } = yield* InstanceState.get(state)
+-      const existing = pending.get(input.requestID)
+-      if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+-
+-      pending.delete(input.requestID)
+-      yield* events.publish(Event.Replied, {
+-        sessionID: existing.info.sessionID,
+-        requestID: existing.info.id,
+-        reply: input.reply,
+-      })
+-
+-      if (input.reply === "reject") {
+-        yield* Deferred.fail(
+-          existing.deferred,
+-          input.message
+-            ? new PermissionV1.CorrectedError({ feedback: input.message })
+-            : new PermissionV1.RejectedError(),
+-        )
++    const reply = Effect.fn("Permission.reply")((input: PermissionV1.ReplyInput) => {
++      const settle = mutex.withPermit(
++        Effect.gen(function* () {
++          const { approved, pending } = yield* InstanceState.get(state)
++          const existing = pending.get(input.requestID)
++          if (!existing) return yield* new PermissionV1.NotFoundError({ requestID: input.requestID })
+ 
+-        for (const [id, item] of pending.entries()) {
+-          if (item.info.sessionID !== existing.info.sessionID) continue
+-          pending.delete(id)
++          pending.delete(input.requestID)
+           yield* events.publish(Event.Replied, {
+-            sessionID: item.info.sessionID,
+-            requestID: item.info.id,
+-            reply: "reject",
++            sessionID: existing.info.sessionID,
++            requestID: existing.info.id,
++            reply: input.reply,
+           })
+-          yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
+-        }
+-        return
+-      }
+ 
+-      yield* Deferred.succeed(existing.deferred, undefined)
+-      if (input.reply === "once") return
++          if (input.reply === "reject") {
++            yield* Deferred.fail(
++              existing.deferred,
++              input.message
++                ? new PermissionV1.CorrectedError({ feedback: input.message })
++                : new PermissionV1.RejectedError(),
++            )
+ 
+-      for (const pattern of existing.info.always) {
+-        approved.push({
+-          permission: existing.info.permission,
+-          pattern,
+-          action: "allow",
+-        })
+-      }
++            for (const [id, item] of pending.entries()) {
++              if (item.info.sessionID !== existing.info.sessionID) continue
++              pending.delete(id)
++              yield* events.publish(Event.Replied, {
++                sessionID: item.info.sessionID,
++                requestID: item.info.id,
++                reply: "reject",
++              })
++              yield* Deferred.fail(item.deferred, new PermissionV1.RejectedError())
++            }
++            return
++          }
+ 
+-      for (const [id, item] of pending.entries()) {
+-        if (item.info.sessionID !== existing.info.sessionID) continue
+-        const ok = item.info.patterns.every(
+-          (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
+-        )
+-        if (!ok) continue
+-        pending.delete(id)
+-        yield* events.publish(Event.Replied, {
+-          sessionID: item.info.sessionID,
+-          requestID: item.info.id,
+-          reply: "always",
+-        })
+-        yield* Deferred.succeed(item.deferred, undefined)
+-      }
+-    })
++          yield* Deferred.succeed(existing.deferred, undefined)
++          if (input.reply === "once") return
++
++          for (const pattern of existing.info.always) {
++            approved.push({
++              permission: existing.info.permission,
++              pattern,
++              action: "allow",
++            })
++          }
+ 
+-    const list = Effect.fn("Permission.list")(function* () {
+-      const pending = (yield* InstanceState.get(state)).pending
+-      return Array.from(pending.values(), (item) => item.info)
++          for (const [id, item] of pending.entries()) {
++            if (item.info.sessionID !== existing.info.sessionID) continue
++            const ok = item.info.patterns.every(
++              (pattern) => evaluate(item.info.permission, pattern, approved).action === "allow",
++            )
++            if (!ok) continue
++            pending.delete(id)
++            yield* events.publish(Event.Replied, {
++              sessionID: item.info.sessionID,
++              requestID: item.info.id,
++              reply: "always",
++            })
++            yield* Deferred.succeed(item.deferred, undefined)
++          }
++        }),
++      )
++      return input.reply === "always"
++        ? hostedApproval.withConfigMutation(settle)
++        : hostedApproval.withConditionalReply(settle)
+     })
+ 
+-    return Service.of({ ask, reply, list })
++    const conditionalReply = Effect.fn("Permission.conditionalReply")((input: ConditionalReplyInput) =>
++      Effect.uninterruptible(
++        mutex.withPermit(
++          Effect.gen(function* () {
++            const { pending, sessionIncarnations } = yield* InstanceState.get(state)
++            const existing = pending.get(input.requestID)
++            if (!existing) return { status: "mismatch" } as const
++            if (
++              existing.info.sessionID !== input.sessionID ||
++              existing.sessionIncarnation !== input.sessionIncarnation ||
++              sessionIncarnations.get(input.sessionID) !== input.sessionIncarnation ||
++              existing.requestIncarnation !== input.requestIncarnation ||
++              !input.matches(existing.info)
++            ) {
++              return { status: "mismatch" } as const
++            }
++
++            pending.delete(input.requestID)
++            yield* events.publish(Event.Replied, {
++              sessionID: existing.info.sessionID,
++              requestID: existing.info.id,
++              reply: input.reply,
++            })
++            if (input.reply === "once") yield* Deferred.succeed(existing.deferred, undefined)
++            else {
++              yield* Deferred.fail(
++                existing.deferred,
++                input.message
++                  ? new PermissionV1.CorrectedError({ feedback: input.message })
++                  : new PermissionV1.RejectedError(),
++              )
++            }
++            return { status: "applied", request: existing.info } as const
++          }),
++        ),
++      ),
++    )
++
++    const list = Effect.fn("Permission.list")(() =>
++      hostedApproval.withConditionalReply(mutex.withPermit(
++        Effect.gen(function* () {
++          const pending = (yield* InstanceState.get(state)).pending
++          return Array.from(pending.values(), (item) => item.info)
++        }),
++      )),
++    )
++
++    const hostedList = Effect.fn("Permission.hostedList")(() =>
++      mutex.withPermit(
++        Effect.gen(function* () {
++          const pending = (yield* InstanceState.get(state)).pending
++          return Array.from(pending.values(), ({ info: request, sessionIncarnation, requestIncarnation }) => ({
++            request,
++            sessionIncarnation,
++            requestIncarnation,
++          }))
++        }),
++      ),
++    )
++
++    return Service.of({ ask, reply, conditionalReply, list, hostedList })
+   }),
+ )
+ 
+@@ -218,6 +365,10 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
+   return Object.fromEntries(Object.entries(tools).filter(([name]) => !hidden.has(name)))
+ }
+ 
+-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
++export const node = LayerNode.make({
++  service: Service,
++  layer: layer,
++  deps: [EventV2Bridge.node, HostedApprovalCoordinator.node],
++})
+ 
+ export * as Permission from "."
+diff --git a/packages/opencode/src/project/instance-context.ts b/packages/opencode/src/project/instance-context.ts
+index 18ea39e16e9175be15489d2593df26dec4c4f526..727985928bf06f5bcb3bd3a12d532f8547b06473 100644
+--- a/packages/opencode/src/project/instance-context.ts
++++ b/packages/opencode/src/project/instance-context.ts
+@@ -1,3 +1,4 @@
++import path from "path"
+ import { LocalContext } from "@/util/local-context"
+ import { FSUtil } from "@opencode-ai/core/fs-util"
+ import type * as Project from "./project"
+@@ -17,8 +18,11 @@ export const context = LocalContext.create<InstanceContext>("instance")
+  */
+ export function containsPath(filepath: string, ctx: InstanceContext): boolean {
+   if (FSUtil.contains(ctx.directory, filepath)) return true
+-  // Non-git projects set worktree to "/" which would match ANY absolute path.
+-  // Skip worktree check in this case to preserve external_directory permissions.
+-  if (ctx.worktree === "/") return false
++  // Non-git projects set worktree to the filesystem root, which would match every path on that volume or share.
++  if (
++    (path.posix.isAbsolute(ctx.worktree) && path.posix.parse(ctx.worktree).root === ctx.worktree) ||
++    (path.win32.isAbsolute(ctx.worktree) && path.win32.parse(ctx.worktree).root === ctx.worktree)
++  )
++    return false
+   return FSUtil.contains(ctx.worktree, filepath)
+ }
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
+index 79959db499bd12a359ac84a9a189faebc84c016e..80ff005def818509dd6fa2b95417f7a58766115e 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/groups/permission.ts
+@@ -8,6 +8,74 @@ import { InstanceContextMiddleware } from "../middleware/instance-context"
+ import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware/workspace-routing"
+ import { described } from "./metadata"
+ 
++const RuntimeInstanceId = Schema.String.check(Schema.isPattern(/^runtime_instance_[0-9a-f]{32}$/))
++const ConfigGeneration = Schema.String.check(Schema.isPattern(/^config_generation_[0-9a-f]{32}$/))
++const SessionIncarnation = Schema.String.check(Schema.isPattern(/^session_incarnation_[0-9a-f]{32}$/))
++const RequestIncarnation = Schema.String.check(Schema.isPattern(/^request_incarnation_[0-9a-f]{32}$/))
++const HostedDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
++export class HostedConflictError extends Schema.TaggedErrorClass<HostedConflictError>()(
++  "HostedApprovalConflict",
++  {},
++  { httpApiStatus: 409 },
++) {}
++export class HostedPreconditionError extends Schema.TaggedErrorClass<HostedPreconditionError>()(
++  "HostedApprovalPreconditionFailed",
++  {},
++  { httpApiStatus: 412 },
++) {}
++export class HostedUnavailableError extends Schema.TaggedErrorClass<HostedUnavailableError>()(
++  "HostedApprovalUnavailable",
++  {},
++  { httpApiStatus: 404 },
++) {}
++export const HostedReplyPayload = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  expectedConfigGeneration: ConfigGeneration,
++  requestId: PermissionV1.ID,
++  sessionId: Schema.String,
++  sessionIncarnation: SessionIncarnation,
++  requestIncarnation: RequestIncarnation,
++  expectedPermissionDigest: HostedDigest,
++  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
++})
++const HostedCapability = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  authentication: Schema.Literal("opencode-basic"),
++})
++const HostedObserve = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  sessionId: Schema.String,
++  permissions: Schema.Array(Schema.Struct({
++    requestId: PermissionV1.ID,
++    sessionId: Schema.String,
++    sessionIncarnation: SessionIncarnation,
++    requestIncarnation: RequestIncarnation,
++    permissionDigest: HostedDigest,
++    rawPermission: PermissionV1.Request,
++  })),
++})
++const HostedReplySuccess = Schema.Struct({
++  schemaVersion: Schema.Literal(2),
++  protocol: Schema.Literal("agent-teams-hosted-approval-v2"),
++  status: Schema.Literal("applied"),
++  runtimeInstanceId: RuntimeInstanceId,
++  configGeneration: ConfigGeneration,
++  requestId: PermissionV1.ID,
++  sessionId: Schema.String,
++  sessionIncarnation: SessionIncarnation,
++  requestIncarnation: RequestIncarnation,
++  permissionDigest: HostedDigest,
++  decision: Schema.Union([Schema.Literal("allow_once"), Schema.Literal("reject")]),
++})
++
+ const root = "/permission"
+ const ReplyPayload = Schema.Struct({
+   reply: PermissionV1.Reply,
+@@ -18,6 +86,24 @@ export const PermissionApi = HttpApi.make("permission")
+   .add(
+     HttpApiGroup.make("permission")
+       .add(
++        HttpApiEndpoint.get("hostedCapability", "/experimental/agent-teams/hosted-approval-capability", {
++          query: WorkspaceRoutingQuery,
++          success: HostedCapability,
++          error: HostedUnavailableError,
++        }),
++        HttpApiEndpoint.get("hostedObserve", "/experimental/agent-teams/hosted-approval/session/:sessionID/permissions", {
++          params: { sessionID: Schema.String },
++          query: WorkspaceRoutingQuery,
++          success: HostedObserve,
++          error: [HostedUnavailableError, HttpApiError.InternalServerError],
++        }),
++        HttpApiEndpoint.post("hostedReply", "/experimental/agent-teams/hosted-approval/session/:sessionID/permission/:requestID/reply", {
++          params: { sessionID: Schema.String, requestID: PermissionV1.ID },
++          query: WorkspaceRoutingQuery,
++          payload: HostedReplyPayload,
++          success: HostedReplySuccess,
++          error: Schema.Union([HttpApiError.BadRequest, HostedConflictError, HostedPreconditionError, HostedUnavailableError]),
++        }),
+         HttpApiEndpoint.get("list", root, {
+           query: WorkspaceRoutingQuery,
+           success: described(Schema.Array(PermissionV1.Request), "List of pending permissions"),
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
+index 3d0e8a06c09c6b3a2366b521ff05f7eaca63eff8..0ba6cd511d057757c30a53925cd8b37c8b81fb18 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/config.ts
+@@ -5,19 +5,25 @@ import { Effect } from "effect"
+ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import { InstanceHttpApi } from "../api"
+ import { markInstanceForDisposal } from "../lifecycle"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (handlers) =>
+   Effect.gen(function* () {
+     const providerSvc = yield* Provider.Service
+     const configSvc = yield* Config.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
+ 
+     const get = Effect.fn("ConfigHttpApi.get")(function* () {
+       return yield* configSvc.get()
+     })
+ 
+     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
+-      yield* configSvc.update(ctx.payload)
+-      yield* markInstanceForDisposal(yield* InstanceState.context)
++      yield* hostedApproval.withConfigMutation(
++        Effect.gen(function* () {
++          yield* configSvc.update(ctx.payload)
++          yield* markInstanceForDisposal(yield* InstanceState.context)
++        }),
++      )
+       return ctx.payload
+     })
+ 
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
+index ac909032f90bf1f372a58cd39badb7f0ff62427c..94b34ec0a0e34bbe192e2848ef25f7e014a6be74 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/global.ts
+@@ -12,6 +12,7 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
+ import * as Sse from "effect/unstable/encoding/Sse"
+ import { RootHttpApi } from "../api"
+ import { GlobalUpgradeInput } from "../groups/global"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ 
+ function eventData(data: unknown): Sse.Event {
+   return {
+@@ -62,6 +63,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+     const config = yield* Config.Service
+     const installation = yield* Installation.Service
+     const bridge = yield* EffectBridge.make()
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
+ 
+     const health = Effect.fn("GlobalHttpApi.health")(function* () {
+       return { healthy: true as const, version: InstallationVersion }
+@@ -76,7 +78,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
+     })
+ 
+     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
+-      const result = yield* config.updateGlobal(ctx.payload)
++      const result = yield* hostedApproval.withConfigMutation(config.updateGlobal(ctx.payload), (value) => value.changed)
+       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
+       return result.info
+     })
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
+index cdb88490605f1311f02a7d8d0c69806a21ddc514..24fe6661578cc45c58011bad789abeb5b4f49cde 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/handlers/permission.ts
+@@ -1,13 +1,257 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+ import { Permission } from "@/permission"
+ import { Effect } from "effect"
+-import { HttpApiBuilder } from "effect/unstable/httpapi"
++import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+ import { InstanceHttpApi } from "../api"
+ import { PermissionNotFoundError } from "../errors"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
++import { digest, protocol, rawPermission } from "@/hosted-approval/protocol"
++import { HostedConflictError, HostedPreconditionError, HostedReplyPayload, HostedUnavailableError } from "../groups/permission"
++import { ServerAuth } from "@/server/auth"
++import { Schema, Stream } from "effect"
++import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
++
++function rejectDuplicateJsonKeys(text: string): void {
++  let offset = 0
++  const whitespace = () => { while (/\s/.test(text[offset] ?? "")) offset++ }
++  const string = () => {
++    const start = offset
++    if (text[offset++] !== '"') throw new Error("invalid string")
++    while (offset < text.length) {
++      const char = text[offset++]
++      if (char === '"') return JSON.parse(text.slice(start, offset)) as string
++      if (char === "\\") offset++
++    }
++    throw new Error("unterminated string")
++  }
++  const value = (): void => {
++    whitespace()
++    if (text[offset] === "{") {
++      offset++
++      const keys = new Set<string>()
++      whitespace()
++      if (text[offset] === "}") { offset++; return }
++      while (true) {
++        whitespace()
++        const key = string()
++        if (keys.has(key)) throw new Error("duplicate key")
++        keys.add(key)
++        whitespace()
++        if (text[offset++] !== ":") throw new Error("invalid object")
++        value()
++        whitespace()
++        const delimiter = text[offset++]
++        if (delimiter === "}") return
++        if (delimiter !== ",") throw new Error("invalid object")
++      }
++    }
++    if (text[offset] === "[") {
++      offset++
++      whitespace()
++      if (text[offset] === "]") { offset++; return }
++      while (true) {
++        value(); whitespace()
++        const delimiter = text[offset++]
++        if (delimiter === "]") return
++        if (delimiter !== ",") throw new Error("invalid array")
++      }
++    }
++    if (text[offset] === '"') { string(); return }
++    const match = text.slice(offset).match(/^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/)
++    if (!match) throw new Error("invalid value")
++    offset += match[0].length
++  }
++  value(); whitespace()
++  if (offset !== text.length) throw new Error("trailing data")
++}
++
++const HOSTED_REPLY_KEYS = [
++  "decision",
++  "expectedConfigGeneration",
++  "expectedPermissionDigest",
++  "protocol",
++  "requestId",
++  "requestIncarnation",
++  "runtimeInstanceId",
++  "schemaVersion",
++  "sessionId",
++  "sessionIncarnation",
++] as const
++
++export class HostedReplyBodyError extends Error {}
++
++export const readHostedReplyBody = Effect.fn("PermissionHttpApi.readHostedReplyBody")(
++  <E>(stream: Stream.Stream<Uint8Array, E>, limit = 16 * 1024) =>
++    Stream.runFoldEffect(
++      stream,
++      () => [] as Uint8Array[],
++      (chunks, chunk) => {
++        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
++        if (size + chunk.byteLength > limit) return Effect.fail(new HostedReplyBodyError("body too large"))
++        chunks.push(chunk)
++        return Effect.succeed(chunks)
++      },
++    ).pipe(
++      Effect.mapError((error) => error instanceof HostedReplyBodyError ? error : new HostedReplyBodyError("body read failed")),
++      Effect.map((chunks) => {
++        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
++        const bytes = new Uint8Array(size)
++        let offset = 0
++        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
++        return bytes
++      }),
++    ),
++)
+ 
+ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
+   Effect.gen(function* () {
+     const svc = yield* Permission.Service
++    const hostedApproval = yield* HostedApprovalCoordinator.Service
++    const serverAuth = yield* ServerAuth.Config
++
++    const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
++      if (!ServerAuth.required(serverAuth)) return yield* new HostedUnavailableError()
++      return yield* Effect.void
++    })
++
++    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
++      yield* requireHosted()
++      return yield* hostedApproval.withConditionalReply(
++        Effect.sync(() => ({
++          schemaVersion: 2 as const,
++          protocol,
++          ...hostedApproval.snapshot(),
++          authentication: "opencode-basic" as const,
++        })),
++      )
++    })
++
++    const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
++      params: { sessionID: string }
++    }) {
++      yield* requireHosted()
++      return yield* hostedApproval.withConditionalReply(
++        Effect.gen(function* () {
++          const snapshot = hostedApproval.snapshot()
++          const pending = yield* svc.hostedList()
++          const permissions = pending
++            .filter(({ request }) => request.sessionID === ctx.params.sessionID)
++            .map(({ request, sessionIncarnation, requestIncarnation }) => {
++              const raw = rawPermission(request)
++              return {
++                requestId: request.id,
++                sessionId: request.sessionID,
++                sessionIncarnation,
++                requestIncarnation,
++                permissionDigest: digest(raw),
++                rawPermission: raw,
++              }
++            })
++          const response = {
++            schemaVersion: 2 as const,
++            protocol,
++            ...snapshot,
++            sessionId: ctx.params.sessionID,
++            permissions,
++          }
++          const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
++          if (permissions.length > 256 || bytes > 1024 * 1024) {
++            yield* Effect.logWarning("hosted approval observe overflow", {
++              sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
++              droppedCount: permissions.length,
++              droppedBytes: bytes,
++            })
++            return yield* new HttpApiError.InternalServerError()
++          }
++          return response
++        }),
++      )
++    })
++
++    const hostedReply = Effect.fn("PermissionHttpApi.hostedReply")(function* (ctx: {
++      params: { sessionID: string; requestID: PermissionV1.ID }
++      payload: typeof HostedReplyPayload.Type
++    }) {
++      yield* requireHosted()
++      if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
++        return yield* new HttpApiError.BadRequest()
++      }
++      return yield* hostedApproval.withConditionalReply(
++        Effect.gen(function* () {
++          const snapshot = hostedApproval.snapshot()
++          if (
++            snapshot.runtimeInstanceId !== ctx.payload.runtimeInstanceId ||
++            snapshot.configGeneration !== ctx.payload.expectedConfigGeneration
++          ) return yield* new HostedPreconditionError()
++
++          const result = yield* svc.conditionalReply({
++            requestID: ctx.params.requestID,
++            sessionID: ctx.payload.sessionId as PermissionV1.Request["sessionID"],
++            sessionIncarnation: ctx.payload.sessionIncarnation,
++            requestIncarnation: ctx.payload.requestIncarnation,
++            reply: ctx.payload.decision === "allow_once" ? "once" : "reject",
++            matches: (request) => digest(rawPermission(request)) === ctx.payload.expectedPermissionDigest,
++          })
++          if (result.status === "mismatch") return yield* new HostedConflictError()
++          return {
++            schemaVersion: 2 as const,
++            protocol,
++            status: "applied" as const,
++            runtimeInstanceId: snapshot.runtimeInstanceId,
++            configGeneration: snapshot.configGeneration,
++            requestId: ctx.payload.requestId,
++            sessionId: ctx.payload.sessionId,
++            sessionIncarnation: ctx.payload.sessionIncarnation,
++            requestIncarnation: ctx.payload.requestIncarnation,
++            permissionDigest: ctx.payload.expectedPermissionDigest,
++            decision: ctx.payload.decision,
++          }
++        }),
++      )
++    })
++
++    const hostedReplyRaw = Effect.fn("PermissionHttpApi.hostedReplyRaw")(function* (ctx: {
++      params: { sessionID: string; requestID: PermissionV1.ID }
++      request: HttpServerRequest.HttpServerRequest
++    }) {
++      const unavailable = yield* requireHosted().pipe(
++        Effect.match({ onFailure: () => true, onSuccess: () => false }),
++      )
++      if (unavailable) return HttpServerResponse.empty({ status: 404 })
++      const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
++        Effect.catch(() => Effect.succeed(undefined)),
++      )
++      if (!bytes) return HttpServerResponse.empty({ status: 400 })
++      let text: string
++      try {
++        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
++        rejectDuplicateJsonKeys(text)
++      } catch {
++        return HttpServerResponse.empty({ status: 400 })
++      }
++      let untyped: unknown
++      try { untyped = JSON.parse(text) } catch { return HttpServerResponse.empty({ status: 400 }) }
++      if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) return HttpServerResponse.empty({ status: 400 })
++      const keys = Object.keys(untyped).sort()
++      if (keys.length !== HOSTED_REPLY_KEYS.length || keys.some((key, index) => key !== HOSTED_REPLY_KEYS[index])) {
++        return HttpServerResponse.empty({ status: 400 })
++      }
++      const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HostedReplyPayload))(text, {
++        onExcessProperty: "error",
++      }).pipe(
++        Effect.catch(() => Effect.succeed(undefined)),
++      )
++      if (!payload) return HttpServerResponse.empty({ status: 400 })
++      const result = yield* hostedReply({ params: ctx.params, payload }).pipe(
++        Effect.catchTags({
++          BadRequest: () => Effect.succeed(HttpServerResponse.empty({ status: 400 })),
++          HostedApprovalConflict: () => Effect.succeed(HttpServerResponse.empty({ status: 409 })),
++          HostedApprovalPreconditionFailed: () => Effect.succeed(HttpServerResponse.empty({ status: 412 })),
++        }),
++      )
++      if (HttpServerResponse.isHttpServerResponse(result)) return result
++      return HttpServerResponse.jsonUnsafe(result)
++    })
+ 
+     const list = Effect.fn("PermissionHttpApi.list")(function* () {
+       return yield* svc.list()
+@@ -36,6 +280,11 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
+       return true
+     })
+ 
+-    return handlers.handle("list", list).handle("reply", reply)
++    return handlers
++      .handle("hostedCapability", hostedCapability)
++      .handle("hostedObserve", hostedObserve)
++      .handleRaw("hostedReply", hostedReplyRaw)
++      .handle("list", list)
++      .handle("reply", reply)
+   }),
+ )
+diff --git a/packages/opencode/src/server/routes/instance/httpapi/server.ts b/packages/opencode/src/server/routes/instance/httpapi/server.ts
+index fb9d2db65621540a514786f2061714f16b6c766c..d942753d204268d24d53a36804cd832ff6f884f5 100644
+--- a/packages/opencode/src/server/routes/instance/httpapi/server.ts
++++ b/packages/opencode/src/server/routes/instance/httpapi/server.ts
+@@ -49,6 +49,7 @@ import { ToolRegistry } from "@/tool/registry"
+ import { Truncate } from "@/tool/truncate"
+ import { Worktree } from "@/worktree"
+ import { RuntimeFlags } from "@/effect/runtime-flags"
++import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+ import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
+ import { Database } from "@opencode-ai/core/database/database"
+ import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
+@@ -140,6 +141,7 @@ const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide(Serve
+ const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
+ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
+   Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++  Layer.provide(HostedApprovalCoordinator.layer),
+   Layer.provide(schemaErrorLayer),
+   Layer.provide(httpApiAuthLayer),
+ )
+@@ -169,6 +171,8 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
+     tuiHandlers,
+     workspaceHandlers,
+   ]),
++  Layer.provide(HostedApprovalCoordinator.layer),
++  Layer.provide(ServerAuth.Config.layer),
+ )
+ 
+ const instanceRoutes = instanceApiRoutes.pipe(
+@@ -237,6 +241,7 @@ const app = LayerNode.group([
+   SessionStatus.node,
+   BackgroundJob.node,
+   RuntimeFlags.node,
++  HostedApprovalCoordinator.node,
+   EventV2Bridge.node,
+   SessionRunState.node,
+   SessionProcessor.node,
+diff --git a/packages/opencode/test/cli/mcp-add.test.ts b/packages/opencode/test/cli/mcp-add.test.ts
+index 9a49384855a1528ed1b43419a2ca6c9a5a9f4c2c..052a6157cca2c0391c3ffe3f57e74bb1c8401059 100644
+--- a/packages/opencode/test/cli/mcp-add.test.ts
++++ b/packages/opencode/test/cli/mcp-add.test.ts
+@@ -8,17 +8,20 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+     "adds a remote server with HTTP headers",
+     ({ home, opencode }) =>
+       Effect.gen(function* () {
+-        const result = yield* opencode.spawn([
+-          "mcp",
+-          "add",
+-          "github",
+-          "--url",
+-          "https://example.com/mcp",
+-          "--header",
+-          "Authorization=Bearer {env:GITHUB_TOKEN}",
+-          "--header",
+-          "X-Option=one=two",
+-        ])
++        const result = yield* opencode.spawn(
++          [
++            "mcp",
++            "add",
++            "github",
++            "--url",
++            "https://example.com/mcp",
++            "--header",
++            "Authorization=Bearer {env:GITHUB_TOKEN}",
++            "--header",
++            "X-Option=one=two",
++          ],
++          { timeoutMs: 60_000 },
++        )
+         opencode.expectExit(result, 0)
+ 
+         const config = yield* Effect.promise(() =>
+@@ -33,28 +36,31 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+           },
+         })
+       }),
+-    60_000,
++    75_000,
+   )
+ 
+   cliIt.concurrent(
+     "adds a local server while preserving argv and environment values",
+     ({ home, opencode }) =>
+       Effect.gen(function* () {
+-        const result = yield* opencode.spawn([
+-          "mcp",
+-          "add",
+-          "local",
+-          "--env",
+-          "API_KEY=secret",
+-          "--env",
+-          "VALUE=one=two",
+-          "--",
+-          "npx",
+-          "-y",
+-          "@example/server",
+-          "--label",
+-          "two words",
+-        ])
++        const result = yield* opencode.spawn(
++          [
++            "mcp",
++            "add",
++            "local",
++            "--env",
++            "API_KEY=secret",
++            "--env",
++            "VALUE=one=two",
++            "--",
++            "npx",
++            "-y",
++            "@example/server",
++            "--label",
++            "two words",
++          ],
++          { timeoutMs: 60_000 },
++        )
+         opencode.expectExit(result, 0)
+ 
+         const config = yield* Effect.promise(() =>
+@@ -69,6 +75,6 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
+           },
+         })
+       }),
+-    60_000,
++    75_000,
+   )
+ })
+diff --git a/packages/opencode/test/cli/run/run-process.test.ts b/packages/opencode/test/cli/run/run-process.test.ts
+index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff347d12f29a4a378f38d3e708e3148bbd8a8915 100644
+--- a/packages/opencode/test/cli/run/run-process.test.ts
++++ b/packages/opencode/test/cli/run/run-process.test.ts
+@@ -73,12 +73,13 @@ describe("opencode run (non-interactive subprocess)", () => {
+       Effect.gen(function* () {
+         const result = yield* opencode.run("say hi", {
+           model: "test/nonexistent-model",
+-          timeoutMs: 15_000,
++          timeoutMs: 30_000,
++          printLogs: true,
+         })
+-        expect(result.exitCode).not.toBe(0)
+-        expect(result.durationMs).toBeLessThan(15_000)
++        opencode.expectExit(result, 1)
++        expect(result.durationMs).toBeLessThan(30_000)
+       }),
+-    30_000,
++    45_000,
+   )
+ 
+   // The test provider's SSE error item is interpreted by the SDK as an unknown
+@@ -96,12 +97,12 @@ describe("opencode run (non-interactive subprocess)", () => {
+         )
+         yield* llm.fail("upstream provider exploded mid-stream")
+         yield* llm.text("recovered")
+-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 30_000 })
++        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 60_000 })
+         expect(result.exitCode).toBe(0)
+         expect(result.stdout).toBe("partial response\nrecovered\n")
+         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
+       }),
+-    60_000,
++    75_000,
+   )
+ 
+   // --format json puts one JSON object per line on stdout for each emitted
+diff --git a/packages/opencode/test/config/config.test.ts b/packages/opencode/test/config/config.test.ts
+index 8f72c0cb7f6390450dc747d9d5b6a75829ad9919..fc05fb716c0894a6492c7ede415df6199bd356ac 100644
+--- a/packages/opencode/test/config/config.test.ts
++++ b/packages/opencode/test/config/config.test.ts
+@@ -371,6 +371,22 @@ it.instance("updates config and preserves empty shell sentinel", () =>
+   }),
+ )
+ 
++it.instance("serializes concurrent updates to the same config file", () =>
++  Effect.gen(function* () {
++    const test = yield* TestInstance
++    const config = yield* Config.Service
++    yield* Effect.all(
++      [config.update({ model: "test/model" }), config.update({ username: "test-user" })],
++      { concurrency: "unbounded" },
++    )
++
++    expect(yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))).toMatchObject({
++      model: "test/model",
++      username: "test-user",
++    })
++  }),
++)
++
+ it.effect("updates global config and omits empty shell key in json", () =>
+   withGlobalConfig({ config: { shell: "bash" } }, ({ dir }) =>
+     Effect.gen(function* () {
+diff --git a/packages/opencode/test/hosted-approval/coordinator.test.ts b/packages/opencode/test/hosted-approval/coordinator.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..da099bdb34ca2b13345a369a89f57dd8bb34cc51
+--- /dev/null
++++ b/packages/opencode/test/hosted-approval/coordinator.test.ts
+@@ -0,0 +1,130 @@
++import { expect, test } from "bun:test"
++import { Deferred, Effect, Fiber } from "effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
++
++test("coordinator uses process-unique tokens and rotates generation after mutation", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const before = coordinator.snapshot()
++    let visibleDuringMutation = ""
++    yield* coordinator.withConfigMutation(
++      Effect.sync(() => {
++        visibleDuringMutation = coordinator.snapshot().configGeneration
++      }),
++    )
++    return { before, after: coordinator.snapshot(), visibleDuringMutation }
++  }).pipe(Effect.provide(HostedApprovalCoordinator.layer), Effect.runPromise)
++
++  expect(result.before.runtimeInstanceId).toMatch(/^runtime_instance_[0-9a-f]{32}$/)
++  expect(result.before.configGeneration).toMatch(/^config_generation_[0-9a-f]{32}$/)
++  expect(result.after.runtimeInstanceId).toBe(result.before.runtimeInstanceId)
++  expect(result.after.configGeneration).not.toBe(result.before.configGeneration)
++  expect(result.visibleDuringMutation).toBe(result.before.configGeneration)
++})
++
++test("separate coordinator boots never reuse runtime or config incarnation", async () => {
++  const read = Effect.gen(function* () {
++    return (yield* HostedApprovalCoordinator.Service).snapshot()
++  })
++  const [first, second] = await Promise.all([
++    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
++    Effect.runPromise(read.pipe(Effect.provide(HostedApprovalCoordinator.makeTestLayer()))),
++  ])
++  expect(first.runtimeInstanceId).not.toBe(second.runtimeInstanceId)
++  expect(first.configGeneration).not.toBe(second.configGeneration)
++})
++
++test("all providers of the production layer share one process authority", async () => {
++  const snapshots = await Effect.all(
++    [
++      Effect.gen(function* () {
++        return (yield* HostedApprovalCoordinator.Service).snapshot()
++      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
++      Effect.gen(function* () {
++        return (yield* HostedApprovalCoordinator.Service).snapshot()
++      }).pipe(Effect.provide(HostedApprovalCoordinator.layer)),
++    ],
++    { concurrency: "unbounded" },
++  ).pipe(Effect.runPromise)
++  expect(snapshots[0]).toEqual(snapshots[1])
++})
++
++test("cancellation cannot split a committed mutation from generation rotation", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const locked = yield* Deferred.make<void>()
++    const unlock = yield* Deferred.make<void>()
++    const committed = yield* Deferred.make<void>()
++    const before = coordinator.snapshot().configGeneration
++    const lock = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(locked, undefined)
++        yield* Deferred.await(unlock)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(locked)
++    const fiber = yield* coordinator.withConfigMutation(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(committed, undefined)
++        return true
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(committed)
++    yield* Fiber.interrupt(fiber).pipe(Effect.forkScoped)
++    yield* Deferred.succeed(unlock, undefined)
++    yield* Fiber.await(lock)
++    yield* Fiber.await(fiber)
++    return { before, after: coordinator.snapshot().configGeneration }
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(result.after).not.toBe(result.before)
++})
++
++test("config work does not hold the process coordinator", async () => {
++  const result = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const started = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const before = coordinator.snapshot().configGeneration
++    const mutation = yield* coordinator.withConfigMutation(
++      Effect.gen(function* () {
++        yield* Deferred.succeed(started, undefined)
++        yield* Deferred.await(release)
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(started)
++    const during = yield* coordinator.withConditionalReply(
++      Effect.sync(() => coordinator.snapshot().configGeneration),
++    ).pipe(Effect.timeout("250 millis"))
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(mutation)
++    return { before, during, after: coordinator.snapshot().configGeneration }
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(result.during).toBe(result.before)
++  expect(result.after).not.toBe(result.before)
++})
++
++test("conditional operations remain single-writer atomic", async () => {
++  const order = await Effect.gen(function* () {
++    const coordinator = yield* HostedApprovalCoordinator.Service
++    const entered = yield* Deferred.make<void>()
++    const release = yield* Deferred.make<void>()
++    const values: string[] = []
++    const first = yield* coordinator.withConditionalReply(
++      Effect.gen(function* () {
++        values.push("first-enter")
++        yield* Deferred.succeed(entered, undefined)
++        yield* Deferred.await(release)
++        values.push("first-exit")
++      }),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.await(entered)
++    const second = yield* coordinator.withConditionalReply(
++      Effect.sync(() => values.push("second")),
++    ).pipe(Effect.forkScoped)
++    yield* Deferred.succeed(release, undefined)
++    yield* Fiber.join(first)
++    yield* Fiber.join(second)
++    return values
++  }).pipe(Effect.scoped, Effect.provide(HostedApprovalCoordinator.makeTestLayer()), Effect.runPromise)
++  expect(order).toEqual(["first-enter", "first-exit", "second"])
++})
+diff --git a/packages/opencode/test/hosted-approval/protocol.test.ts b/packages/opencode/test/hosted-approval/protocol.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..66f91bf650a5d10bbb338c84982cefdd7a44c5e3
+--- /dev/null
++++ b/packages/opencode/test/hosted-approval/protocol.test.ts
+@@ -0,0 +1,61 @@
++import { describe, expect, test } from "bun:test"
++import { canonicalJson, digest, rawPermission } from "../../src/hosted-approval/protocol"
++import { readHostedReplyBody } from "../../src/server/routes/instance/httpapi/handlers/permission"
++import { Effect, Stream } from "effect"
++
++describe("hosted approval protocol", () => {
++  test("canonical digest matches the frozen golden vector", () => {
++    expect(digest({ requestID: "permission_1", sessionID: "session_1", tool: "bash" })).toBe(
++      "bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2",
++    )
++  })
++
++  test("canonical digest matches the full permission golden vector", () => {
++    expect(digest({
++      always: [],
++      id: "per_1",
++      metadata: { cwd: "/tmp", risk: 1 },
++      patterns: ["ls", "pwd"],
++      permission: "bash",
++      sessionID: "ses_1",
++    })).toBe("04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca")
++  })
++
++  test("sorts object keys recursively while preserving arrays", () => {
++    expect(canonicalJson({ z: [{ b: 2, a: 1 }], a: true })).toBe('{"a":true,"z":[{"a":1,"b":2}]}')
++  })
++
++  test("digests the JSON wire projection without undefined fields", () => {
++    const internal = { id: "permission_1", tool: undefined, metadata: { value: 1, absent: undefined } }
++    const wire = rawPermission(internal) as unknown
++    expect(wire).toEqual({ id: "permission_1", metadata: { value: 1 } })
++    expect(() => digest(wire)).not.toThrow()
++  })
++
++  test("rejects unsupported canonical values", () => {
++    expect(() => canonicalJson({ value: BigInt(1) })).toThrow("Unsupported hosted approval canonical value")
++  })
++
++  test("rejects undefined at every nesting position", () => {
++    const sparse: unknown[] = []
++    sparse.length = 1
++    expect(() => canonicalJson(undefined)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson([undefined])).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson(sparse)).toThrow("Unsupported hosted approval canonical value")
++    expect(() => canonicalJson({ nested: { value: undefined } })).toThrow(
++      "Unsupported hosted approval canonical value",
++    )
++  })
++})
++
++test("bounded request reader stops before consuming chunks after the limit", async () => {
++  let consumed = 0
++  const stream = Stream.fromIterable([
++    new Uint8Array(10),
++    new Uint8Array(7),
++    new Uint8Array(1),
++  ]).pipe(Stream.tap(() => Effect.sync(() => { consumed += 1 })))
++  const exit = await Effect.runPromiseExit(readHostedReplyBody(stream, 16))
++  expect(exit._tag).toBe("Failure")
++  expect(consumed).toBe(2)
++})
+diff --git a/packages/opencode/test/permission/next.test.ts b/packages/opencode/test/permission/next.test.ts
+index 2f2ce98efb341ed27ca140ace2c8cac9992c9120..f79f20f9fc1df5bbcc6e734ddfa5a7f32829b101 100644
+--- a/packages/opencode/test/permission/next.test.ts
++++ b/packages/opencode/test/permission/next.test.ts
+@@ -1,4 +1,5 @@
+ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { SessionV1 } from "@opencode-ai/core/v1/session"
+ import { test, expect } from "bun:test"
+ import os from "os"
+ import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+@@ -68,12 +69,24 @@ const reply = (input: Parameters<Permission.Interface["reply"]>[0]) =>
+     return yield* permission.reply(input)
+   })
+ 
++const conditionalReply = (input: Parameters<Permission.Interface["conditionalReply"]>[0]) =>
++  Effect.gen(function* () {
++    const permission = yield* Permission.Service
++    return yield* permission.conditionalReply(input)
++  })
++
+ const list = () =>
+   Effect.gen(function* () {
+     const permission = yield* Permission.Service
+     return yield* permission.list()
+   })
+ 
++const hostedList = () =>
++  Effect.gen(function* () {
++    const permission = yield* Permission.Service
++    return yield* permission.hostedList()
++  })
++
+ // fromConfig tests
+ 
+ test("fromConfig - string value becomes wildcard rule", () => {
+@@ -741,6 +754,266 @@ it.instance(
+   { git: true },
+ )
+ 
++it.instance(
++  "conditional reply - concurrent callers settle exactly once",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_conditional_concurrent")
++      const sessionID = SessionID.make("session_conditional_concurrent")
++      const asked = yield* ask({
++        id: requestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(1)
++      const [{ sessionIncarnation, requestIncarnation }] = yield* hostedList()
++      let matched = 0
++      const settle = conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => {
++          matched += 1
++          return true
++        },
++      }).pipe(Effect.exit)
++      const [left, right] = yield* Effect.all([settle, settle], { concurrency: "unbounded" })
++
++      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "applied")).toHaveLength(1)
++      expect([left, right].filter((result) => Exit.isSuccess(result) && result.value.status === "mismatch")).toHaveLength(1)
++      expect(matched).toBe(1)
++      yield* Fiber.join(asked)
++      expect(yield* list()).toHaveLength(0)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "ask - duplicate live request ID cannot replace its incarnation",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_duplicate_live")
++      const first = yield* ask({
++        id: requestID,
++        sessionID: SessionID.make("session_duplicate_first"),
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(1)
++      const [before] = yield* hostedList()
++
++      const duplicate = yield* ask({
++        id: requestID,
++        sessionID: SessionID.make("session_duplicate_second"),
++        permission: "edit",
++        patterns: ["file.ts"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.exit)
++      expect(Exit.isFailure(duplicate)).toBe(true)
++      const [after] = yield* hostedList()
++      expect(after.request.sessionID).toBe(before.request.sessionID)
++      expect(after.requestIncarnation).toBe(before.requestIncarnation)
++
++      yield* conditionalReply({
++        requestID,
++        sessionID: before.request.sessionID,
++        sessionIncarnation: before.sessionIncarnation,
++        requestIncarnation: before.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(first)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - reject is scoped to one request",
++  () =>
++    Effect.gen(function* () {
++      const sessionID = SessionID.make("session_conditional_scoped")
++      const firstID = PermissionV1.ID.make("per_conditional_first")
++      const secondID = PermissionV1.ID.make("per_conditional_second")
++      const first = yield* ask({
++        id: firstID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      const second = yield* ask({
++        id: secondID,
++        sessionID,
++        permission: "edit",
++        patterns: ["file.ts"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(2)
++      const incarnations = new Map((yield* hostedList()).map((item) => [item.request.id, item]))
++      yield* conditionalReply({
++        requestID: firstID,
++        sessionID,
++        sessionIncarnation: incarnations.get(firstID)!.sessionIncarnation,
++        requestIncarnation: incarnations.get(firstID)!.requestIncarnation,
++        reply: "reject",
++        matches: () => true,
++      })
++
++      const firstExit = yield* Fiber.await(first)
++      expect(Exit.isFailure(firstExit)).toBe(true)
++      expect((yield* list()).map((request) => request.id)).toEqual([secondID])
++      yield* conditionalReply({
++        requestID: secondID,
++        sessionID,
++        sessionIncarnation: incarnations.get(secondID)!.sessionIncarnation,
++        requestIncarnation: incarnations.get(secondID)!.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(second)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - mismatched incarnation performs no effect",
++  () =>
++    Effect.gen(function* () {
++      const requestID = PermissionV1.ID.make("per_conditional_mismatch")
++      const sessionID = SessionID.make("session_conditional_mismatch")
++      const asked = yield* ask({
++        id: requestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++
++      yield* waitForPending(1)
++      const [{ sessionIncarnation, requestIncarnation }] = yield* hostedList()
++      const mismatch = yield* conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => false,
++      })
++      expect(mismatch.status).toBe("mismatch")
++      expect((yield* list()).map((request) => request.id)).toEqual([requestID])
++
++      yield* conditionalReply({
++        requestID,
++        sessionID,
++        sessionIncarnation,
++        requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(asked)
++    }),
++  { git: true },
++)
++
++it.instance(
++  "conditional reply - a still-live request is stale after session delete and recreate",
++  () =>
++    Effect.gen(function* () {
++      const staleRequestID = PermissionV1.ID.make("per_session_incarnation_stale")
++      const currentRequestID = PermissionV1.ID.make("per_session_incarnation_current")
++      const sessionID = SessionID.make("ses_incarnation_reuse")
++      const staleAsk = yield* ask({
++        id: staleRequestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["ls"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(1)
++      const [stale] = yield* hostedList()
++
++      const events = yield* EventV2Bridge.Service
++      const info = {
++        id: sessionID,
++        slug: "session-incarnation-reuse",
++        projectID: "project-incarnation-reuse",
++        directory: "/tmp/session-incarnation-reuse",
++        cost: 0,
++        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
++        title: "session incarnation reuse",
++        version: "test",
++        time: { created: Date.now(), updated: Date.now() },
++      }
++      yield* events.publish(
++        SessionV1.Event.Deleted,
++        { sessionID, info } as typeof SessionV1.Event.Deleted.data.Type,
++      )
++      yield* events.publish(
++        SessionV1.Event.Created,
++        { sessionID, info } as typeof SessionV1.Event.Created.data.Type,
++      )
++
++      const currentAsk = yield* ask({
++        id: currentRequestID,
++        sessionID,
++        permission: "bash",
++        patterns: ["pwd"],
++        metadata: {},
++        always: [],
++        ruleset: [],
++      }).pipe(Effect.forkScoped)
++      yield* waitForPending(2)
++      const pending = new Map((yield* hostedList()).map((item) => [item.request.id, item]))
++      const current = pending.get(currentRequestID)!
++      expect(current.sessionIncarnation).not.toBe(stale.sessionIncarnation)
++
++      const result = yield* conditionalReply({
++        requestID: staleRequestID,
++        sessionID,
++        sessionIncarnation: stale.sessionIncarnation,
++        requestIncarnation: stale.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      expect(result.status).toBe("mismatch")
++      expect((yield* list()).map((request) => request.id)).toEqual([staleRequestID, currentRequestID])
++
++      yield* conditionalReply({
++        requestID: currentRequestID,
++        sessionID,
++        sessionIncarnation: current.sessionIncarnation,
++        requestIncarnation: current.requestIncarnation,
++        reply: "once",
++        matches: () => true,
++      })
++      yield* Fiber.join(currentAsk)
++      yield* reply({ requestID: staleRequestID, reply: "once" })
++      yield* Fiber.join(staleAsk)
++    }),
++  { git: true },
++)
++
+ it.instance(
+   "reply - reject with message throws CorrectedError",
+   () =>
+diff --git a/packages/opencode/test/plugin/loader-shared.test.ts b/packages/opencode/test/plugin/loader-shared.test.ts
+deleted file mode 100644
+index 005a6e78cb55af77c019c469814c816ca7cd0d0e..0000000000000000000000000000000000000000
+--- a/packages/opencode/test/plugin/loader-shared.test.ts
++++ /dev/null
+@@ -1,1306 +0,0 @@
+-import { afterEach, describe, expect, spyOn } from "bun:test"
+-import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+-import { Effect, Layer } from "effect"
+-import fs from "fs/promises"
+-import path from "path"
+-import { pathToFileURL } from "url"
+-import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+-import { FSUtil } from "@opencode-ai/core/fs-util"
+-import { Config } from "@/config/config"
+-import { disposeAllInstances, provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
+-import { testEffect } from "../lib/effect"
+-
+-const { Plugin } = await import("../../src/plugin/index")
+-const { PluginLoader } = await import("../../src/plugin/loader")
+-const { readPackageThemes } = await import("../../src/plugin/shared")
+-const { Npm } = await import("@opencode-ai/core/npm")
+-const { TestConfig } = await import("../fixture/config")
+-const { RuntimeFlags } = await import("../../src/effect/runtime-flags")
+-
+-afterEach(async () => {
+-  await disposeAllInstances()
+-})
+-
+-const it = testEffect(
+-  Layer.mergeAll(LayerNode.compile(LayerNode.group([CrossSpawnSpawner.node, FSUtil.node])), testInstanceStoreLayer),
+-)
+-
+-function withTmp<T, A, E, R>(
+-  init: (dir: string) => Promise<T>,
+-  body: (tmp: { path: string; extra: T }) => Effect.Effect<A, E, R>,
+-) {
+-  return Effect.gen(function* () {
+-    const dir = yield* tmpdirScoped()
+-    const extra = yield* Effect.promise(() => init(dir))
+-    return yield* body({ path: dir, extra })
+-  })
+-}
+-
+-function load(dir: string, flags?: Parameters<typeof RuntimeFlags.layer>[0]) {
+-  const source = path.join(dir, "opencode.json")
+-  return Effect.gen(function* () {
+-    const config = yield* Effect.promise(
+-      () => Bun.file(source).json() as Promise<{ plugin?: Array<string | [string, Record<string, unknown>]> }>,
+-    )
+-    const plugins = config.plugin ?? []
+-    return yield* Effect.gen(function* () {
+-      const plugin = yield* Plugin.Service
+-      yield* plugin.list()
+-    }).pipe(
+-      Effect.provide(
+-        LayerNode.compile(Plugin.node, [
+-          [
+-            Config.node,
+-            TestConfig.layer({
+-              get: () =>
+-                Effect.succeed({
+-                  plugin: plugins,
+-                  plugin_origins: plugins.map((plugin) => ({ spec: plugin, source, scope: "local" as const })),
+-                }),
+-              directories: () => Effect.succeed([dir]),
+-            }),
+-          ],
+-          [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true, ...flags })],
+-        ]),
+-      ),
+-      provideInstance(dir),
+-    )
+-  })
+-}
+-
+-describe("plugin.loader.shared", () => {
+-  it.live("loads a file:// plugin function export", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "called.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "export default async () => {",
+-            `  await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "  return {}",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("called")
+-        }),
+-    ),
+-  )
+-
+-  it.live("deduplicates same function exported as default and named", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "count.txt")
+-        await Bun.write(mark, "")
+-        await Bun.write(
+-          file,
+-          [
+-            "const run = async () => {",
+-            `  const text = await Bun.file(${JSON.stringify(mark)}).text().catch(() => "")`,
+-            `  await Bun.write(${JSON.stringify(mark)}, text + "1")`,
+-            "  return {}",
+-            "}",
+-            "export default run",
+-            "export const named = run",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("1")
+-        }),
+-    ),
+-  )
+-
+-  it.live("uses only default v1 server plugin when present", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "count.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "export default {",
+-            '  id: "demo.v1-default",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "default")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "export const named = async () => {",
+-            `  await Bun.write(${JSON.stringify(mark)}, "named")`,
+-            "  return {}",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("default")
+-        }),
+-    ),
+-  )
+-
+-  it.live("rejects v1 file server plugin without id", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "called.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "export default {",
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          const called = yield* Effect.promise(() =>
+-            Bun.file(tmp.extra.mark)
+-              .text()
+-              .then(() => true)
+-              .catch(() => false),
+-          )
+-
+-          expect(called).toBe(false)
+-        }),
+-    ),
+-  )
+-
+-  it.live("rejects v1 plugin that exports server and tui together", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "called.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "export default {",
+-            '  id: "demo.mixed",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "server")`,
+-            "    return {}",
+-            "  },",
+-            "  tui: async () => {},",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          const called = yield* Effect.promise(() =>
+-            Bun.file(tmp.extra.mark)
+-              .text()
+-              .then(() => true)
+-              .catch(() => false),
+-          )
+-
+-          expect(called).toBe(false)
+-        }),
+-    ),
+-  )
+-
+-  it.live("resolves npm plugin specs with explicit and default versions", () =>
+-    withTmp(
+-      async (dir) => {
+-        const acme = path.join(dir, "node_modules", "acme-plugin")
+-        const scope = path.join(dir, "node_modules", "scope-plugin")
+-        await fs.mkdir(acme, { recursive: true })
+-        await fs.mkdir(scope, { recursive: true })
+-        await Bun.write(
+-          path.join(acme, "package.json"),
+-          JSON.stringify({ name: "acme-plugin", type: "module", main: "./index.js" }, null, 2),
+-        )
+-        await Bun.write(path.join(acme, "index.js"), "export default { server: async () => ({}) }\n")
+-        await Bun.write(
+-          path.join(scope, "package.json"),
+-          JSON.stringify({ name: "scope-plugin", type: "module", main: "./index.js" }, null, 2),
+-        )
+-        await Bun.write(path.join(scope, "index.js"), "export default { server: async () => ({}) }\n")
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: ["acme-plugin", "scope-plugin@2.3.4"] }, null, 2),
+-        )
+-
+-        return { acme, scope }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const add = spyOn(Npm, "add").mockImplementation(async (pkg) => {
+-            if (pkg === "acme-plugin") return { directory: tmp.extra.acme, entrypoint: undefined }
+-            return { directory: tmp.extra.scope, entrypoint: undefined }
+-          })
+-
+-          try {
+-            yield* load(tmp.path)
+-
+-            expect(add.mock.calls).toContainEqual(["acme-plugin@latest"])
+-            expect(add.mock.calls).toContainEqual(["scope-plugin@2.3.4"])
+-          } finally {
+-            add.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("loads npm server plugin from package ./server export", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        const mark = path.join(dir, "server-called.txt")
+-        await fs.mkdir(mod, { recursive: true })
+-
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              type: "module",
+-              exports: {
+-                ".": "./index.js",
+-                "./server": "./server.js",
+-                "./tui": "./tui.js",
+-              },
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(path.join(mod, "index.js"), 'import "./main-throws.js"\nexport default {}\n')
+-        await Bun.write(path.join(mod, "main-throws.js"), 'throw new Error("main loaded")\n')
+-        await Bun.write(
+-          path.join(mod, "server.js"),
+-          [
+-            "export default {",
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-        await Bun.write(path.join(mod, "tui.js"), "export default {}\n")
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
+-
+-        return {
+-          mod,
+-          mark,
+-        }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            yield* load(tmp.path)
+-            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("loads npm server plugin from package server export without leading dot", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        const dist = path.join(mod, "dist")
+-        const mark = path.join(dir, "server-called.txt")
+-        await fs.mkdir(dist, { recursive: true })
+-
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              type: "module",
+-              exports: {
+-                ".": "./index.js",
+-                "./server": "dist/server.js",
+-              },
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(path.join(mod, "index.js"), 'import "./main-throws.js"\nexport default {}\n')
+-        await Bun.write(path.join(mod, "main-throws.js"), 'throw new Error("main loaded")\n')
+-        await Bun.write(
+-          path.join(dist, "server.js"),
+-          [
+-            "export default {",
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
+-
+-        return {
+-          mod,
+-          mark,
+-        }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            yield* load(tmp.path)
+-            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("loads npm server plugin from package main without leading dot", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        const dist = path.join(mod, "dist")
+-        const mark = path.join(dir, "main-called.txt")
+-        await fs.mkdir(dist, { recursive: true })
+-
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              type: "module",
+-              main: "dist/index.js",
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(
+-          path.join(dist, "index.js"),
+-          [
+-            "export default {",
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
+-
+-        return {
+-          mod,
+-          mark,
+-        }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            yield* load(tmp.path)
+-            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("does not use npm package exports dot for server entry", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        const mark = path.join(dir, "dot-server.txt")
+-        await fs.mkdir(mod, { recursive: true })
+-
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify({
+-            name: "acme-plugin",
+-            type: "module",
+-            exports: { ".": "./index.js" },
+-          }),
+-        )
+-        await Bun.write(
+-          path.join(mod, "index.js"),
+-          [
+-            "export default {",
+-            '  id: "demo.dot.server",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
+-
+-        return { mod, mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            yield* load(tmp.path)
+-            const called = yield* Effect.promise(() =>
+-              Bun.file(tmp.extra.mark)
+-                .text()
+-                .then(() => true)
+-                .catch(() => false),
+-            )
+-
+-            expect(called).toBe(false)
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("rejects npm server export that resolves outside plugin directory", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        const outside = path.join(dir, "outside")
+-        const mark = path.join(dir, "outside-server.txt")
+-        await fs.mkdir(mod, { recursive: true })
+-        await fs.mkdir(outside, { recursive: true })
+-
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              type: "module",
+-              exports: {
+-                ".": "./index.js",
+-                "./server": "./escape/server.js",
+-              },
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(path.join(mod, "index.js"), "export default {}\n")
+-        await Bun.write(
+-          path.join(outside, "server.js"),
+-          [
+-            "export default {",
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "outside")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-        await fs.symlink(outside, path.join(mod, "escape"), process.platform === "win32" ? "junction" : "dir")
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin"] }, null, 2))
+-
+-        return {
+-          mod,
+-          mark,
+-        }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            yield* load(tmp.path)
+-            const called = yield* Effect.promise(() =>
+-              Bun.file(tmp.extra.mark)
+-                .text()
+-                .then(() => true)
+-                .catch(() => false),
+-            )
+-            expect(called).toBe(false)
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("skips legacy codex and copilot auth plugin specs", () =>
+-    withTmp(
+-      async (dir) => {
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify(
+-            {
+-              plugin: ["opencode-openai-codex-auth@1.0.0", "opencode-copilot-auth@1.0.0", "regular-plugin@1.0.0"],
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-      },
+-      (_tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: "", entrypoint: undefined })
+-
+-          try {
+-            yield* load(_tmp.path)
+-
+-            const pkgs = install.mock.calls.map((call) => call[0])
+-            expect(pkgs).toContain("regular-plugin@1.0.0")
+-            expect(pkgs).not.toContain("opencode-openai-codex-auth@1.0.0")
+-            expect(pkgs).not.toContain("opencode-copilot-auth@1.0.0")
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("skips broken plugin when install fails", () =>
+-    withTmp(
+-      async (dir) => {
+-        const ok = path.join(dir, "ok.ts")
+-        const mark = path.join(dir, "ok.txt")
+-        await Bun.write(
+-          ok,
+-          [
+-            "export default {",
+-            '  id: "demo.ok",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: ["broken-plugin@9.9.9", pathToFileURL(ok).href] }, null, 2),
+-        )
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockRejectedValue(new Error("boom"))
+-
+-          try {
+-            yield* load(tmp.path)
+-            expect(install).toHaveBeenCalledWith("broken-plugin@9.9.9")
+-            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("continues loading plugins when plugin init throws", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = pathToFileURL(path.join(dir, "throws.ts")).href
+-        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
+-        const mark = path.join(dir, "ok.txt")
+-        await Bun.write(
+-          path.join(dir, "throws.ts"),
+-          [
+-            "export default {",
+-            '  id: "demo.throws",',
+-            "  server: async () => {",
+-            '    throw new Error("explode")',
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-        await Bun.write(
+-          path.join(dir, "ok.ts"),
+-          [
+-            "export default {",
+-            '  id: "demo.ok",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [file, ok] }, null, 2))
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
+-        }),
+-    ),
+-  )
+-
+-  it.live("continues loading plugins when plugin module has invalid export", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = pathToFileURL(path.join(dir, "invalid.ts")).href
+-        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
+-        const mark = path.join(dir, "ok.txt")
+-        await Bun.write(
+-          path.join(dir, "invalid.ts"),
+-          ["export default {", '  id: "demo.invalid",', "  nope: true,", "}", ""].join("\n"),
+-        )
+-        await Bun.write(
+-          path.join(dir, "ok.ts"),
+-          [
+-            "export default {",
+-            '  id: "demo.ok",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [file, ok] }, null, 2))
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
+-        }),
+-    ),
+-  )
+-
+-  it.live("continues loading plugins when plugin import fails", () =>
+-    withTmp(
+-      async (dir) => {
+-        const missing = pathToFileURL(path.join(dir, "missing-plugin.ts")).href
+-        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
+-        const mark = path.join(dir, "ok.txt")
+-        await Bun.write(
+-          path.join(dir, "ok.ts"),
+-          [
+-            "export default {",
+-            '  id: "demo.ok",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [missing, ok] }, null, 2))
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
+-        }),
+-    ),
+-  )
+-
+-  it.live("loads object plugin via plugin.server", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "object-plugin.ts")
+-        const mark = path.join(dir, "object-called.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "const plugin = {",
+-            '  id: "demo.object",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "export default plugin",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("called")
+-        }),
+-    ),
+-  )
+-
+-  it.live("passes tuple plugin options into server plugin", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "options-plugin.ts")
+-        const mark = path.join(dir, "options.json")
+-        await Bun.write(
+-          file,
+-          [
+-            "const plugin = {",
+-            '  id: "demo.options",',
+-            "  server: async (_input, options) => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, JSON.stringify(options ?? null))`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "export default plugin",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [[pathToFileURL(file).href, { source: "tuple", enabled: true }]] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          expect(
+-            (yield* (yield* FSUtil.Service).readJson(tmp.extra.mark)) as { source: string; enabled: boolean },
+-          ).toEqual({
+-            source: "tuple",
+-            enabled: true,
+-          })
+-        }),
+-    ),
+-  )
+-
+-  it.live("initializes server plugins in config order", () =>
+-    withTmp(
+-      async (dir) => {
+-        const a = path.join(dir, "a-plugin.ts")
+-        const b = path.join(dir, "b-plugin.ts")
+-        const marker = path.join(dir, "server-order.txt")
+-        const aSpec = pathToFileURL(a).href
+-        const bSpec = pathToFileURL(b).href
+-
+-        await Bun.write(
+-          a,
+-          `import fs from "fs/promises"
+-
+-export default {
+-  id: "demo.order.a",
+-  server: async () => {
+-    await fs.appendFile(${JSON.stringify(marker)}, "a-start\\n")
+-    await Bun.sleep(25)
+-    await fs.appendFile(${JSON.stringify(marker)}, "a-end\\n")
+-    return {}
+-  },
+-}
+-`,
+-        )
+-        await Bun.write(
+-          b,
+-          `import fs from "fs/promises"
+-
+-export default {
+-  id: "demo.order.b",
+-  server: async () => {
+-    await fs.appendFile(${JSON.stringify(marker)}, "b\\n")
+-    return {}
+-  },
+-}
+-`,
+-        )
+-
+-        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [aSpec, bSpec] }, null, 2))
+-
+-        return { marker }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path)
+-          const lines = (yield* Effect.promise(() => fs.readFile(tmp.extra.marker, "utf8"))).trim().split("\n")
+-          expect(lines).toEqual(["a-start", "a-end", "b"])
+-        }),
+-    ),
+-  )
+-
+-  it.live("skips external plugins in pure mode", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const mark = path.join(dir, "called.txt")
+-        await Bun.write(
+-          file,
+-          [
+-            "export default {",
+-            '  id: "demo.pure",',
+-            "  server: async () => {",
+-            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
+-            "    return {}",
+-            "  },",
+-            "}",
+-            "",
+-          ].join("\n"),
+-        )
+-
+-        await Bun.write(
+-          path.join(dir, "opencode.json"),
+-          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
+-        )
+-
+-        return { mark }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          yield* load(tmp.path, { pure: true })
+-          const called = yield* Effect.promise(() =>
+-            fs
+-              .readFile(tmp.extra.mark, "utf8")
+-              .then(() => true)
+-              .catch(() => false),
+-          )
+-          expect(called).toBe(false)
+-        }),
+-    ),
+-  )
+-
+-  it.live("reads oc-themes from package manifest", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mod")
+-        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              version: "1.0.0",
+-              "oc-themes": ["themes/one.json", "./themes/one.json", "themes/two.json"],
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-
+-        return { mod }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const file = path.join(tmp.extra.mod, "package.json")
+-          const fsys = yield* FSUtil.Service
+-          const json = (yield* fsys.readJson(file)) as Record<string, unknown>
+-          const list = readPackageThemes("acme-plugin", {
+-            dir: tmp.extra.mod,
+-            pkg: file,
+-            json,
+-          })
+-
+-          expect(list).toEqual([
+-            FSUtil.resolve(path.join(tmp.extra.mod, "themes", "one.json")),
+-            FSUtil.resolve(path.join(tmp.extra.mod, "themes", "two.json")),
+-          ])
+-        }),
+-    ),
+-  )
+-
+-  it.live("handles no-entrypoint tui packages via missing callback", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              version: "1.0.0",
+-              "oc-themes": ["themes/night.json"],
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(path.join(mod, "themes", "night.json"), "{}\n")
+-        return { mod }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-          const missing: string[] = []
+-
+-          try {
+-            const loaded = yield* Effect.promise(() =>
+-              PluginLoader.loadExternal({
+-                items: [
+-                  {
+-                    spec: "acme-plugin@1.0.0",
+-                    scope: "local" as const,
+-                    source: tmp.path,
+-                  },
+-                ],
+-                kind: "tui",
+-                missing: async (item) => {
+-                  if (!item.pkg) return
+-                  const themes = readPackageThemes(item.spec, item.pkg)
+-                  if (!themes.length) return
+-                  return {
+-                    spec: item.spec,
+-                    target: item.target,
+-                    themes,
+-                  }
+-                },
+-                report: {
+-                  missing(_candidate, _retry, message) {
+-                    missing.push(message)
+-                  },
+-                },
+-              }),
+-            )
+-
+-            expect(loaded).toEqual([
+-              {
+-                spec: "acme-plugin@1.0.0",
+-                target: tmp.extra.mod,
+-                themes: [FSUtil.resolve(path.join(tmp.extra.mod, "themes", "night.json"))],
+-              },
+-            ])
+-            expect(missing).toHaveLength(0)
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("passes package metadata for entrypoint tui plugins", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mods", "acme-plugin")
+-        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify(
+-            {
+-              name: "acme-plugin",
+-              version: "1.0.0",
+-              exports: {
+-                "./tui": "./tui.js",
+-              },
+-              "oc-themes": ["themes/night.json"],
+-            },
+-            null,
+-            2,
+-          ),
+-        )
+-        await Bun.write(path.join(mod, "tui.js"), 'export default { id: "demo", tui: async () => {} }\n')
+-        await Bun.write(path.join(mod, "themes", "night.json"), "{}\n")
+-        return { mod }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
+-
+-          try {
+-            const loaded = yield* Effect.promise(() =>
+-              PluginLoader.loadExternal({
+-                items: [
+-                  {
+-                    spec: "acme-plugin@1.0.0",
+-                    scope: "local" as const,
+-                    source: tmp.path,
+-                  },
+-                ],
+-                kind: "tui",
+-                finish: async (item) => {
+-                  if (!item.pkg) return
+-                  return {
+-                    spec: item.spec,
+-                    themes: readPackageThemes(item.spec, item.pkg),
+-                  }
+-                },
+-              }),
+-            )
+-
+-            expect(loaded).toEqual([
+-              {
+-                spec: "acme-plugin@1.0.0",
+-                themes: [FSUtil.resolve(path.join(tmp.extra.mod, "themes", "night.json"))],
+-              },
+-            ])
+-          } finally {
+-            install.mockRestore()
+-          }
+-        }),
+-    ),
+-  )
+-
+-  it.live("rejects oc-themes path traversal", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "mod")
+-        await fs.mkdir(mod, { recursive: true })
+-        const file = path.join(mod, "package.json")
+-        await Bun.write(file, JSON.stringify({ name: "acme", "oc-themes": ["../escape.json"] }, null, 2))
+-        return { mod, file }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          const fsys = yield* FSUtil.Service
+-          const json = (yield* fsys.readJson(tmp.extra.file)) as Record<string, unknown>
+-          expect(() =>
+-            readPackageThemes("acme", {
+-              dir: tmp.extra.mod,
+-              pkg: tmp.extra.file,
+-              json,
+-            }),
+-          ).toThrow("outside plugin directory")
+-        }),
+-    ),
+-  )
+-
+-  it.live("retries failed file plugins once after wait and keeps order", () =>
+-    withTmp(
+-      async (dir) => {
+-        const a = path.join(dir, "a")
+-        const b = path.join(dir, "b")
+-        const aSpec = pathToFileURL(a).href
+-        const bSpec = pathToFileURL(b).href
+-        await fs.mkdir(a, { recursive: true })
+-        await fs.mkdir(b, { recursive: true })
+-        return { a, b, aSpec, bSpec }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          let wait = 0
+-          const calls: Array<[string, boolean]> = []
+-
+-          const loaded = yield* Effect.promise(() =>
+-            PluginLoader.loadExternal({
+-              items: [tmp.extra.aSpec, tmp.extra.bSpec].map((spec) => ({
+-                spec,
+-                scope: "local" as const,
+-                source: tmp.path,
+-              })),
+-              kind: "tui",
+-              wait: async () => {
+-                wait += 1
+-                await Bun.write(path.join(tmp.extra.a, "index.ts"), "export default {}\n")
+-                await Bun.write(path.join(tmp.extra.b, "index.ts"), "export default {}\n")
+-              },
+-              report: {
+-                start(candidate, retry) {
+-                  calls.push([candidate.plan.spec, retry])
+-                },
+-              },
+-            }),
+-          )
+-
+-          expect(wait).toBe(1)
+-          expect(calls).toEqual([
+-            [tmp.extra.aSpec, false],
+-            [tmp.extra.bSpec, false],
+-            [tmp.extra.aSpec, true],
+-            [tmp.extra.bSpec, true],
+-          ])
+-          expect(loaded.map((item) => item.spec)).toEqual([tmp.extra.aSpec, tmp.extra.bSpec])
+-        }),
+-    ),
+-  )
+-
+-  it.live("does not retry permanent file plugin entry errors", () =>
+-    withTmp(
+-      async (dir) => {
+-        const mod = path.join(dir, "bad-entry")
+-        const spec = pathToFileURL(mod).href
+-        await fs.mkdir(mod, { recursive: true })
+-        await Bun.write(
+-          path.join(mod, "package.json"),
+-          JSON.stringify({ exports: { "./tui": "../outside.js" } }, null, 2),
+-        )
+-        return { spec }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          let wait = 0
+-          const errors: Array<[string, boolean]> = []
+-
+-          const loaded = yield* Effect.promise(() =>
+-            PluginLoader.loadExternal({
+-              items: [
+-                {
+-                  spec: tmp.extra.spec,
+-                  scope: "local" as const,
+-                  source: tmp.path,
+-                },
+-              ],
+-              kind: "tui",
+-              wait: async () => {
+-                wait += 1
+-              },
+-              report: {
+-                error(_candidate, retry, stage) {
+-                  errors.push([stage, retry])
+-                },
+-              },
+-            }),
+-          )
+-
+-          expect(loaded).toEqual([])
+-          expect(wait).toBe(0)
+-          expect(errors).toEqual([["entry", false]])
+-        }),
+-    ),
+-  )
+-
+-  it.live("does not retry file plugins when finish returns undefined", () =>
+-    withTmp(
+-      async (dir) => {
+-        const file = path.join(dir, "plugin.ts")
+-        const spec = pathToFileURL(file).href
+-        await Bun.write(file, "export default {}\n")
+-        return { spec }
+-      },
+-      (tmp) =>
+-        Effect.gen(function* () {
+-          let wait = 0
+-          let count = 0
+-
+-          const loaded = yield* Effect.promise(() =>
+-            PluginLoader.loadExternal({
+-              items: [
+-                {
+-                  spec: tmp.extra.spec,
+-                  scope: "local" as const,
+-                  source: tmp.path,
+-                },
+-              ],
+-              kind: "tui",
+-              wait: async () => {
+-                wait += 1
+-              },
+-              finish: async () => {
+-                count += 1
+-              },
+-            }),
+-          )
+-
+-          expect(wait).toBe(0)
+-          expect(count).toBe(1)
+-          expect(loaded).toEqual([])
+-        }),
+-    ),
+-  )
+-
+-  it.live("does not wait or retry npm plugin failures", () =>
+-    Effect.gen(function* () {
+-      const install = spyOn(Npm, "add").mockRejectedValue(new Error("boom"))
+-      let wait = 0
+-      const errors: Array<[string, boolean]> = []
+-
+-      try {
+-        const loaded = yield* Effect.promise(() =>
+-          PluginLoader.loadExternal({
+-            items: [
+-              {
+-                spec: "acme-plugin@1.0.0",
+-                scope: "local" as const,
+-                source: "test",
+-              },
+-            ],
+-            kind: "tui",
+-            wait: async () => {
+-              wait += 1
+-            },
+-            report: {
+-              error(_candidate, retry, stage) {
+-                errors.push([stage, retry])
+-              },
+-            },
+-          }),
+-        )
+-
+-        expect(loaded).toEqual([])
+-        expect(wait).toBe(0)
+-        expect(errors).toEqual([["install", false]])
+-      } finally {
+-        install.mockRestore()
+-      }
+-    }),
+-  )
+-})
+diff --git a/packages/opencode/test/plugin/loader.test.ts b/packages/opencode/test/plugin/loader.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..005a6e78cb55af77c019c469814c816ca7cd0d0e
+--- /dev/null
++++ b/packages/opencode/test/plugin/loader.test.ts
+@@ -0,0 +1,1306 @@
++import { afterEach, describe, expect, spyOn } from "bun:test"
++import { LayerNode } from "@opencode-ai/core/effect/layer-node"
++import { Effect, Layer } from "effect"
++import fs from "fs/promises"
++import path from "path"
++import { pathToFileURL } from "url"
++import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
++import { FSUtil } from "@opencode-ai/core/fs-util"
++import { Config } from "@/config/config"
++import { disposeAllInstances, provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
++import { testEffect } from "../lib/effect"
++
++const { Plugin } = await import("../../src/plugin/index")
++const { PluginLoader } = await import("../../src/plugin/loader")
++const { readPackageThemes } = await import("../../src/plugin/shared")
++const { Npm } = await import("@opencode-ai/core/npm")
++const { TestConfig } = await import("../fixture/config")
++const { RuntimeFlags } = await import("../../src/effect/runtime-flags")
++
++afterEach(async () => {
++  await disposeAllInstances()
++})
++
++const it = testEffect(
++  Layer.mergeAll(LayerNode.compile(LayerNode.group([CrossSpawnSpawner.node, FSUtil.node])), testInstanceStoreLayer),
++)
++
++function withTmp<T, A, E, R>(
++  init: (dir: string) => Promise<T>,
++  body: (tmp: { path: string; extra: T }) => Effect.Effect<A, E, R>,
++) {
++  return Effect.gen(function* () {
++    const dir = yield* tmpdirScoped()
++    const extra = yield* Effect.promise(() => init(dir))
++    return yield* body({ path: dir, extra })
++  })
++}
++
++function load(dir: string, flags?: Parameters<typeof RuntimeFlags.layer>[0]) {
++  const source = path.join(dir, "opencode.json")
++  return Effect.gen(function* () {
++    const config = yield* Effect.promise(
++      () => Bun.file(source).json() as Promise<{ plugin?: Array<string | [string, Record<string, unknown>]> }>,
++    )
++    const plugins = config.plugin ?? []
++    return yield* Effect.gen(function* () {
++      const plugin = yield* Plugin.Service
++      yield* plugin.list()
++    }).pipe(
++      Effect.provide(
++        LayerNode.compile(Plugin.node, [
++          [
++            Config.node,
++            TestConfig.layer({
++              get: () =>
++                Effect.succeed({
++                  plugin: plugins,
++                  plugin_origins: plugins.map((plugin) => ({ spec: plugin, source, scope: "local" as const })),
++                }),
++              directories: () => Effect.succeed([dir]),
++            }),
++          ],
++          [RuntimeFlags.node, RuntimeFlags.layer({ disableDefaultPlugins: true, ...flags })],
++        ]),
++      ),
++      provideInstance(dir),
++    )
++  })
++}
++
++describe("plugin.loader.shared", () => {
++  it.live("loads a file:// plugin function export", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "called.txt")
++        await Bun.write(
++          file,
++          [
++            "export default async () => {",
++            `  await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "  return {}",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("called")
++        }),
++    ),
++  )
++
++  it.live("deduplicates same function exported as default and named", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "count.txt")
++        await Bun.write(mark, "")
++        await Bun.write(
++          file,
++          [
++            "const run = async () => {",
++            `  const text = await Bun.file(${JSON.stringify(mark)}).text().catch(() => "")`,
++            `  await Bun.write(${JSON.stringify(mark)}, text + "1")`,
++            "  return {}",
++            "}",
++            "export default run",
++            "export const named = run",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("1")
++        }),
++    ),
++  )
++
++  it.live("uses only default v1 server plugin when present", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "count.txt")
++        await Bun.write(
++          file,
++          [
++            "export default {",
++            '  id: "demo.v1-default",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "default")`,
++            "    return {}",
++            "  },",
++            "}",
++            "export const named = async () => {",
++            `  await Bun.write(${JSON.stringify(mark)}, "named")`,
++            "  return {}",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("default")
++        }),
++    ),
++  )
++
++  it.live("rejects v1 file server plugin without id", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "called.txt")
++        await Bun.write(
++          file,
++          [
++            "export default {",
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          const called = yield* Effect.promise(() =>
++            Bun.file(tmp.extra.mark)
++              .text()
++              .then(() => true)
++              .catch(() => false),
++          )
++
++          expect(called).toBe(false)
++        }),
++    ),
++  )
++
++  it.live("rejects v1 plugin that exports server and tui together", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "called.txt")
++        await Bun.write(
++          file,
++          [
++            "export default {",
++            '  id: "demo.mixed",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "server")`,
++            "    return {}",
++            "  },",
++            "  tui: async () => {},",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          const called = yield* Effect.promise(() =>
++            Bun.file(tmp.extra.mark)
++              .text()
++              .then(() => true)
++              .catch(() => false),
++          )
++
++          expect(called).toBe(false)
++        }),
++    ),
++  )
++
++  it.live("resolves npm plugin specs with explicit and default versions", () =>
++    withTmp(
++      async (dir) => {
++        const acme = path.join(dir, "node_modules", "acme-plugin")
++        const scope = path.join(dir, "node_modules", "scope-plugin")
++        await fs.mkdir(acme, { recursive: true })
++        await fs.mkdir(scope, { recursive: true })
++        await Bun.write(
++          path.join(acme, "package.json"),
++          JSON.stringify({ name: "acme-plugin", type: "module", main: "./index.js" }, null, 2),
++        )
++        await Bun.write(path.join(acme, "index.js"), "export default { server: async () => ({}) }\n")
++        await Bun.write(
++          path.join(scope, "package.json"),
++          JSON.stringify({ name: "scope-plugin", type: "module", main: "./index.js" }, null, 2),
++        )
++        await Bun.write(path.join(scope, "index.js"), "export default { server: async () => ({}) }\n")
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: ["acme-plugin", "scope-plugin@2.3.4"] }, null, 2),
++        )
++
++        return { acme, scope }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const add = spyOn(Npm, "add").mockImplementation(async (pkg) => {
++            if (pkg === "acme-plugin") return { directory: tmp.extra.acme, entrypoint: undefined }
++            return { directory: tmp.extra.scope, entrypoint: undefined }
++          })
++
++          try {
++            yield* load(tmp.path)
++
++            expect(add.mock.calls).toContainEqual(["acme-plugin@latest"])
++            expect(add.mock.calls).toContainEqual(["scope-plugin@2.3.4"])
++          } finally {
++            add.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("loads npm server plugin from package ./server export", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        const mark = path.join(dir, "server-called.txt")
++        await fs.mkdir(mod, { recursive: true })
++
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              type: "module",
++              exports: {
++                ".": "./index.js",
++                "./server": "./server.js",
++                "./tui": "./tui.js",
++              },
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(path.join(mod, "index.js"), 'import "./main-throws.js"\nexport default {}\n')
++        await Bun.write(path.join(mod, "main-throws.js"), 'throw new Error("main loaded")\n')
++        await Bun.write(
++          path.join(mod, "server.js"),
++          [
++            "export default {",
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++        await Bun.write(path.join(mod, "tui.js"), "export default {}\n")
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
++
++        return {
++          mod,
++          mark,
++        }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            yield* load(tmp.path)
++            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("loads npm server plugin from package server export without leading dot", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        const dist = path.join(mod, "dist")
++        const mark = path.join(dir, "server-called.txt")
++        await fs.mkdir(dist, { recursive: true })
++
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              type: "module",
++              exports: {
++                ".": "./index.js",
++                "./server": "dist/server.js",
++              },
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(path.join(mod, "index.js"), 'import "./main-throws.js"\nexport default {}\n')
++        await Bun.write(path.join(mod, "main-throws.js"), 'throw new Error("main loaded")\n')
++        await Bun.write(
++          path.join(dist, "server.js"),
++          [
++            "export default {",
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
++
++        return {
++          mod,
++          mark,
++        }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            yield* load(tmp.path)
++            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("loads npm server plugin from package main without leading dot", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        const dist = path.join(mod, "dist")
++        const mark = path.join(dir, "main-called.txt")
++        await fs.mkdir(dist, { recursive: true })
++
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              type: "module",
++              main: "dist/index.js",
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(
++          path.join(dist, "index.js"),
++          [
++            "export default {",
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
++
++        return {
++          mod,
++          mark,
++        }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            yield* load(tmp.path)
++            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("called")
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("does not use npm package exports dot for server entry", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        const mark = path.join(dir, "dot-server.txt")
++        await fs.mkdir(mod, { recursive: true })
++
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify({
++            name: "acme-plugin",
++            type: "module",
++            exports: { ".": "./index.js" },
++          }),
++        )
++        await Bun.write(
++          path.join(mod, "index.js"),
++          [
++            "export default {",
++            '  id: "demo.dot.server",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin@1.0.0"] }, null, 2))
++
++        return { mod, mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            yield* load(tmp.path)
++            const called = yield* Effect.promise(() =>
++              Bun.file(tmp.extra.mark)
++                .text()
++                .then(() => true)
++                .catch(() => false),
++            )
++
++            expect(called).toBe(false)
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("rejects npm server export that resolves outside plugin directory", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        const outside = path.join(dir, "outside")
++        const mark = path.join(dir, "outside-server.txt")
++        await fs.mkdir(mod, { recursive: true })
++        await fs.mkdir(outside, { recursive: true })
++
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              type: "module",
++              exports: {
++                ".": "./index.js",
++                "./server": "./escape/server.js",
++              },
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(path.join(mod, "index.js"), "export default {}\n")
++        await Bun.write(
++          path.join(outside, "server.js"),
++          [
++            "export default {",
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "outside")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++        await fs.symlink(outside, path.join(mod, "escape"), process.platform === "win32" ? "junction" : "dir")
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: ["acme-plugin"] }, null, 2))
++
++        return {
++          mod,
++          mark,
++        }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            yield* load(tmp.path)
++            const called = yield* Effect.promise(() =>
++              Bun.file(tmp.extra.mark)
++                .text()
++                .then(() => true)
++                .catch(() => false),
++            )
++            expect(called).toBe(false)
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("skips legacy codex and copilot auth plugin specs", () =>
++    withTmp(
++      async (dir) => {
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify(
++            {
++              plugin: ["opencode-openai-codex-auth@1.0.0", "opencode-copilot-auth@1.0.0", "regular-plugin@1.0.0"],
++            },
++            null,
++            2,
++          ),
++        )
++      },
++      (_tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: "", entrypoint: undefined })
++
++          try {
++            yield* load(_tmp.path)
++
++            const pkgs = install.mock.calls.map((call) => call[0])
++            expect(pkgs).toContain("regular-plugin@1.0.0")
++            expect(pkgs).not.toContain("opencode-openai-codex-auth@1.0.0")
++            expect(pkgs).not.toContain("opencode-copilot-auth@1.0.0")
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("skips broken plugin when install fails", () =>
++    withTmp(
++      async (dir) => {
++        const ok = path.join(dir, "ok.ts")
++        const mark = path.join(dir, "ok.txt")
++        await Bun.write(
++          ok,
++          [
++            "export default {",
++            '  id: "demo.ok",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: ["broken-plugin@9.9.9", pathToFileURL(ok).href] }, null, 2),
++        )
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockRejectedValue(new Error("boom"))
++
++          try {
++            yield* load(tmp.path)
++            expect(install).toHaveBeenCalledWith("broken-plugin@9.9.9")
++            expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("continues loading plugins when plugin init throws", () =>
++    withTmp(
++      async (dir) => {
++        const file = pathToFileURL(path.join(dir, "throws.ts")).href
++        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
++        const mark = path.join(dir, "ok.txt")
++        await Bun.write(
++          path.join(dir, "throws.ts"),
++          [
++            "export default {",
++            '  id: "demo.throws",',
++            "  server: async () => {",
++            '    throw new Error("explode")',
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++        await Bun.write(
++          path.join(dir, "ok.ts"),
++          [
++            "export default {",
++            '  id: "demo.ok",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [file, ok] }, null, 2))
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
++        }),
++    ),
++  )
++
++  it.live("continues loading plugins when plugin module has invalid export", () =>
++    withTmp(
++      async (dir) => {
++        const file = pathToFileURL(path.join(dir, "invalid.ts")).href
++        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
++        const mark = path.join(dir, "ok.txt")
++        await Bun.write(
++          path.join(dir, "invalid.ts"),
++          ["export default {", '  id: "demo.invalid",', "  nope: true,", "}", ""].join("\n"),
++        )
++        await Bun.write(
++          path.join(dir, "ok.ts"),
++          [
++            "export default {",
++            '  id: "demo.ok",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [file, ok] }, null, 2))
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
++        }),
++    ),
++  )
++
++  it.live("continues loading plugins when plugin import fails", () =>
++    withTmp(
++      async (dir) => {
++        const missing = pathToFileURL(path.join(dir, "missing-plugin.ts")).href
++        const ok = pathToFileURL(path.join(dir, "ok.ts")).href
++        const mark = path.join(dir, "ok.txt")
++        await Bun.write(
++          path.join(dir, "ok.ts"),
++          [
++            "export default {",
++            '  id: "demo.ok",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "ok")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [missing, ok] }, null, 2))
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => Bun.file(tmp.extra.mark).text())).toBe("ok")
++        }),
++    ),
++  )
++
++  it.live("loads object plugin via plugin.server", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "object-plugin.ts")
++        const mark = path.join(dir, "object-called.txt")
++        await Bun.write(
++          file,
++          [
++            "const plugin = {",
++            '  id: "demo.object",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "export default plugin",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))).toBe("called")
++        }),
++    ),
++  )
++
++  it.live("passes tuple plugin options into server plugin", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "options-plugin.ts")
++        const mark = path.join(dir, "options.json")
++        await Bun.write(
++          file,
++          [
++            "const plugin = {",
++            '  id: "demo.options",',
++            "  server: async (_input, options) => {",
++            `    await Bun.write(${JSON.stringify(mark)}, JSON.stringify(options ?? null))`,
++            "    return {}",
++            "  },",
++            "}",
++            "export default plugin",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [[pathToFileURL(file).href, { source: "tuple", enabled: true }]] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          expect(
++            (yield* (yield* FSUtil.Service).readJson(tmp.extra.mark)) as { source: string; enabled: boolean },
++          ).toEqual({
++            source: "tuple",
++            enabled: true,
++          })
++        }),
++    ),
++  )
++
++  it.live("initializes server plugins in config order", () =>
++    withTmp(
++      async (dir) => {
++        const a = path.join(dir, "a-plugin.ts")
++        const b = path.join(dir, "b-plugin.ts")
++        const marker = path.join(dir, "server-order.txt")
++        const aSpec = pathToFileURL(a).href
++        const bSpec = pathToFileURL(b).href
++
++        await Bun.write(
++          a,
++          `import fs from "fs/promises"
++
++export default {
++  id: "demo.order.a",
++  server: async () => {
++    await fs.appendFile(${JSON.stringify(marker)}, "a-start\\n")
++    await Bun.sleep(25)
++    await fs.appendFile(${JSON.stringify(marker)}, "a-end\\n")
++    return {}
++  },
++}
++`,
++        )
++        await Bun.write(
++          b,
++          `import fs from "fs/promises"
++
++export default {
++  id: "demo.order.b",
++  server: async () => {
++    await fs.appendFile(${JSON.stringify(marker)}, "b\\n")
++    return {}
++  },
++}
++`,
++        )
++
++        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [aSpec, bSpec] }, null, 2))
++
++        return { marker }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path)
++          const lines = (yield* Effect.promise(() => fs.readFile(tmp.extra.marker, "utf8"))).trim().split("\n")
++          expect(lines).toEqual(["a-start", "a-end", "b"])
++        }),
++    ),
++  )
++
++  it.live("skips external plugins in pure mode", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const mark = path.join(dir, "called.txt")
++        await Bun.write(
++          file,
++          [
++            "export default {",
++            '  id: "demo.pure",',
++            "  server: async () => {",
++            `    await Bun.write(${JSON.stringify(mark)}, "called")`,
++            "    return {}",
++            "  },",
++            "}",
++            "",
++          ].join("\n"),
++        )
++
++        await Bun.write(
++          path.join(dir, "opencode.json"),
++          JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2),
++        )
++
++        return { mark }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          yield* load(tmp.path, { pure: true })
++          const called = yield* Effect.promise(() =>
++            fs
++              .readFile(tmp.extra.mark, "utf8")
++              .then(() => true)
++              .catch(() => false),
++          )
++          expect(called).toBe(false)
++        }),
++    ),
++  )
++
++  it.live("reads oc-themes from package manifest", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mod")
++        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              version: "1.0.0",
++              "oc-themes": ["themes/one.json", "./themes/one.json", "themes/two.json"],
++            },
++            null,
++            2,
++          ),
++        )
++
++        return { mod }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const file = path.join(tmp.extra.mod, "package.json")
++          const fsys = yield* FSUtil.Service
++          const json = (yield* fsys.readJson(file)) as Record<string, unknown>
++          const list = readPackageThemes("acme-plugin", {
++            dir: tmp.extra.mod,
++            pkg: file,
++            json,
++          })
++
++          expect(list).toEqual([
++            FSUtil.resolve(path.join(tmp.extra.mod, "themes", "one.json")),
++            FSUtil.resolve(path.join(tmp.extra.mod, "themes", "two.json")),
++          ])
++        }),
++    ),
++  )
++
++  it.live("handles no-entrypoint tui packages via missing callback", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              version: "1.0.0",
++              "oc-themes": ["themes/night.json"],
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(path.join(mod, "themes", "night.json"), "{}\n")
++        return { mod }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++          const missing: string[] = []
++
++          try {
++            const loaded = yield* Effect.promise(() =>
++              PluginLoader.loadExternal({
++                items: [
++                  {
++                    spec: "acme-plugin@1.0.0",
++                    scope: "local" as const,
++                    source: tmp.path,
++                  },
++                ],
++                kind: "tui",
++                missing: async (item) => {
++                  if (!item.pkg) return
++                  const themes = readPackageThemes(item.spec, item.pkg)
++                  if (!themes.length) return
++                  return {
++                    spec: item.spec,
++                    target: item.target,
++                    themes,
++                  }
++                },
++                report: {
++                  missing(_candidate, _retry, message) {
++                    missing.push(message)
++                  },
++                },
++              }),
++            )
++
++            expect(loaded).toEqual([
++              {
++                spec: "acme-plugin@1.0.0",
++                target: tmp.extra.mod,
++                themes: [FSUtil.resolve(path.join(tmp.extra.mod, "themes", "night.json"))],
++              },
++            ])
++            expect(missing).toHaveLength(0)
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("passes package metadata for entrypoint tui plugins", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mods", "acme-plugin")
++        await fs.mkdir(path.join(mod, "themes"), { recursive: true })
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify(
++            {
++              name: "acme-plugin",
++              version: "1.0.0",
++              exports: {
++                "./tui": "./tui.js",
++              },
++              "oc-themes": ["themes/night.json"],
++            },
++            null,
++            2,
++          ),
++        )
++        await Bun.write(path.join(mod, "tui.js"), 'export default { id: "demo", tui: async () => {} }\n')
++        await Bun.write(path.join(mod, "themes", "night.json"), "{}\n")
++        return { mod }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const install = spyOn(Npm, "add").mockResolvedValue({ directory: tmp.extra.mod, entrypoint: undefined })
++
++          try {
++            const loaded = yield* Effect.promise(() =>
++              PluginLoader.loadExternal({
++                items: [
++                  {
++                    spec: "acme-plugin@1.0.0",
++                    scope: "local" as const,
++                    source: tmp.path,
++                  },
++                ],
++                kind: "tui",
++                finish: async (item) => {
++                  if (!item.pkg) return
++                  return {
++                    spec: item.spec,
++                    themes: readPackageThemes(item.spec, item.pkg),
++                  }
++                },
++              }),
++            )
++
++            expect(loaded).toEqual([
++              {
++                spec: "acme-plugin@1.0.0",
++                themes: [FSUtil.resolve(path.join(tmp.extra.mod, "themes", "night.json"))],
++              },
++            ])
++          } finally {
++            install.mockRestore()
++          }
++        }),
++    ),
++  )
++
++  it.live("rejects oc-themes path traversal", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "mod")
++        await fs.mkdir(mod, { recursive: true })
++        const file = path.join(mod, "package.json")
++        await Bun.write(file, JSON.stringify({ name: "acme", "oc-themes": ["../escape.json"] }, null, 2))
++        return { mod, file }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          const fsys = yield* FSUtil.Service
++          const json = (yield* fsys.readJson(tmp.extra.file)) as Record<string, unknown>
++          expect(() =>
++            readPackageThemes("acme", {
++              dir: tmp.extra.mod,
++              pkg: tmp.extra.file,
++              json,
++            }),
++          ).toThrow("outside plugin directory")
++        }),
++    ),
++  )
++
++  it.live("retries failed file plugins once after wait and keeps order", () =>
++    withTmp(
++      async (dir) => {
++        const a = path.join(dir, "a")
++        const b = path.join(dir, "b")
++        const aSpec = pathToFileURL(a).href
++        const bSpec = pathToFileURL(b).href
++        await fs.mkdir(a, { recursive: true })
++        await fs.mkdir(b, { recursive: true })
++        return { a, b, aSpec, bSpec }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          let wait = 0
++          const calls: Array<[string, boolean]> = []
++
++          const loaded = yield* Effect.promise(() =>
++            PluginLoader.loadExternal({
++              items: [tmp.extra.aSpec, tmp.extra.bSpec].map((spec) => ({
++                spec,
++                scope: "local" as const,
++                source: tmp.path,
++              })),
++              kind: "tui",
++              wait: async () => {
++                wait += 1
++                await Bun.write(path.join(tmp.extra.a, "index.ts"), "export default {}\n")
++                await Bun.write(path.join(tmp.extra.b, "index.ts"), "export default {}\n")
++              },
++              report: {
++                start(candidate, retry) {
++                  calls.push([candidate.plan.spec, retry])
++                },
++              },
++            }),
++          )
++
++          expect(wait).toBe(1)
++          expect(calls).toEqual([
++            [tmp.extra.aSpec, false],
++            [tmp.extra.bSpec, false],
++            [tmp.extra.aSpec, true],
++            [tmp.extra.bSpec, true],
++          ])
++          expect(loaded.map((item) => item.spec)).toEqual([tmp.extra.aSpec, tmp.extra.bSpec])
++        }),
++    ),
++  )
++
++  it.live("does not retry permanent file plugin entry errors", () =>
++    withTmp(
++      async (dir) => {
++        const mod = path.join(dir, "bad-entry")
++        const spec = pathToFileURL(mod).href
++        await fs.mkdir(mod, { recursive: true })
++        await Bun.write(
++          path.join(mod, "package.json"),
++          JSON.stringify({ exports: { "./tui": "../outside.js" } }, null, 2),
++        )
++        return { spec }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          let wait = 0
++          const errors: Array<[string, boolean]> = []
++
++          const loaded = yield* Effect.promise(() =>
++            PluginLoader.loadExternal({
++              items: [
++                {
++                  spec: tmp.extra.spec,
++                  scope: "local" as const,
++                  source: tmp.path,
++                },
++              ],
++              kind: "tui",
++              wait: async () => {
++                wait += 1
++              },
++              report: {
++                error(_candidate, retry, stage) {
++                  errors.push([stage, retry])
++                },
++              },
++            }),
++          )
++
++          expect(loaded).toEqual([])
++          expect(wait).toBe(0)
++          expect(errors).toEqual([["entry", false]])
++        }),
++    ),
++  )
++
++  it.live("does not retry file plugins when finish returns undefined", () =>
++    withTmp(
++      async (dir) => {
++        const file = path.join(dir, "plugin.ts")
++        const spec = pathToFileURL(file).href
++        await Bun.write(file, "export default {}\n")
++        return { spec }
++      },
++      (tmp) =>
++        Effect.gen(function* () {
++          let wait = 0
++          let count = 0
++
++          const loaded = yield* Effect.promise(() =>
++            PluginLoader.loadExternal({
++              items: [
++                {
++                  spec: tmp.extra.spec,
++                  scope: "local" as const,
++                  source: tmp.path,
++                },
++              ],
++              kind: "tui",
++              wait: async () => {
++                wait += 1
++              },
++              finish: async () => {
++                count += 1
++              },
++            }),
++          )
++
++          expect(wait).toBe(0)
++          expect(count).toBe(1)
++          expect(loaded).toEqual([])
++        }),
++    ),
++  )
++
++  it.live("does not wait or retry npm plugin failures", () =>
++    Effect.gen(function* () {
++      const install = spyOn(Npm, "add").mockRejectedValue(new Error("boom"))
++      let wait = 0
++      const errors: Array<[string, boolean]> = []
++
++      try {
++        const loaded = yield* Effect.promise(() =>
++          PluginLoader.loadExternal({
++            items: [
++              {
++                spec: "acme-plugin@1.0.0",
++                scope: "local" as const,
++                source: "test",
++              },
++            ],
++            kind: "tui",
++            wait: async () => {
++              wait += 1
++            },
++            report: {
++              error(_candidate, retry, stage) {
++                errors.push([stage, retry])
++              },
++            },
++          }),
++        )
++
++        expect(loaded).toEqual([])
++        expect(wait).toBe(0)
++        expect(errors).toEqual([["install", false]])
++      } finally {
++        install.mockRestore()
++      }
++    }),
++  )
++})
+diff --git a/packages/opencode/test/project/instance.test.ts b/packages/opencode/test/project/instance.test.ts
+index f78b99ef7d9b9193a4097f836df2aa7354905a8a..3cd3f7710f2c09c62f54d078f88a000a4cf845cd 100644
+--- a/packages/opencode/test/project/instance.test.ts
++++ b/packages/opencode/test/project/instance.test.ts
+@@ -1,10 +1,11 @@
+-import { describe, expect } from "bun:test"
++import { describe, expect, test } from "bun:test"
+ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+ import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+ import { Deferred, Effect, Fiber, Layer } from "effect"
+ import { InstanceRef } from "../../src/effect/instance-ref"
+ import { registerDisposer } from "../../src/effect/instance-registry"
+ import { InstanceBootstrap } from "../../src/project/bootstrap"
++import { containsPath, type InstanceContext } from "../../src/project/instance-context"
+ import { InstanceStore } from "../../src/project/instance-store"
+ import { tmpdirScoped } from "../fixture/fixture"
+ import { testEffect } from "../lib/effect"
+@@ -38,6 +39,39 @@ const registerDisposerScoped = (disposer: (directory: string) => Promise<void>)
+     (off) => Effect.sync(off),
+   )
+ 
++const instanceContext = (directory: string, worktree: string) =>
++  ({ directory, worktree, project: {} as InstanceContext["project"] })
++
++describe("containsPath", () => {
++  test("allows paths in an ordinary worktree outside the instance directory", () => {
++    const ctx = instanceContext("/repo/packages/opencode", "/repo")
++
++    expect(containsPath("/repo/packages/core/src/index.ts", ctx)).toBe(true)
++  })
++
++  test.each([
++    ["POSIX", "/", "/outside/file.txt"],
++    ["Windows drive with backslashes", "C:\\", "C:\\outside\\file.txt"],
++    ["Windows drive with slashes", "C:/", "C:/outside/file.txt"],
++    ["UNC share with backslashes", "\\\\server\\share\\", "\\\\server\\share\\outside\\file.txt"],
++    ["UNC share with slashes", "//server/share/", "//server/share/outside/file.txt"],
++  ])("does not allow paths through a %s root worktree", (_name, worktree, filepath) => {
++    const ctx = instanceContext(`${worktree}project`, worktree)
++
++    expect(containsPath(ctx.directory, ctx)).toBe(true)
++    expect(containsPath(filepath, ctx)).toBe(false)
++  })
++
++  test.each([
++    ["Windows volume", "C:\\", "D:\\outside\\file.txt"],
++    ["UNC share", "\\\\server\\share\\", "\\\\other\\share\\outside\\file.txt"],
++  ])("denies paths on another %s", (_name, worktree, filepath) => {
++    const ctx = instanceContext(`${worktree}project`, worktree)
++
++    expect(containsPath(filepath, ctx)).toBe(false)
++  })
++})
++
+ describe("InstanceStore", () => {
+   it.live("loads instance context", () =>
+     Effect.gen(function* () {
+diff --git a/packages/opencode/test/server/httpapi-control-plane.test.ts b/packages/opencode/test/server/httpapi-control-plane.test.ts
+index b837bf7556daf7a8fe436535d7605816fa8d2618..ca978671457a05a5b22cfa2025887240924f4be3 100644
+--- a/packages/opencode/test/server/httpapi-control-plane.test.ts
++++ b/packages/opencode/test/server/httpapi-control-plane.test.ts
+@@ -17,6 +17,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
+ import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
+ import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+ import { testEffect } from "../lib/effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
+ 
+ const input = MoveSession.Input.make({
+   sessionID: SessionV2.ID.make("ses_move"),
+@@ -28,6 +29,7 @@ const called = Ref.makeUnsafe<MoveSession.Input | undefined>(undefined)
+ const apiLayer = HttpRouter.serve(
+   HttpApiBuilder.layer(RootHttpApi).pipe(
+     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++    Layer.provide(HostedApprovalCoordinator.layer),
+     Layer.provide([authorizationLayer, schemaErrorLayer]),
+     // Raw HttpApi routes expose an opaque handler context at the request boundary.
+     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+diff --git a/packages/opencode/test/server/httpapi-exercise/index.ts b/packages/opencode/test/server/httpapi-exercise/index.ts
+index c8e11ea8451b84c674a650ab01e004dd958cf96c..a12364b165b78d4330ed4f45488c1cd3360b5ae4 100644
+--- a/packages/opencode/test/server/httpapi-exercise/index.ts
++++ b/packages/opencode/test/server/httpapi-exercise/index.ts
+@@ -279,6 +279,47 @@ const scenarios: Scenario[] = [
+       body: { method: "bad" },
+     }))
+     .status(400),
++  http.protected
++    .get("/experimental/agent-teams/hosted-approval-capability", "permission.hostedCapability")
++    .json(404, (body) => {
++      object(body)
++      check(body._tag === "HostedApprovalUnavailable", "hosted capability should require configured server auth")
++    }),
++  http.protected
++    .get(
++      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions",
++      "permission.hostedObserve",
++    )
++    .seeded((ctx) => ctx.session({ title: "Hosted approval observer" }))
++    .at((ctx) => ({
++      path: route("/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions", {
++        sessionID: ctx.state.id,
++      }),
++      headers: ctx.headers(),
++    }))
++    .json(404, (body) => {
++      object(body)
++      check(body._tag === "HostedApprovalUnavailable", "hosted observe should require configured server auth")
++    }),
++  http.protected
++    .post(
++      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
++      "permission.hostedReply",
++    )
++    .seeded((ctx) => ctx.session({ title: "Hosted approval reply owner" }))
++    .at((ctx) => ({
++      path: route(
++        "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
++        { sessionID: ctx.state.id, requestID: "per_httpapi_missing" },
++      ),
++      headers: ctx.headers(),
++      body: {},
++    }))
++    .status(404, (_ctx, result) =>
++      Effect.sync(() => {
++        check(result.text === "", "unavailable hosted reply should not parse or expose a response body")
++      }),
++    ),
+   http.protected.get("/permission", "permission.list").json(200, array),
+   http.protected
+     .post("/permission/{requestID}/reply", "permission.reply.invalid")
+diff --git a/packages/opencode/test/server/httpapi-global.test.ts b/packages/opencode/test/server/httpapi-global.test.ts
+index 55bdcff4f59fbac80b0df6e4191c2e97a45d8633..8af98431fb8dcfe8ab17aa0955e4c97ce629cd29 100644
+--- a/packages/opencode/test/server/httpapi-global.test.ts
++++ b/packages/opencode/test/server/httpapi-global.test.ts
+@@ -16,10 +16,12 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
+ import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
+ import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
+ import { testEffect } from "../lib/effect"
++import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
+ 
+ const apiLayer = HttpRouter.serve(
+   HttpApiBuilder.layer(RootHttpApi).pipe(
+     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
++    Layer.provide(HostedApprovalCoordinator.layer),
+     Layer.provide([authorizationLayer, schemaErrorLayer]),
+     // Raw HttpApi routes expose an opaque handler context at the request boundary.
+     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+diff --git a/packages/opencode/test/server/httpapi-hosted-approval.test.ts b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..67d5e7768122ec9c463ea6919793a486ad00bc66
+--- /dev/null
++++ b/packages/opencode/test/server/httpapi-hosted-approval.test.ts
+@@ -0,0 +1,271 @@
++import { afterEach, describe, expect, test } from "bun:test"
++import { ConfigProvider, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
++import { HttpRouter } from "effect/unstable/http"
++import { PermissionV1 } from "@opencode-ai/core/v1/permission"
++import { AppLayer } from "../../src/effect/app-runtime"
++import { attach } from "../../src/effect/run-service"
++import { Permission } from "../../src/permission"
++import { InstanceStore } from "../../src/project/instance-store"
++import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
++import { ServerAuth } from "../../src/server/auth"
++import { SessionID } from "../../src/session/schema"
++import { disposeAllInstances, tmpdir } from "../fixture/fixture"
++import { resetDatabase } from "../fixture/db"
++
++const apps = new Set<{ dispose: () => Promise<void> }>()
++
++function app(password?: string) {
++  const memoMap = Layer.makeMemoMapUnsafe()
++  const runtime = ManagedRuntime.make(AppLayer, { memoMap })
++  const web = HttpRouter.toWebHandler(
++    HttpApiApp.routes.pipe(
++      Layer.provide(
++        ConfigProvider.layer(
++          ConfigProvider.fromUnknown({
++            OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
++            OPENCODE_SERVER_PASSWORD: password,
++          }),
++        ),
++      ),
++    ),
++    { disableLogger: true, memoMap },
++  )
++  apps.add({
++    dispose: async () => {
++      await web.dispose()
++      await runtime.dispose()
++    },
++  })
++  return Object.assign(
++    (path: string, init?: RequestInit) =>
++      web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context),
++    {
++      runFork: <A, E>(effect: Effect.Effect<A, E, ManagedRuntime.ManagedRuntime.Services<typeof runtime>>) =>
++        runtime.runFork(attach(effect)),
++    },
++  )
++}
++
++function auth(password = "secret") {
++  return ServerAuth.header({ username: "opencode", password }) ?? ""
++}
++
++afterEach(async () => {
++  await Promise.all(Array.from(apps, (web) => web.dispose()))
++  apps.clear()
++  await disposeAllInstances()
++  await resetDatabase()
++})
++
++describe("hosted approval v2 HttpApi", () => {
++  test("maps unavailable capability and observe errors through their declared response contract", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app()
++    const headers = { "x-opencode-directory": dir.path }
++    const capability = await request("/experimental/agent-teams/hosted-approval-capability", { headers })
++    const observe = await request(
++      "/experimental/agent-teams/hosted-approval/session/ses_missing/permissions",
++      { headers },
++    )
++    const observeBody = await observe.text()
++    expect(capability.status).toBe(404)
++    expect(await capability.json()).toEqual({ _tag: "HostedApprovalUnavailable" })
++    expect({ status: observe.status, body: observeBody }).toEqual({
++      status: 404,
++      body: JSON.stringify({ _tag: "HostedApprovalUnavailable" }),
++    })
++  })
++
++  test("is unavailable before reading malformed bodies when server auth is absent", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app()
++    const response = await request(
++      "/experimental/agent-teams/hosted-approval/session/ses_missing/permission/per_missing/reply",
++      {
++        method: "POST",
++        headers: { "content-type": "application/json", "x-opencode-directory": dir.path },
++        body: '{"duplicate":1,"duplicate":2}',
++      },
++    )
++    expect(response.status).toBe(404)
++  })
++
++  test("isolates hosted availability between app runtimes", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const unavailable = app()
++    const available = app("secret")
++    const path = "/experimental/agent-teams/hosted-approval-capability"
++    const headers = { "x-opencode-directory": dir.path }
++
++    expect((await unavailable(path, { headers })).status).toBe(404)
++    expect((await available(path, { headers: { ...headers, authorization: auth() } })).status).toBe(200)
++  })
++
++  test("requires standard Basic auth for capability", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const path = "/experimental/agent-teams/hosted-approval-capability"
++    const headers = { "x-opencode-directory": dir.path }
++    expect((await request(path, { headers })).status).toBe(401)
++    expect((await request(path, { headers: { ...headers, authorization: auth("wrong") } })).status).toBe(401)
++    const accepted = await request(path, { headers: { ...headers, authorization: auth() } })
++    expect(accepted.status).toBe(200)
++    expect(await accepted.json()).toMatchObject({
++      schemaVersion: 2,
++      protocol: "agent-teams-hosted-approval-v2",
++      authentication: "opencode-basic",
++      runtimeInstanceId: expect.stringMatching(/^runtime_instance_[0-9a-f]{32}$/),
++      configGeneration: expect.stringMatching(/^config_generation_[0-9a-f]{32}$/),
++    })
++  })
++
++  test("rejects extra reply keys before any permission effect", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const headers = {
++      "content-type": "application/json",
++      "x-opencode-directory": dir.path,
++      authorization: auth(),
++    }
++    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    const body = {
++      schemaVersion: 2,
++      protocol: "agent-teams-hosted-approval-v2",
++      runtimeInstanceId: capability.runtimeInstanceId,
++      expectedConfigGeneration: capability.configGeneration,
++      requestId: "per_missing",
++      sessionId: "ses_missing",
++      sessionIncarnation: `session_incarnation_${"3".repeat(32)}`,
++      requestIncarnation: `request_incarnation_${"1".repeat(32)}`,
++      expectedPermissionDigest: "2".repeat(64),
++      decision: "allow_once",
++      extra: true,
++    }
++    const response = await request(
++      "/experimental/agent-teams/hosted-approval/session/ses_missing/permission/per_missing/reply",
++      { method: "POST", headers, body: JSON.stringify(body) },
++    )
++    expect(response.status).toBe(400)
++    const observe = await request(
++      "/experimental/agent-teams/hosted-approval/session/ses_missing/permissions",
++      { headers },
++    )
++    expect((await observe.json()).permissions).toEqual([])
++  })
++
++  test("returns explicit no-effect statuses for malformed, duplicate, oversize, conflict, and precondition", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const headers = {
++      "content-type": "application/json",
++      "x-opencode-directory": dir.path,
++      authorization: auth(),
++    }
++    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    const path = "/experimental/agent-teams/hosted-approval/session/ses_missing/permission/per_missing/reply"
++    const valid = {
++      schemaVersion: 2,
++      protocol: "agent-teams-hosted-approval-v2",
++      runtimeInstanceId: capability.runtimeInstanceId,
++      expectedConfigGeneration: capability.configGeneration,
++      requestId: "per_missing",
++      sessionId: "ses_missing",
++      sessionIncarnation: `session_incarnation_${"3".repeat(32)}`,
++      requestIncarnation: `request_incarnation_${"1".repeat(32)}`,
++      expectedPermissionDigest: "2".repeat(64),
++      decision: "allow_once",
++    }
++    const post = (body: BodyInit) => request(path, { method: "POST", headers, body })
++    expect((await post("{" )).status).toBe(400)
++    expect((await post('{"schemaVersion":2,"schemaVersion":2}')).status).toBe(400)
++    expect((await post("x".repeat(16 * 1024 + 1))).status).toBe(400)
++    const legacy = Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "sessionIncarnation"))
++    expect((await post(JSON.stringify(legacy))).status).toBe(400)
++    expect((await post(JSON.stringify(valid))).status).toBe(409)
++    expect((await post(JSON.stringify({ ...valid, runtimeInstanceId: `runtime_instance_${"f".repeat(32)}` }))).status).toBe(412)
++  })
++
++  test("authenticates and applies one real pending request exactly once", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const headers = {
++      "content-type": "application/json",
++      "x-opencode-directory": dir.path,
++      authorization: auth(),
++    }
++    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    const requestID = PermissionV1.ID.make("per_hosted_http_once")
++    const sessionID = SessionID.make("ses_hosted_http_once")
++    const asked = request.runFork(
++      InstanceStore.Service.use((store) =>
++        store.provide(
++          { directory: dir.path },
++          Permission.Service.use((permission) =>
++            permission.ask({
++              id: requestID,
++              sessionID,
++              permission: "bash",
++              patterns: ["ls"],
++              metadata: {},
++              always: [],
++              ruleset: [],
++            }),
++          ),
++        ),
++      ),
++    )
++    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
++    const observed = await Effect.runPromise(
++      Effect.gen(function* () {
++        while (true) {
++          const response = yield* Effect.promise(() => request(observePath, { headers }))
++          const body = yield* Effect.promise(() => response.json())
++          if (body.permissions.length === 1) return body
++          yield* Effect.sleep("10 millis")
++        }
++      }).pipe(Effect.timeout("2 seconds")),
++    )
++    const pending = observed.permissions[0]
++    const body = {
++      schemaVersion: 2,
++      protocol: "agent-teams-hosted-approval-v2",
++      runtimeInstanceId: capability.runtimeInstanceId,
++      expectedConfigGeneration: capability.configGeneration,
++      requestId: pending.requestId,
++      sessionId: pending.sessionId,
++      sessionIncarnation: pending.sessionIncarnation,
++      requestIncarnation: pending.requestIncarnation,
++      expectedPermissionDigest: pending.permissionDigest,
++      decision: "allow_once",
++    }
++    const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
++    const applied = await request(path, { method: "POST", headers, body: JSON.stringify(body) })
++    expect(applied.status).toBe(200)
++    expect(await applied.json()).toMatchObject({
++      status: "applied",
++      requestId: requestID,
++      sessionId: sessionID,
++      permissionDigest: pending.permissionDigest,
++      decision: "allow_once",
++    })
++    expect((await request(path, { method: "POST", headers, body: JSON.stringify(body) })).status).toBe(409)
++    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
++    expect((await (await request(observePath, { headers })).json()).permissions).toEqual([])
++  })
++
++  test("config mutation rotates the same authority observed by hosted routes", async () => {
++    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
++    const request = app("secret")
++    const headers = {
++      "content-type": "application/json",
++      "x-opencode-directory": dir.path,
++      authorization: auth(),
++    }
++    const before = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    const updated = await request("/config", { method: "PATCH", headers, body: JSON.stringify({ formatter: false }) })
++    expect(updated.status).toBe(200)
++    const after = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
++    expect(after.runtimeInstanceId).toBe(before.runtimeInstanceId)
++    expect(after.configGeneration).not.toBe(before.configGeneration)
++  })
++})

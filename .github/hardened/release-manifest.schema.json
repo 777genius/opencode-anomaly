@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/777genius/opencode-anomaly/blob/dev/.github/hardened/release-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "release", "workflow", "assets"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "release": {
+      "type": "object",
+      "required": [
+        "sourceCommit",
+        "sourceTree",
+        "packagesTree",
+        "artifactTree",
+        "baseCommit",
+        "patchSha256",
+        "patchSize",
+        "version",
+        "tag",
+        "bunVersion",
+        "productionEligible"
+      ],
+      "properties": {
+        "sourceCommit": { "const": "0aab19b8295feb99f9c45c403e2cd46dbddc4b7b" },
+        "sourceTree": { "const": "da53426fec5bc794626a389e512e0c8abbef00ff" },
+        "packagesTree": { "const": "7c7567243a25d53cd911be507a9c0499344ca963" },
+        "artifactTree": { "const": "dc39bb88fc45702e305e9deb09d0ab5e4d892289" },
+        "baseCommit": { "const": "ef2880f379129aa048be9e9353e30aa168d42c17" },
+        "patchSha256": { "const": "451990f173b1b8f47a0aa4fc3ac8c414b6df6474c97f6ea2db17a29489e71af7" },
+        "patchSize": { "const": 194044 },
+        "version": { "const": "1.18.23-agentteams.1" },
+        "tag": { "const": "v1.18.23-agentteams.1" },
+        "bunVersion": { "const": "1.4.0" },
+        "productionEligible": { "const": false }
+      },
+      "additionalProperties": false
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "workflow", "runId", "runAttempt", "actor", "ref", "sha"],
+      "properties": {
+        "repository": { "type": "string" },
+        "workflow": { "type": "string" },
+        "runId": { "type": "string" },
+        "runAttempt": { "type": "string" },
+        "actor": { "type": "string" },
+        "ref": { "type": "string" },
+        "sha": { "type": "string" }
+      }
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "archive": {
+            "enum": [
+              "opencode-linux-x64.tar.gz",
+              "opencode-linux-arm64.tar.gz",
+              "opencode-darwin-x64.zip",
+              "opencode-darwin-arm64.zip",
+              "opencode-windows-x64.zip"
+            ]
+          },
+          "archiveSha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "archiveSize": { "type": "integer", "exclusiveMinimum": 0 },
+          "binaryPath": { "enum": ["opencode", "opencode.exe"] },
+          "binarySha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "binarySize": { "type": "integer", "exclusiveMinimum": 0 },
+          "platform": {
+            "enum": [
+              "opencode-linux-x64",
+              "opencode-linux-arm64",
+              "opencode-darwin-x64",
+              "opencode-darwin-arm64",
+              "opencode-windows-x64"
+            ]
+          },
+          "os": { "enum": ["linux", "darwin", "windows"] },
+          "arch": { "enum": ["x64", "arm64"] },
+          "signing": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["binaryStatus", "reason", "provenanceAction", "provenanceStatus"],
+            "properties": {
+              "binaryStatus": { "const": "unsigned" },
+              "reason": { "const": "non-production fork prerelease" },
+              "provenanceAction": {
+                "const": "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8"
+              },
+              "provenanceStatus": { "const": "required-after-manifest" }
+            }
+          }
+        },
+        "required": [
+          "archive",
+          "archiveSha256",
+          "archiveSize",
+          "binaryPath",
+          "binarySha256",
+          "binarySize",
+          "platform",
+          "os",
+          "arch",
+          "signing"
+        ]
+      }
+    }
+  }
+}

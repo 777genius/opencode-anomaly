@@ -3,8 +3,9 @@ import { Effect } from "effect"
 import fs from "fs/promises"
 import path from "path"
 import { pathToFileURL } from "url"
-import { tmpdir } from "../fixture/fixture"
+import { prepareTestDependencies, tmpdir } from "../fixture/fixture"
 import { Filesystem } from "../../src/util"
+import { Global } from "../../src/global"
 
 const disableDefault = process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS
 process.env.OPENCODE_DISABLE_DEFAULT_PLUGINS = "1"
@@ -14,6 +15,8 @@ const { PluginLoader } = await import("../../src/plugin/loader")
 const { readPackageThemes } = await import("../../src/plugin/shared")
 const { Instance } = await import("../../src/project/instance")
 const { Npm } = await import("../../src/npm")
+
+await prepareTestDependencies(Global.Path.config)
 
 afterAll(() => {
   if (disableDefault === undefined) {

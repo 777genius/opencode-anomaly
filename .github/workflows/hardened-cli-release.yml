@@ -1,0 +1,309 @@
+name: hardened CLI prerelease
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/hardened-cli-release.yml
+      - .github/scripts/hardened-artifacts.ts
+      - .github/scripts/hardened-artifacts.test.ts
+      - .github/hardened/**
+
+concurrency:
+  group: hardened-cli-v1.18.23-agentteams.1
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_COMMIT: 0aab19b8295feb99f9c45c403e2cd46dbddc4b7b
+  BASE_COMMIT: ef2880f379129aa048be9e9353e30aa168d42c17
+  VERSION: 1.18.23-agentteams.1
+  TAG: v1.18.23-agentteams.1
+  BUN_VERSION: 1.4.0
+  PATCH: .github/hardened/opencode-hosted-approval-v2-r4.patch
+
+jobs:
+  identity:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: infra
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - name: Verify immutable source, parent, patch, and resulting tree
+        run: bun infra/.github/scripts/hardened-artifacts.ts identity --repo source --patch "infra/$PATCH"
+      - name: Run hardened release contract tests
+        run: bun test --config /dev/null ./.github/scripts/hardened-artifacts.test.ts
+        working-directory: infra
+
+  build:
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        pass: [one, two]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: infra
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.BASE_COMMIT }}
+          path: source
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: test "$(bun --version)" = "$BUN_VERSION"
+      - name: Materialize exact accepted source change
+        run: bun infra/.github/scripts/hardened-artifacts.ts materialize --repo source --patch "infra/$PATCH"
+      - run: bun install --frozen-lockfile
+        working-directory: source
+      - name: Clean build
+        working-directory: source/packages/opencode
+        env:
+          OPENCODE_VERSION: ${{ env.VERSION }}
+          OPENCODE_RELEASE: ""
+        run: bun script/build.ts
+      - name: Create deterministic archives
+        run: bun infra/.github/scripts/hardened-artifacts.ts archive --dist source/packages/opencode/dist --output hardened-assets
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-build-${{ matrix.pass }}
+          path: hardened-assets
+          if-no-files-found: error
+          retention-days: 1
+
+  reproducible:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-build-one
+          path: build-one
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-build-two
+          path: build-two
+      - run: bun .github/scripts/hardened-artifacts.ts compare --left build-one --right build-two
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: reproducible-assets
+          path: build-one
+          if-no-files-found: error
+          retention-days: 1
+
+  native-verify:
+    needs: reproducible
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: opencode-linux-x64.tar.gz
+          - runner: ubuntu-24.04-arm
+            asset: opencode-linux-arm64.tar.gz
+          - runner: macos-15-intel
+            asset: opencode-darwin-x64.zip
+          - runner: macos-14
+            asset: opencode-darwin-arm64.zip
+          - runner: windows-2025
+            asset: opencode-windows-x64.zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reproducible-assets
+          path: assets
+      - run: bun .github/scripts/hardened-artifacts.ts verify --archive "assets/${{ matrix.asset }}"
+
+  manifest:
+    needs: native-verify
+    runs-on: ubuntu-24.04
+    outputs:
+      candidate-artifact-id: ${{ steps.candidate.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: reproducible-assets
+          path: release
+      - run: bun .github/scripts/hardened-artifacts.ts manifest --assets release --patch "$PATCH" --schema .github/hardened/release-manifest.schema.json --output release/release-manifest.json
+      - run: bun .github/scripts/hardened-artifacts.ts validate-manifest --manifest release/release-manifest.json --schema .github/hardened/release-manifest.schema.json
+      - id: candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-release-candidate
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  pull-request-provenance:
+    needs: manifest
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Reject non-same-repository pull request heads
+        env:
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: test "$HEAD_REPOSITORY" = "$GITHUB_REPOSITORY"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ needs.manifest.outputs.candidate-artifact-id }}
+          path: candidate
+          merge-multiple: true
+      - name: Verify exact candidate files and manifest digests
+        run: |
+          assets=(
+            opencode-linux-x64.tar.gz
+            opencode-linux-arm64.tar.gz
+            opencode-darwin-x64.zip
+            opencode-darwin-arm64.zip
+            opencode-windows-x64.zip
+          )
+          test "$(find candidate -mindepth 1 -maxdepth 1 -printf x | wc -c | tr -d ' ')" = 6
+          test -f candidate/release-manifest.json
+          test "$(jq '.assets | length' candidate/release-manifest.json)" = "${#assets[@]}"
+          for asset in "${assets[@]}"; do
+            test -f "candidate/$asset"
+            digest="$(jq -er --arg asset "$asset" '
+              [.assets[] | select(.archive == $asset) | .archiveSha256]
+              | select(length == 1)
+              | .[0]
+              | select(test("^[0-9a-f]{64}$"))
+            ' candidate/release-manifest.json)"
+            printf '%s  %s\n' "$digest" "candidate/$asset" | sha256sum --check --strict -
+          done
+      - id: provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            candidate/opencode-linux-x64.tar.gz
+            candidate/opencode-linux-arm64.tar.gz
+            candidate/opencode-darwin-x64.zip
+            candidate/opencode-darwin-arm64.zip
+            candidate/opencode-windows-x64.zip
+            candidate/release-manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardened-release-provenance
+          path: ${{ steps.provenance.outputs.bundle-path }}
+          if-no-files-found: error
+          retention-days: 7
+
+  hardened-release:
+    needs: manifest
+    if: github.event_name == 'workflow_dispatch' && github.repository == '777genius/opencode-anomaly'
+    runs-on: ubuntu-24.04
+    environment: hardened-release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_COMMIT }}
+          path: source
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: hardened-release-candidate
+          path: release
+      - name: Verify live hardened-release environment protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/hardened-release"
+          environment="$(mktemp)"
+          policies="$(mktemp)"
+          gh api "repos/$GITHUB_REPOSITORY/environments/hardened-release" >"$environment"
+          jq -e '
+            [.protection_rules[]? | select(.type == "required_reviewers")] as $review_rules
+            | ($review_rules | length) >= 1
+            and ([$review_rules[].reviewers[]?] | length) >= 1
+            and all($review_rules[]; has("prevent_self_review") and .prevent_self_review == true)
+            and .can_admins_bypass == false
+            and .deployment_branch_policy.protected_branches == false
+            and .deployment_branch_policy.custom_branch_policies == true
+          ' "$environment"
+          gh api "repos/$GITHUB_REPOSITORY/environments/hardened-release/deployment-branch-policies" >"$policies"
+          jq -e '
+            .total_count == 1
+            and (.branch_policies | length) == 1
+            and .branch_policies[0].name == "hardened-release"
+            and .branch_policies[0].type == "branch"
+          ' "$policies"
+      - name: Refuse an existing release and validate candidate assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_COMMIT"
+          require_absent() {
+            response="$(mktemp)"
+            if gh api --include "$1" >"$response" 2>&1; then
+              cat "$response"
+              return 1
+            fi
+            if ! grep -Eq '^HTTP/[0-9.]+ 404' "$response"; then
+              cat "$response"
+              return 1
+            fi
+          }
+          require_absent "repos/$GITHUB_REPOSITORY/releases/tags/$TAG"
+          test "$(find release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
+      - name: Atomically own exact-source tag and create draft prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          created_ref="$(mktemp)"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" \
+            -f sha="$SOURCE_COMMIT" >"$created_ref"
+          test "$(jq -r .ref "$created_ref")" = "refs/tags/$TAG"
+          test "$(jq -r .object.type "$created_ref")" = "commit"
+          test "$(jq -r .object.sha "$created_ref")" = "$SOURCE_COMMIT"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$SOURCE_COMMIT"
+          gh release create "$TAG" release/* --verify-tag --draft --prerelease --title "$TAG" --notes "Hardened non-production prerelease. productionEligible=false."
