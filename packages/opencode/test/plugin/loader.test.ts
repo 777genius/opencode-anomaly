@@ -39,8 +39,8 @@ async function load(dir: string) {
 }
 
 describe("plugin.loader.shared", () => {
-  // Bun 1.4.0's first Windows file:// TypeScript transpile exceeded 30 seconds; the run was warm by 46.
-  // Keep the normal deadline everywhere else while still bounding that upstream cold start.
+  // Bun 1.4.0's first Windows file:// TypeScript transpile exceeded 60 seconds with an isolated cache.
+  // Keep the normal deadline everywhere else while bounding that upstream cold start to two minutes.
   test("loads a file:// plugin function export", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
@@ -68,7 +68,7 @@ describe("plugin.loader.shared", () => {
 
     await load(tmp.path)
     expect(await fs.readFile(tmp.extra.mark, "utf8")).toBe("called")
-  }, process.platform === "win32" ? 60_000 : 30_000)
+  }, process.platform === "win32" ? 120_000 : 30_000)
 
   test("deduplicates same function exported as default and named", async () => {
     await using tmp = await tmpdir({
