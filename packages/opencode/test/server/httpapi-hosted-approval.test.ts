@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
+import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppLayer } from "../../src/effect/app-runtime"
@@ -583,8 +583,15 @@ describe("hosted approval v2 HttpApi", () => {
     if (boundary === "abort") controller.abort()
     Deferred.doneUnsafe(release, Effect.void)
     await Promise.all([response, shutdown])
-    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    const askedExit = await Effect.runPromise(Fiber.await(asked))
+    if (boundary === "abort") expect(Exit.isSuccess(askedExit)).toBe(true)
+    if (boundary === "shutdown") {
+      // Runtime disposal may interrupt this consumer after Permission has already settled its Deferred.
+      const interrupted = Exit.isFailure(askedExit) && Cause.interruptors(askedExit.cause).size > 0
+      expect(Exit.isSuccess(askedExit) || interrupted).toBe(true)
+    }
     const effect = captured.records.find((item) => item.record.recordType === "conditional-reply-effect")!.record
+    expect(captured.records.filter((item) => item.record.operationNonce === effect.operationNonce && item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
     expect(captured.records.filter((item) => item.record.operationNonce === effect.operationNonce && item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
     expect(captured.records.filter((item) => item.record.operationNonce === effect.operationNonce && item.record.recordType === "hosted-reply")).toHaveLength(1)
     captured.producer.assertHealthy()
@@ -702,7 +709,7 @@ describe("hosted approval v2 HttpApi", () => {
     expect(second).not.toBe(409)
     expect(retry).not.toBe(409)
     expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
-    expect((await Effect.runPromise(Fiber.poll(askedB)))._tag).toBe("None")
+    expect(askedB.pollUnsafe()).toBeUndefined()
     const remaining = await Effect.runPromise(Fiber.join(request.runFork(
       InstanceStore.Service.use((store) => store.provide(
         { directory: dir.path },
@@ -712,6 +719,8 @@ describe("hosted approval v2 HttpApi", () => {
     expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
     expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
     expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(0)
+    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(0)
+    expect(() => captured.producer.assertHealthy()).toThrow("producer-provenance-fatal")
     await Effect.runPromise(Fiber.interrupt(listener))
   })
 
