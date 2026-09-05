@@ -144,6 +144,20 @@ function auth(password = "secret") {
   return ServerAuth.header({ username: "opencode", password }) ?? ""
 }
 
+function observe<A>(promise: Promise<A>) {
+  return promise.then(
+    (value) => ({ _tag: "success" as const, value }),
+    (error: unknown) => ({ _tag: "failure" as const, error }),
+  )
+}
+
+function bounded<A>(promise: Promise<A>, label: string) {
+  return Promise.race([
+    promise,
+    Bun.sleep(2_000).then(() => Promise.reject(new Error(`timed out waiting for ${label}`))),
+  ])
+}
+
 afterEach(async () => {
   await Promise.all(Array.from(apps, (web) => web.dispose()))
   apps.clear()
@@ -669,51 +683,98 @@ describe("hosted approval v2 HttpApi", () => {
       Deferred.doneUnsafe(registered, Effect.void)
       yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
     }))
-    await Effect.runPromise(Deferred.await(registered))
-    const firstResponse = request(path(requestID), {
+    await Effect.runPromise(Deferred.await(registered).pipe(Effect.timeout("2 seconds")))
+    const firstResponse = observe(request(path(requestID), {
       method: "POST",
       headers,
       body: bodyFor(pending.get(requestID)!),
-    })
-    await Effect.runPromise(Deferred.await(published))
-    const bodyRead = Promise.withResolvers<void>()
+    }))
     const controller = new AbortController()
-    const secondResponse = request(path(requestIDB), {
-      method: "POST",
-      headers,
-      signal: controller.signal,
-      body: new ReadableStream({
-        pull(stream) {
-          stream.enqueue(new TextEncoder().encode(bodyFor(pending.get(requestIDB)!)))
-          stream.close()
-          bodyRead.resolve()
-        },
-      }),
-      duplex: "half",
-    } as RequestInit).then((response) => response.status, () => 0)
-    await bodyRead.promise
-    while (captured && captured.nonces() < 4) await Promise.resolve()
-    for (let index = 0; index < 10; index++) await Promise.resolve()
-    controller.abort()
-    Deferred.doneUnsafe(release, Effect.void)
-    expect((await firstResponse).status).toBe(200)
-    expect(await secondResponse).not.toBe(200)
-    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
-    expect(askedB.pollUnsafe()).toBeUndefined()
-    const remaining = await Effect.runPromise(Fiber.join(request.runFork(
-      InstanceStore.Service.use((store) => store.provide(
-        { directory: dir.path },
-        Permission.Service.use((permission) => permission.hostedList()),
-      )),
-    )))
-    expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
-    if (captured) {
-      expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
-      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
-      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(1)
-      captured.producer.assertHealthy()
+    try {
+      const publication = await Promise.race([
+        Effect.runPromise(Deferred.await(published)).then(() => ({ _tag: "published" as const })),
+        firstResponse.then((result) => ({ _tag: "response" as const, result })),
+        Bun.sleep(2_000).then(() => ({ _tag: "timeout" as const })),
+      ])
+      if (publication._tag === "response" && publication.result._tag === "failure") throw publication.result.error
+      expect(publication._tag).toBe("published")
+
+      const nonceBeforeB = captured?.nonces()
+      const bodyRead = Promise.withResolvers<void>()
+      const secondResponse = observe(request(path(requestIDB), {
+        method: "POST",
+        headers,
+        signal: controller.signal,
+        body: new ReadableStream({
+          pull(stream) {
+            stream.enqueue(new TextEncoder().encode(bodyFor(pending.get(requestIDB)!)))
+            stream.close()
+            bodyRead.resolve()
+          },
+        }),
+        duplex: "half",
+      } as RequestInit))
+      try {
+        const body = await Promise.race([
+          bodyRead.promise.then(() => ({ _tag: "read" as const })),
+          secondResponse.then((result) => ({ _tag: "response" as const, result })),
+          Bun.sleep(2_000).then(() => ({ _tag: "timeout" as const })),
+        ])
+        if (body._tag === "response" && body.result._tag === "failure") throw body.result.error
+        expect(body._tag).toBe("read")
+
+        if (captured) {
+          const deadline = Date.now() + 2_000
+          while (captured.nonces() === nonceBeforeB && Date.now() < deadline) {
+            const stage = await Promise.race([
+              secondResponse.then((result) => ({ _tag: "response" as const, result })),
+              Bun.sleep(10).then(() => ({ _tag: "waiting" as const })),
+            ])
+            if (stage._tag === "response" && stage.result._tag === "failure") throw stage.result.error
+            expect(stage._tag).toBe("waiting")
+          }
+          expect(captured.nonces()).not.toBe(nonceBeforeB)
+        }
+
+        // The public API has no queue-entry receipt, so require B to remain live across a timer turn.
+        const waiting = await Promise.race([
+          secondResponse.then((result) => ({ _tag: "response" as const, result })),
+          Bun.sleep(500).then(() => ({ _tag: "waiting" as const })),
+        ])
+        if (waiting._tag === "response" && waiting.result._tag === "failure") throw waiting.result.error
+        expect(waiting._tag).toBe("waiting")
+        controller.abort()
+      } finally {
+        Deferred.doneUnsafe(release, Effect.void)
+        if (!controller.signal.aborted) controller.abort()
+      }
+
+      const first = await bounded(firstResponse, "A response after publication release")
+      if (first._tag === "failure") throw first.error
+      const second = await bounded(secondResponse, "aborted B response")
+      if (second._tag === "failure") expect(controller.signal.aborted).toBe(true)
+      expect(first.value.status).toBe(200)
+      if (second._tag === "success") expect(second.value.status).not.toBe(200)
+      expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked).pipe(Effect.timeout("2 seconds"))))).toBe(true)
+      expect(askedB.pollUnsafe()).toBeUndefined()
+      const remaining = await Effect.runPromise(Fiber.join(request.runFork(
+        InstanceStore.Service.use((store) => store.provide(
+          { directory: dir.path },
+          Permission.Service.use((permission) => permission.hostedList()),
+        )),
+      )).pipe(Effect.timeout("2 seconds")))
+      expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
+      if (captured) {
+        expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
+        expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
+        expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(1)
+        captured.producer.assertHealthy()
+      }
+    } finally {
+      Deferred.doneUnsafe(release, Effect.void)
+      if (!controller.signal.aborted) controller.abort()
+      await Effect.runPromise(Fiber.interrupt(listener))
     }
-    await Effect.runPromise(Fiber.interrupt(listener))
   })
 
   test("capture failure after A settlement leaves B pending and unsettled", async () => {
@@ -803,43 +864,79 @@ describe("hosted approval v2 HttpApi", () => {
       Deferred.doneUnsafe(registered, Effect.void)
       yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
     }))
-    await Effect.runPromise(Deferred.await(registered))
+    await Effect.runPromise(Deferred.await(registered).pipe(Effect.timeout("2 seconds")))
     captured.failEffects()
-    const firstResponse = request(path(requestID), { method: "POST", headers, body: bodyFor(pending.get(requestID)!) }).then(
-      (response) => response.status,
-      () => 0,
-    )
-    await Effect.runPromise(Deferred.await(published))
-    const nonceBeforeB = captured.nonces()
-    const secondResponse = request(path(requestIDB), { method: "POST", headers, body: bodyFor(pending.get(requestIDB)!) }).then(
-      (response) => response.status,
-      () => 0,
-    )
-    while (captured.nonces() === nonceBeforeB) await Promise.resolve()
-    Deferred.doneUnsafe(release, Effect.void)
-    const [first, second] = await Promise.all([firstResponse, secondResponse])
-    const retry = await request(path(requestID), {
+    const firstResponse = observe(request(path(requestID), {
       method: "POST",
       headers,
       body: bodyFor(pending.get(requestID)!),
-    }).then((response) => response.status, () => 0)
-    expect(first).not.toBe(200)
-    expect(second).not.toBe(409)
-    expect(retry).not.toBe(409)
-    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
-    expect(askedB.pollUnsafe()).toBeUndefined()
-    const remaining = await Effect.runPromise(Fiber.join(request.runFork(
-      InstanceStore.Service.use((store) => store.provide(
-        { directory: dir.path },
-        Permission.Service.use((permission) => permission.hostedList()),
-      )),
-    )))
-    expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
-    expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
-    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(0)
-    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(0)
-    expect(() => captured.producer.assertHealthy()).toThrow("producer-provenance-fatal")
-    await Effect.runPromise(Fiber.interrupt(listener))
+    }))
+    try {
+      const publication = await Promise.race([
+        Effect.runPromise(Deferred.await(published)).then(() => ({ _tag: "published" as const })),
+        firstResponse.then((result) => ({ _tag: "response" as const, result })),
+        Bun.sleep(2_000).then(() => ({ _tag: "timeout" as const })),
+      ])
+      if (publication._tag === "response" && publication.result._tag === "failure") throw publication.result.error
+      expect(publication._tag).toBe("published")
+
+      const nonceBeforeB = captured.nonces()
+      const secondResponse = observe(request(path(requestIDB), {
+        method: "POST",
+        headers,
+        body: bodyFor(pending.get(requestIDB)!),
+      }))
+      try {
+        const deadline = Date.now() + 2_000
+        while (captured.nonces() === nonceBeforeB && Date.now() < deadline) {
+          const stage = await Promise.race([
+            secondResponse.then((result) => ({ _tag: "response" as const, result })),
+            Bun.sleep(10).then(() => ({ _tag: "waiting" as const })),
+          ])
+          if (stage._tag === "response" && stage.result._tag === "failure") throw stage.result.error
+          expect(stage._tag).toBe("waiting")
+        }
+        expect(captured.nonces()).not.toBe(nonceBeforeB)
+
+        const waiting = await Promise.race([
+          secondResponse.then((result) => ({ _tag: "response" as const, result })),
+          Bun.sleep(500).then(() => ({ _tag: "waiting" as const })),
+        ])
+        if (waiting._tag === "response" && waiting.result._tag === "failure") throw waiting.result.error
+        expect(waiting._tag).toBe("waiting")
+      } finally {
+        Deferred.doneUnsafe(release, Effect.void)
+      }
+
+      const [first, second] = await bounded(Promise.all([firstResponse, secondResponse]), "failed A and B responses")
+      const retry = await bounded(observe(request(path(requestID), {
+        method: "POST",
+        headers,
+        body: bodyFor(pending.get(requestID)!),
+      })), "failed A retry response")
+      if (first._tag === "failure") expect(String(first.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
+      if (second._tag === "failure") expect(String(second.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
+      if (retry._tag === "failure") expect(String(retry.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
+      if (first._tag === "success") expect(first.value.status).not.toBe(200)
+      if (second._tag === "success") expect(second.value.status).not.toBe(409)
+      if (retry._tag === "success") expect(retry.value.status).not.toBe(409)
+      expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked).pipe(Effect.timeout("2 seconds"))))).toBe(true)
+      expect(askedB.pollUnsafe()).toBeUndefined()
+      const remaining = await Effect.runPromise(Fiber.join(request.runFork(
+        InstanceStore.Service.use((store) => store.provide(
+          { directory: dir.path },
+          Permission.Service.use((permission) => permission.hostedList()),
+        )),
+      )).pipe(Effect.timeout("2 seconds")))
+      expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
+      expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
+      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(0)
+      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(0)
+      expect(() => captured.producer.assertHealthy()).toThrow("producer-provenance-fatal")
+    } finally {
+      Deferred.doneUnsafe(release, Effect.void)
+      await Effect.runPromise(Fiber.interrupt(listener))
+    }
   })
 
   test("config mutation rotates the same authority observed by hosted routes", async () => {
