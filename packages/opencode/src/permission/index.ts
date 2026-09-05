@@ -288,6 +288,7 @@ const layer = Layer.effect(
               return { status: "mismatch" } as const
             }
 
+            provenance?.assertHealthy()
             pending.delete(input.requestID)
             yield* events.publish(Event.Replied, {
               sessionID: existing.info.sessionID,

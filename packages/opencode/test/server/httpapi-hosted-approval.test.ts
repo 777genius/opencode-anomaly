@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { ConfigProvider, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
+import { ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppLayer } from "../../src/effect/app-runtime"
 import { attach } from "../../src/effect/run-service"
 import { Permission } from "../../src/permission"
+import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { InstanceStore } from "../../src/project/instance-store"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { ServerAuth } from "../../src/server/auth"
@@ -12,8 +13,15 @@ import { SessionID } from "../../src/session/schema"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
 import {
+  canonicalJson,
+  contract,
+  contractSha256,
+  createFromEnvironment,
+  environmentKey,
   HostedApprovalProvenance,
+  implementationId,
   type NativeRecord,
+  type Operations,
   type Producer,
   type Stream,
 } from "../../src/hosted-approval/provenance"
@@ -38,45 +46,98 @@ function app(password?: string, producer?: Producer) {
     ),
     { disableLogger: true, memoMap },
   )
-  apps.add({
+  const entry = {
     dispose: async () => {
+      apps.delete(entry)
       await web.dispose()
       await runtime.dispose()
     },
-  })
+  }
+  apps.add(entry)
   return Object.assign(
     (path: string, init?: RequestInit) =>
       web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context),
     {
       runFork: <A, E>(effect: Effect.Effect<A, E, ManagedRuntime.ManagedRuntime.Services<typeof runtime>>) =>
         runtime.runFork(attach(effect)),
+      dispose: entry.dispose,
     },
   )
 }
 
 function capture() {
   const records: Array<{ stream: Stream; record: NativeRecord }> = []
+  const chunks = new Map<number, Uint8Array[]>([[9, []], [10, []]])
+  const consumed = new Map<number, number>([[9, 0], [10, 0]])
   let nonce = 0
-  let failTimeline = false
-  let failed = false
-  const producer: Producer = {
-    controllerNonce: "a".repeat(64),
-    runId: "run_http_capture",
-    operationNonce: () => (++nonce).toString(16).padStart(64, "0"),
-    emit: (stream, record) => {
-      if (failed) throw new Error("capture already poisoned")
-      records.push({ stream, record })
-      if (!failTimeline || stream !== "openCodeTimeline") return
-      failed = true
-      throw new Error("timeline capture failed")
+  let failEffects = false
+  const executableSha256 = HostedApprovalProvenance.sha256("http test executable")
+  const moduleSha256 = HostedApprovalProvenance.sha256("http test module")
+  const operations: Operations = {
+    deriveIdentity: () => ({
+      pid: process.pid,
+      startTicks: "1234",
+      exeDevice: "31",
+      exeInode: "41",
+      exeSha256: executableSha256,
+      moduleDevice: "32",
+      moduleInode: "42",
+      moduleSha256,
+    }),
+    descriptorIdentity: (fd) => ({
+      device: fd === 9 ? "71" : "72",
+      inode: fd === 9 ? "91" : "92",
+      regularFile: true,
+      append: true,
+      writeOnly: true,
+      mode: 0o600,
+      nlink: "1",
+      size: "0",
+    }),
+    randomNonce: () => (++nonce).toString(16).padStart(64, "0"),
+    write: (fd, bytes, offset) => {
+      chunks.get(fd)!.push(bytes.slice(offset))
+      return bytes.byteLength - offset
     },
-    poison: (reason) => {
-      failed = true
-      throw new Error(reason)
+    sync: (fd) => {
+      const bytes = Buffer.concat(chunks.get(fd)!.map((chunk) => Buffer.from(chunk)))
+      const offset = consumed.get(fd)!
+      const lines = bytes.subarray(offset).toString("utf8").trimEnd().split("\n").filter(Boolean)
+      for (const line of lines) {
+        const record = JSON.parse(line) as { recordType: string }
+        if (record.recordType !== "producer-open" && record.recordType !== "producer-close") {
+          records.push({ stream: fd === 9 ? "openCodeTimeline" : "protectedEffectLedger", record: record as NativeRecord })
+        }
+      }
+      consumed.set(fd, bytes.byteLength)
+      if (failEffects && fd === 10) throw new Error("effect capture failed")
     },
     close: () => {},
   }
-  return { producer, records, failTimeline: () => { failTimeline = true } }
+  const producer = createFromEnvironment({
+    [environmentKey]: canonicalJson({
+      activation: {
+        controllerNonce: "a".repeat(64),
+        runId: "run_http_capture",
+        stackManifestSha256: "b".repeat(64),
+      },
+      contract,
+      contractSha256,
+      expectedProducer: {
+        artifactManifestSha256: "c".repeat(64),
+        executableSha256,
+        implementationId,
+        moduleSha256,
+      },
+      producerRole: "opencode",
+      streams: {
+        openCodeTimeline: { device: "71", fd: 9, inode: "91" },
+        protectedEffectLedger: { device: "72", fd: 10, inode: "92" },
+      },
+      version: 2,
+    }),
+  }, { modulePath: "/admitted/opencode", operations })!
+  return { producer, records, failEffects: () => { failEffects = true }, nonces: () => nonce }
 }
 
 function auth(password = "secret") {
@@ -441,7 +502,7 @@ describe("hosted approval v2 HttpApi", () => {
     })
   })
 
-  test("capture failure after settlement remains poisoned and cannot become a retry-safe conflict", async () => {
+  test.each(["abort", "shutdown"] as const)("finalizes a settlement when the request reaches publication then %s occurs", async (boundary) => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const captured = capture()
     const request = app("secret", captured.producer)
@@ -452,7 +513,97 @@ describe("hosted approval v2 HttpApi", () => {
       "x-opencode-directory": dir.path,
     }
     const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
-    const requestID = PermissionV1.ID.make("per_hosted_capture_failure")
+    const requestID = PermissionV1.ID.make(`per_hosted_${boundary}_boundary`)
+    const sessionID = SessionID.make(`ses_hosted_${boundary}_boundary`)
+    const asked = request.runFork(
+      InstanceStore.Service.use((store) => store.provide(
+        { directory: dir.path },
+        Permission.Service.use((permission) => permission.ask({
+          id: requestID,
+          sessionID,
+          permission: "bash",
+          patterns: ["pwd"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })),
+      )),
+    )
+    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
+    const pending = await Effect.runPromise(
+      Effect.gen(function* () {
+        while (true) {
+          const response = yield* Effect.promise(() => request(observePath, { headers }))
+          const body = yield* Effect.promise(() => response.json())
+          if (body.permissions.length === 1) return body.permissions[0]
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(Effect.timeout("2 seconds")),
+    )
+    const registered = Effect.runSync(Deferred.make<void>())
+    const published = Effect.runSync(Deferred.make<void>())
+    const release = Effect.runSync(Deferred.make<void>())
+    const listener = request.runFork(Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const unsubscribe = yield* events.listen((event) => {
+        if (
+          event.type !== Permission.Event.Replied.type ||
+          (event.data as { requestID: PermissionV1.ID }).requestID !== requestID
+        ) return Effect.void
+        Deferred.doneUnsafe(published, Effect.void)
+        return Deferred.await(release)
+      })
+      Deferred.doneUnsafe(registered, Effect.void)
+      yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
+    }))
+    await Effect.runPromise(Deferred.await(registered))
+    const controller = new AbortController()
+    const response = request(
+      `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`,
+      {
+        method: "POST",
+        headers,
+        signal: controller.signal,
+        body: JSON.stringify({
+          schemaVersion: 2,
+          protocol: "agent-teams-hosted-approval-v2",
+          runtimeInstanceId: capability.runtimeInstanceId,
+          expectedConfigGeneration: capability.configGeneration,
+          requestId: pending.requestId,
+          sessionId: pending.sessionId,
+          sessionIncarnation: pending.sessionIncarnation,
+          requestIncarnation: pending.requestIncarnation,
+          expectedPermissionDigest: pending.permissionDigest,
+          decision: "allow_once",
+        }),
+      },
+    ).then((value) => value, () => undefined)
+    await Effect.runPromise(Deferred.await(published))
+    const shutdown = boundary === "shutdown" ? request.dispose() : Promise.resolve()
+    if (boundary === "abort") controller.abort()
+    Deferred.doneUnsafe(release, Effect.void)
+    await Promise.all([response, shutdown])
+    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    const effect = captured.records.find((item) => item.record.recordType === "conditional-reply-effect")!.record
+    expect(captured.records.filter((item) => item.record.operationNonce === effect.operationNonce && item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
+    expect(captured.records.filter((item) => item.record.operationNonce === effect.operationNonce && item.record.recordType === "hosted-reply")).toHaveLength(1)
+    captured.producer.assertHealthy()
+    if (boundary === "abort") await Effect.runPromise(Fiber.interrupt(listener))
+  })
+
+  test("capture failure after A settlement leaves B pending and unsettled", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const captured = capture()
+    const request = app("secret", captured.producer)
+    const headers = {
+      "accept-encoding": "identity",
+      authorization: auth(),
+      "content-type": "application/json",
+      "x-opencode-directory": dir.path,
+    }
+    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
+    const requestID = PermissionV1.ID.make("per_hosted_capture_failure_a")
+    const requestIDB = PermissionV1.ID.make("per_hosted_capture_failure_b")
     const sessionID = SessionID.make("ses_hosted_capture_failure")
     const asked = request.runFork(
       InstanceStore.Service.use((store) =>
@@ -470,44 +621,98 @@ describe("hosted approval v2 HttpApi", () => {
         ),
       ),
     )
+    const askedB = request.runFork(
+      InstanceStore.Service.use((store) =>
+        store.provide(
+          { directory: dir.path },
+          Permission.Service.use((permission) => permission.ask({
+            id: requestIDB,
+            sessionID,
+            permission: "bash",
+            patterns: ["whoami"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          })),
+        ),
+      ),
+    )
     const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
     const observed = await Effect.runPromise(
       Effect.gen(function* () {
         while (true) {
           const response = yield* Effect.promise(() => request(observePath, { headers }))
           const body = yield* Effect.promise(() => response.json())
-          if (body.permissions.length === 1) return body.permissions[0]
+          if (body.permissions.length === 2) return body.permissions
           yield* Effect.sleep("10 millis")
         }
       }).pipe(Effect.timeout("2 seconds")),
     )
-    const body = JSON.stringify({
+    const pending = new Map(observed.map((item: { requestId: string }) => [item.requestId, item]))
+    const bodyFor = (item: (typeof observed)[number]) => JSON.stringify({
       schemaVersion: 2,
       protocol: "agent-teams-hosted-approval-v2",
       runtimeInstanceId: capability.runtimeInstanceId,
       expectedConfigGeneration: capability.configGeneration,
-      requestId: observed.requestId,
-      sessionId: observed.sessionId,
-      sessionIncarnation: observed.sessionIncarnation,
-      requestIncarnation: observed.requestIncarnation,
-      expectedPermissionDigest: observed.permissionDigest,
+      requestId: item.requestId,
+      sessionId: item.sessionId,
+      sessionIncarnation: item.sessionIncarnation,
+      requestIncarnation: item.requestIncarnation,
+      expectedPermissionDigest: item.permissionDigest,
       decision: "allow_once",
     })
-    const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
-    captured.failTimeline()
-    const first = await request(path, { method: "POST", headers, body }).then(
+    const path = (id: PermissionV1.ID) => `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${id}/reply`
+    const registered = Effect.runSync(Deferred.make<void>())
+    const published = Effect.runSync(Deferred.make<void>())
+    const release = Effect.runSync(Deferred.make<void>())
+    const listener = request.runFork(Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const unsubscribe = yield* events.listen((event) => {
+        if (
+          event.type !== Permission.Event.Replied.type ||
+          (event.data as { requestID: PermissionV1.ID }).requestID !== requestID
+        ) return Effect.void
+        Deferred.doneUnsafe(published, Effect.void)
+        return Deferred.await(release)
+      })
+      Deferred.doneUnsafe(registered, Effect.void)
+      yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
+    }))
+    await Effect.runPromise(Deferred.await(registered))
+    captured.failEffects()
+    const firstResponse = request(path(requestID), { method: "POST", headers, body: bodyFor(pending.get(requestID)!) }).then(
       (response) => response.status,
       () => 0,
     )
-    const second = await request(path, { method: "POST", headers, body }).then(
+    await Effect.runPromise(Deferred.await(published))
+    const nonceBeforeB = captured.nonces()
+    const secondResponse = request(path(requestIDB), { method: "POST", headers, body: bodyFor(pending.get(requestIDB)!) }).then(
       (response) => response.status,
       () => 0,
     )
+    while (captured.nonces() === nonceBeforeB) await Promise.resolve()
+    Deferred.doneUnsafe(release, Effect.void)
+    const [first, second] = await Promise.all([firstResponse, secondResponse])
+    const retry = await request(path(requestID), {
+      method: "POST",
+      headers,
+      body: bodyFor(pending.get(requestID)!),
+    }).then((response) => response.status, () => 0)
     expect(first).not.toBe(200)
     expect(second).not.toBe(409)
+    expect(retry).not.toBe(409)
     expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    expect((await Effect.runPromise(Fiber.poll(askedB)))._tag).toBe("None")
+    const remaining = await Effect.runPromise(Fiber.join(request.runFork(
+      InstanceStore.Service.use((store) => store.provide(
+        { directory: dir.path },
+        Permission.Service.use((permission) => permission.hostedList()),
+      )),
+    )))
+    expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
     expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
-    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
+    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(0)
+    await Effect.runPromise(Fiber.interrupt(listener))
   })
 
   test("config mutation rotates the same authority observed by hosted routes", async () => {

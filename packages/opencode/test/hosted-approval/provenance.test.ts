@@ -164,6 +164,24 @@ describe("native hosted approval provenance producer", () => {
     expect(identityFixture.closed).toEqual([9, 10])
   })
 
+  test.each([0o1600, 0o2600, 0o4600])("rejects descriptor mode %# while checking file type separately", (mode) => {
+    const fixture = harness()
+    expect(() => create({
+      ...fixture.operations,
+      descriptorIdentity: (fd) => ({ ...fixture.operations.descriptorIdentity(fd), mode }),
+    })).toThrow("producer-provenance-descriptor-identity")
+    expect(fixture.closed).toEqual([9, 10])
+  })
+
+  test("rejects a non-regular descriptor even with exact mode 0600", () => {
+    const fixture = harness()
+    expect(() => create({
+      ...fixture.operations,
+      descriptorIdentity: (fd) => ({ ...fixture.operations.descriptorIdentity(fd), regularFile: false }),
+    })).toThrow("producer-provenance-descriptor-identity")
+    expect(fixture.closed).toEqual([9, 10])
+  })
+
   test("writes partial chunks into exact independent canonical chains", () => {
     const fixture = harness({ writeLimit: 7 })
     const producer = create(fixture.operations)
@@ -238,6 +256,8 @@ describe("native hosted approval provenance producer", () => {
         status: 200,
       },
     })).toThrow("producer-provenance-fatal")
+    expect(() => producer.assertHealthy()).toThrow("producer-provenance-fatal")
+    expect(() => producer.operationNonce()).toThrow("producer-provenance-fatal")
     expect(() => producer.emit("openCodeTimeline", {
       recordType: "hosted-capability",
       operationNonce,

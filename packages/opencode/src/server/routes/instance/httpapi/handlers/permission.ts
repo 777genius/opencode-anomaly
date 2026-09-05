@@ -390,56 +390,58 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
         emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
         return response
       }
-      const result = yield* hostedReply({ params: ctx.params, payload, operationNonce }).pipe(
-        Effect.map((response) => ({ response } as const)),
-        Effect.catchTags({
-          BadRequest: () => Effect.succeed({ outcome: "bad-request", status: 400 } as const),
-          HostedApprovalConflict: () => Effect.succeed({ outcome: "conflict", status: 409 } as const),
-          HostedApprovalPreconditionFailed: () => Effect.succeed({ outcome: "precondition-failed", status: 412 } as const),
-        }),
-      )
-      if (!("response" in result)) {
-        const response = HttpServerResponse.empty({ status: result.status })
-        emitRaw(provenance, operationNonce, ctx.params, result.outcome, requestBodySha256, result.status)
-        emitTypedFailure(provenance, operationNonce, payload, result.outcome, result.status)
+      return yield* Effect.uninterruptible(Effect.gen(function* () {
+        const result = yield* hostedReply({ params: ctx.params, payload, operationNonce }).pipe(
+          Effect.map((response) => ({ response } as const)),
+          Effect.catchTags({
+            BadRequest: () => Effect.succeed({ outcome: "bad-request", status: 400 } as const),
+            HostedApprovalConflict: () => Effect.succeed({ outcome: "conflict", status: 409 } as const),
+            HostedApprovalPreconditionFailed: () => Effect.succeed({ outcome: "precondition-failed", status: 412 } as const),
+          }),
+        )
+        if (!("response" in result)) {
+          const response = HttpServerResponse.empty({ status: result.status })
+          emitRaw(provenance, operationNonce, ctx.params, result.outcome, requestBodySha256, result.status)
+          emitTypedFailure(provenance, operationNonce, payload, result.outcome, result.status)
+          return response
+        }
+        const responseSha256 = sha256(JSON.stringify(result.response))
+        const response = HttpServerResponse.jsonUnsafe(result.response)
+        provenance?.emit("openCodeTimeline", {
+          recordType: "hosted-reply-raw",
+          operationNonce: operationNonce!,
+          native: {
+            configGeneration: result.response.configGeneration,
+            outcome: "applied",
+            requestBodySha256,
+            requestId: result.response.requestId,
+            requestIncarnation: result.response.requestIncarnation,
+            responseSha256,
+            runtimeInstanceId: result.response.runtimeInstanceId,
+            sessionId: result.response.sessionId,
+            sessionIncarnation: result.response.sessionIncarnation,
+            status: 200,
+          },
+        })
+        provenance?.emit("openCodeTimeline", {
+          recordType: "hosted-reply",
+          operationNonce: operationNonce!,
+          native: {
+            configGeneration: result.response.configGeneration,
+            decision: result.response.decision,
+            outcome: "applied",
+            permissionDigest: result.response.permissionDigest,
+            requestId: result.response.requestId,
+            requestIncarnation: result.response.requestIncarnation,
+            responseSha256,
+            runtimeInstanceId: result.response.runtimeInstanceId,
+            sessionId: result.response.sessionId,
+            sessionIncarnation: result.response.sessionIncarnation,
+            status: 200,
+          },
+        })
         return response
-      }
-      const responseSha256 = sha256(JSON.stringify(result.response))
-      const response = HttpServerResponse.jsonUnsafe(result.response)
-      provenance?.emit("openCodeTimeline", {
-        recordType: "hosted-reply-raw",
-        operationNonce: operationNonce!,
-        native: {
-          configGeneration: result.response.configGeneration,
-          outcome: "applied",
-          requestBodySha256,
-          requestId: result.response.requestId,
-          requestIncarnation: result.response.requestIncarnation,
-          responseSha256,
-          runtimeInstanceId: result.response.runtimeInstanceId,
-          sessionId: result.response.sessionId,
-          sessionIncarnation: result.response.sessionIncarnation,
-          status: 200,
-        },
-      })
-      provenance?.emit("openCodeTimeline", {
-        recordType: "hosted-reply",
-        operationNonce: operationNonce!,
-        native: {
-          configGeneration: result.response.configGeneration,
-          decision: result.response.decision,
-          outcome: "applied",
-          permissionDigest: result.response.permissionDigest,
-          requestId: result.response.requestId,
-          requestIncarnation: result.response.requestIncarnation,
-          responseSha256,
-          runtimeInstanceId: result.response.runtimeInstanceId,
-          sessionId: result.response.sessionId,
-          sessionIncarnation: result.response.sessionIncarnation,
-          status: 200,
-        },
-      })
-      return response
+      }))
     })
 
     const list = Effect.fn("PermissionHttpApi.list")(function* () {

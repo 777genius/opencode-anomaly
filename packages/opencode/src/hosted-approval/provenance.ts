@@ -169,6 +169,7 @@ export class FatalError extends Error {
 export interface Producer {
   readonly controllerNonce: string
   readonly runId: string
+  readonly assertHealthy: () => void
   readonly operationNonce: () => string
   readonly emit: (stream: Stream, record: NativeRecord) => void
   readonly poison: (reason: string) => never
@@ -378,7 +379,13 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
   const producer: Producer = {
     controllerNonce: capsule.activation.controllerNonce,
     runId: capsule.activation.runId,
+    assertHealthy() {
+      if (fatal) throw fatal
+      if (closed || closing) throw new FatalError("producer-provenance-writer-closed")
+    },
     operationNonce: () => {
+      if (fatal) throw fatal
+      if (closed || closing) throw new FatalError("producer-provenance-writer-closed")
       const nonce = operations.randomNonce()
       if (!HEX.test(nonce)) return fail(new TypeError("producer-provenance-operation-nonce"))
       return nonce
@@ -621,7 +628,7 @@ export function createNodeOperations(): Operations {
         regularFile: identity.isFile(),
         append: (flags & constants.O_APPEND) !== 0,
         writeOnly: (flags & 3) === constants.O_WRONLY,
-        mode: Number(identity.mode & 0o777n),
+        mode: Number(identity.mode & 0o7777n),
         nlink: identity.nlink.toString(),
         size: identity.size.toString(),
       }
