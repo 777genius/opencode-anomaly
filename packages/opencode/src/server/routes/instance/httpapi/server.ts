@@ -50,6 +50,7 @@ import { Truncate } from "@/tool/truncate"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+import { HostedApprovalProvenance } from "@/hosted-approval/provenance"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
@@ -242,6 +243,7 @@ const app = LayerNode.group([
   BackgroundJob.node,
   RuntimeFlags.node,
   HostedApprovalCoordinator.node,
+  HostedApprovalProvenance.node,
   EventV2Bridge.node,
   SessionRunState.node,
   SessionProcessor.node,
@@ -275,6 +277,7 @@ const app = LayerNode.group([
 
 export function createRoutes(
   corsOptions?: CorsOptions,
+  provenanceLayer = HostedApprovalProvenance.layer,
 ): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
   const locationServiceMapV2 = buildLocationServiceMap()
 
@@ -308,7 +311,7 @@ export function createRoutes(
     ),
     Layer.provide(locationServiceMapV2),
 
-    Layer.provide(AppNodeBuilderV1.build(app)),
+    Layer.provide(AppNodeBuilderV1.build(app, [[HostedApprovalProvenance.node, provenanceLayer]])),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,
     // so Observability must come after every service graph. Otherwise eagerly forked
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout

@@ -10,6 +10,7 @@ import { HostedConflictError, HostedPreconditionError, HostedReplyPayload, Hoste
 import { ServerAuth } from "@/server/auth"
 import { Schema, Stream } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import { HostedApprovalProvenance, sha256, type Producer } from "@/hosted-approval/provenance"
 
 function rejectDuplicateJsonKeys(text: string): void {
   let offset = 0
@@ -84,29 +85,92 @@ export const readHostedReplyBody = Effect.fn("PermissionHttpApi.readHostedReplyB
   <E>(stream: Stream.Stream<Uint8Array, E>, limit = 16 * 1024) =>
     Stream.runFoldEffect(
       stream,
-      () => [] as Uint8Array[],
-      (chunks, chunk) => {
-        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
-        if (size + chunk.byteLength > limit) return Effect.fail(new HostedReplyBodyError("body too large"))
-        chunks.push(chunk)
-        return Effect.succeed(chunks)
+      () => ({ chunks: [] as Uint8Array[], size: 0 }),
+      (state, chunk) => {
+        if (state.size + chunk.byteLength > limit) return Effect.fail(new HostedReplyBodyError("body too large"))
+        state.chunks.push(chunk)
+        return Effect.succeed({ chunks: state.chunks, size: state.size + chunk.byteLength })
       },
     ).pipe(
       Effect.mapError((error) => error instanceof HostedReplyBodyError ? error : new HostedReplyBodyError("body read failed")),
-      Effect.map((chunks) => {
-        const size = chunks.reduce((total, value) => total + value.byteLength, 0)
-        const bytes = new Uint8Array(size)
+      Effect.map((state) => {
+        const bytes = new Uint8Array(state.size)
         let offset = 0
-        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
+        for (const chunk of state.chunks) { bytes.set(chunk, offset); offset += chunk.byteLength }
         return bytes
       }),
     ),
 )
 
+function emitRaw(
+  provenance: Producer | null,
+  operationNonce: string | undefined,
+  params: { sessionID: string; requestID: PermissionV1.ID },
+  outcome:
+    | "unavailable"
+    | "body-read-failed"
+    | "invalid-json"
+    | "invalid-schema"
+    | "bad-request"
+    | "conflict"
+    | "precondition-failed",
+  requestBodySha256: string | null,
+  status: 400 | 404 | 409 | 412,
+) {
+  provenance?.emit("openCodeTimeline", {
+    recordType: "hosted-reply-raw",
+    operationNonce: operationNonce!,
+    native: {
+      configGeneration: null,
+      outcome,
+      requestBodySha256,
+      requestId: params.requestID,
+      requestIncarnation: null,
+      responseSha256: sha256(new Uint8Array()),
+      runtimeInstanceId: null,
+      sessionId: params.sessionID,
+      sessionIncarnation: null,
+      status,
+    },
+  })
+}
+
+function emitTypedFailure(
+  provenance: Producer | null,
+  operationNonce: string | undefined,
+  payload: typeof HostedReplyPayload.Type,
+  outcome: "bad-request" | "conflict" | "precondition-failed",
+  status: 400 | 409 | 412,
+) {
+  provenance?.emit("openCodeTimeline", {
+    recordType: "hosted-reply",
+    operationNonce: operationNonce!,
+    native: {
+      configGeneration: null,
+      decision: payload.decision,
+      outcome,
+      permissionDigest: payload.expectedPermissionDigest,
+      requestId: payload.requestId,
+      requestIncarnation: null,
+      runtimeInstanceId: null,
+      sessionId: payload.sessionId,
+      sessionIncarnation: null,
+      status,
+    },
+  })
+}
+
+function requireIdentityEncoding(provenance: Producer | null, request: HttpServerRequest.HttpServerRequest) {
+  if (!provenance) return
+  if (request.headers["accept-encoding"] === "identity") return
+  provenance.poison("producer-provenance-wire-encoding")
+}
+
 export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permission", (handlers) =>
   Effect.gen(function* () {
     const svc = yield* Permission.Service
     const hostedApproval = yield* HostedApprovalCoordinator.Service
+    const provenance = (yield* HostedApprovalProvenance.Service).producer
     const serverAuth = yield* ServerAuth.Config
 
     const requireHosted = Effect.fn("PermissionHttpApi.requireHosted")(function* () {
@@ -114,22 +178,48 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       return yield* Effect.void
     })
 
-    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* () {
-      yield* requireHosted()
+    const hostedCapability = Effect.fn("PermissionHttpApi.hostedCapability")(function* (ctx: {
+      request: HttpServerRequest.HttpServerRequest
+    }) {
+      requireIdentityEncoding(provenance, ctx.request)
+      const unavailable = yield* requireHosted().pipe(
+        Effect.match({ onFailure: () => true, onSuccess: () => false }),
+      )
+      if (unavailable) return HttpServerResponse.jsonUnsafe({ _tag: "HostedApprovalUnavailable" }, { status: 404 })
       return yield* hostedApproval.withConditionalReply(
-        Effect.sync(() => ({
-          schemaVersion: 2 as const,
-          protocol,
-          ...hostedApproval.snapshot(),
-          authentication: "opencode-basic" as const,
-        })),
+        Effect.sync(() => {
+          const body = {
+            schemaVersion: 2 as const,
+            protocol,
+            ...hostedApproval.snapshot(),
+            authentication: "opencode-basic" as const,
+          }
+          const response = HttpServerResponse.jsonUnsafe(body)
+          provenance?.emit("openCodeTimeline", {
+            recordType: "hosted-capability",
+            operationNonce: provenance.operationNonce(),
+            native: {
+              configGeneration: body.configGeneration,
+              outcome: "ok",
+              responseSha256: sha256(JSON.stringify(body)),
+              runtimeInstanceId: body.runtimeInstanceId,
+              status: 200,
+            },
+          })
+          return response
+        }),
       )
     })
 
     const hostedObserve = Effect.fn("PermissionHttpApi.hostedObserve")(function* (ctx: {
       params: { sessionID: string }
+      request: HttpServerRequest.HttpServerRequest
     }) {
-      yield* requireHosted()
+      requireIdentityEncoding(provenance, ctx.request)
+      const unavailable = yield* requireHosted().pipe(
+        Effect.match({ onFailure: () => true, onSuccess: () => false }),
+      )
+      if (unavailable) return HttpServerResponse.jsonUnsafe({ _tag: "HostedApprovalUnavailable" }, { status: 404 })
       return yield* hostedApproval.withConditionalReply(
         Effect.gen(function* () {
           const snapshot = hostedApproval.snapshot()
@@ -161,9 +251,38 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
               droppedCount: permissions.length,
               droppedBytes: bytes,
             })
-            return yield* new HttpApiError.InternalServerError()
+            const error = { _tag: "InternalServerError" }
+            const finalized = HttpServerResponse.jsonUnsafe(error, { status: 500 })
+            provenance?.emit("openCodeTimeline", {
+              recordType: "hosted-observe",
+              operationNonce: provenance.operationNonce(),
+              native: {
+                configGeneration: response.configGeneration,
+                outcome: "overflow",
+                permissionCount: permissions.length,
+                responseSha256: sha256(JSON.stringify(error)),
+                runtimeInstanceId: response.runtimeInstanceId,
+                sessionId: response.sessionId,
+                status: 500,
+              },
+            })
+            return finalized
           }
-          return response
+          const finalized = HttpServerResponse.jsonUnsafe(response)
+          provenance?.emit("openCodeTimeline", {
+            recordType: "hosted-observe",
+            operationNonce: provenance.operationNonce(),
+            native: {
+              configGeneration: response.configGeneration,
+              outcome: "ok",
+              permissionCount: permissions.length,
+              responseSha256: sha256(JSON.stringify(response)),
+              runtimeInstanceId: response.runtimeInstanceId,
+              sessionId: response.sessionId,
+              status: 200,
+            },
+          })
+          return finalized
         }),
       )
     })
@@ -171,6 +290,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
     const hostedReply = Effect.fn("PermissionHttpApi.hostedReply")(function* (ctx: {
       params: { sessionID: string; requestID: PermissionV1.ID }
       payload: typeof HostedReplyPayload.Type
+      operationNonce?: string
     }) {
       yield* requireHosted()
       if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
@@ -191,20 +311,21 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             requestIncarnation: ctx.payload.requestIncarnation,
             reply: ctx.payload.decision === "allow_once" ? "once" : "reject",
             matches: (request) => digest(rawPermission(request)) === ctx.payload.expectedPermissionDigest,
+            provenanceOperationNonce: ctx.operationNonce,
           })
           if (result.status === "mismatch") return yield* new HostedConflictError()
           return {
             schemaVersion: 2 as const,
             protocol,
             status: "applied" as const,
-            runtimeInstanceId: snapshot.runtimeInstanceId,
-            configGeneration: snapshot.configGeneration,
-            requestId: ctx.payload.requestId,
-            sessionId: ctx.payload.sessionId,
-            sessionIncarnation: ctx.payload.sessionIncarnation,
-            requestIncarnation: ctx.payload.requestIncarnation,
-            permissionDigest: ctx.payload.expectedPermissionDigest,
-            decision: ctx.payload.decision,
+            runtimeInstanceId: result.runtimeInstanceId,
+            configGeneration: result.configGeneration,
+            requestId: result.request.id,
+            sessionId: result.request.sessionID,
+            sessionIncarnation: result.sessionIncarnation,
+            requestIncarnation: result.requestIncarnation,
+            permissionDigest: result.permissionDigest,
+            decision: result.reply === "once" ? "allow_once" as const : "reject" as const,
           }
         }),
       )
@@ -214,43 +335,111 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       params: { sessionID: string; requestID: PermissionV1.ID }
       request: HttpServerRequest.HttpServerRequest
     }) {
+      const operationNonce = provenance?.operationNonce()
+      requireIdentityEncoding(provenance, ctx.request)
       const unavailable = yield* requireHosted().pipe(
         Effect.match({ onFailure: () => true, onSuccess: () => false }),
       )
-      if (unavailable) return HttpServerResponse.empty({ status: 404 })
+      if (unavailable) {
+        const response = HttpServerResponse.empty({ status: 404 })
+        emitRaw(provenance, operationNonce, ctx.params, "unavailable", null, 404)
+        return response
+      }
       const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
         Effect.catch(() => Effect.succeed(undefined)),
       )
-      if (!bytes) return HttpServerResponse.empty({ status: 400 })
+      if (!bytes) {
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "body-read-failed", null, 400)
+        return response
+      }
+      const requestBodySha256 = sha256(bytes)
       let text: string
       try {
         text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
         rejectDuplicateJsonKeys(text)
       } catch {
-        return HttpServerResponse.empty({ status: 400 })
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "invalid-json", requestBodySha256, 400)
+        return response
       }
       let untyped: unknown
-      try { untyped = JSON.parse(text) } catch { return HttpServerResponse.empty({ status: 400 }) }
-      if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) return HttpServerResponse.empty({ status: 400 })
+      try { untyped = JSON.parse(text) } catch {
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "invalid-json", requestBodySha256, 400)
+        return response
+      }
+      if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) {
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
+        return response
+      }
       const keys = Object.keys(untyped).sort()
       if (keys.length !== HOSTED_REPLY_KEYS.length || keys.some((key, index) => key !== HOSTED_REPLY_KEYS[index])) {
-        return HttpServerResponse.empty({ status: 400 })
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
+        return response
       }
       const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HostedReplyPayload))(text, {
         onExcessProperty: "error",
       }).pipe(
         Effect.catch(() => Effect.succeed(undefined)),
       )
-      if (!payload) return HttpServerResponse.empty({ status: 400 })
-      const result = yield* hostedReply({ params: ctx.params, payload }).pipe(
+      if (!payload) {
+        const response = HttpServerResponse.empty({ status: 400 })
+        emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
+        return response
+      }
+      const result = yield* hostedReply({ params: ctx.params, payload, operationNonce }).pipe(
+        Effect.map((response) => ({ response } as const)),
         Effect.catchTags({
-          BadRequest: () => Effect.succeed(HttpServerResponse.empty({ status: 400 })),
-          HostedApprovalConflict: () => Effect.succeed(HttpServerResponse.empty({ status: 409 })),
-          HostedApprovalPreconditionFailed: () => Effect.succeed(HttpServerResponse.empty({ status: 412 })),
+          BadRequest: () => Effect.succeed({ outcome: "bad-request", status: 400 } as const),
+          HostedApprovalConflict: () => Effect.succeed({ outcome: "conflict", status: 409 } as const),
+          HostedApprovalPreconditionFailed: () => Effect.succeed({ outcome: "precondition-failed", status: 412 } as const),
         }),
       )
-      if (HttpServerResponse.isHttpServerResponse(result)) return result
-      return HttpServerResponse.jsonUnsafe(result)
+      if (!("response" in result)) {
+        const response = HttpServerResponse.empty({ status: result.status })
+        emitRaw(provenance, operationNonce, ctx.params, result.outcome, requestBodySha256, result.status)
+        emitTypedFailure(provenance, operationNonce, payload, result.outcome, result.status)
+        return response
+      }
+      const responseSha256 = sha256(JSON.stringify(result.response))
+      const response = HttpServerResponse.jsonUnsafe(result.response)
+      provenance?.emit("openCodeTimeline", {
+        recordType: "hosted-reply-raw",
+        operationNonce: operationNonce!,
+        native: {
+          configGeneration: result.response.configGeneration,
+          outcome: "applied",
+          requestBodySha256,
+          requestId: result.response.requestId,
+          requestIncarnation: result.response.requestIncarnation,
+          responseSha256,
+          runtimeInstanceId: result.response.runtimeInstanceId,
+          sessionId: result.response.sessionId,
+          sessionIncarnation: result.response.sessionIncarnation,
+          status: 200,
+        },
+      })
+      provenance?.emit("openCodeTimeline", {
+        recordType: "hosted-reply",
+        operationNonce: operationNonce!,
+        native: {
+          configGeneration: result.response.configGeneration,
+          decision: result.response.decision,
+          outcome: "applied",
+          permissionDigest: result.response.permissionDigest,
+          requestId: result.response.requestId,
+          requestIncarnation: result.response.requestIncarnation,
+          responseSha256,
+          runtimeInstanceId: result.response.runtimeInstanceId,
+          sessionId: result.response.sessionId,
+          sessionIncarnation: result.response.sessionIncarnation,
+          status: 200,
+        },
+      })
+      return response
     })
 
     const list = Effect.fn("PermissionHttpApi.list")(function* () {
@@ -281,8 +470,8 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
     })
 
     return handlers
-      .handle("hostedCapability", hostedCapability)
-      .handle("hostedObserve", hostedObserve)
+      .handleRaw("hostedCapability", hostedCapability)
+      .handleRaw("hostedObserve", hostedObserve)
       .handleRaw("hostedReply", hostedReplyRaw)
       .handle("list", list)
       .handle("reply", reply)

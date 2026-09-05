@@ -11,14 +11,22 @@ import { ServerAuth } from "../../src/server/auth"
 import { SessionID } from "../../src/session/schema"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
+import {
+  HostedApprovalProvenance,
+  type NativeRecord,
+  type Producer,
+  type Stream,
+} from "../../src/hosted-approval/provenance"
 
 const apps = new Set<{ dispose: () => Promise<void> }>()
 
-function app(password?: string) {
+function app(password?: string, producer?: Producer) {
   const memoMap = Layer.makeMemoMapUnsafe()
   const runtime = ManagedRuntime.make(AppLayer, { memoMap })
   const web = HttpRouter.toWebHandler(
-    HttpApiApp.routes.pipe(
+    (producer
+      ? HttpApiApp.createRoutes(undefined, HostedApprovalProvenance.makeLayer(producer))
+      : HttpApiApp.routes).pipe(
       Layer.provide(
         ConfigProvider.layer(
           ConfigProvider.fromUnknown({
@@ -46,6 +54,31 @@ function app(password?: string) {
   )
 }
 
+function capture() {
+  const records: Array<{ stream: Stream; record: NativeRecord }> = []
+  let nonce = 0
+  let failTimeline = false
+  let failed = false
+  const producer: Producer = {
+    controllerNonce: "a".repeat(64),
+    runId: "run_http_capture",
+    operationNonce: () => (++nonce).toString(16).padStart(64, "0"),
+    emit: (stream, record) => {
+      if (failed) throw new Error("capture already poisoned")
+      records.push({ stream, record })
+      if (!failTimeline || stream !== "openCodeTimeline") return
+      failed = true
+      throw new Error("timeline capture failed")
+    },
+    poison: (reason) => {
+      failed = true
+      throw new Error(reason)
+    },
+    close: () => {},
+  }
+  return { producer, records, failTimeline: () => { failTimeline = true } }
+}
+
 function auth(password = "secret") {
   return ServerAuth.header({ username: "opencode", password }) ?? ""
 }
@@ -58,6 +91,41 @@ afterEach(async () => {
 })
 
 describe("hosted approval v2 HttpApi", () => {
+  test("captures actually read invalid bytes as one raw operation and no typed or effect fact", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const captured = capture()
+    const request = app("secret", captured.producer)
+    const body = '{ "schemaVersion": 2, bad json'
+    const response = await request(
+      "/experimental/agent-teams/hosted-approval/session/ses_invalid/permission/per_invalid/reply",
+      {
+        method: "POST",
+        headers: {
+          "accept-encoding": "identity",
+          authorization: auth(),
+          "content-type": "application/json",
+          "x-opencode-directory": dir.path,
+        },
+        body,
+      },
+    )
+    expect(response.status).toBe(400)
+    expect(await response.text()).toBe("")
+    expect(captured.records).toHaveLength(1)
+    expect(captured.records[0]).toMatchObject({
+      stream: "openCodeTimeline",
+      record: {
+        recordType: "hosted-reply-raw",
+        native: {
+          outcome: "invalid-json",
+          requestBodySha256: HostedApprovalProvenance.sha256(body),
+          responseSha256: HostedApprovalProvenance.sha256(new Uint8Array()),
+          status: 400,
+        },
+      },
+    })
+  })
+
   test("maps unavailable capability and observe errors through their declared response contract", async () => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const request = app()
@@ -155,8 +223,10 @@ describe("hosted approval v2 HttpApi", () => {
 
   test("returns explicit no-effect statuses for malformed, duplicate, oversize, conflict, and precondition", async () => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-    const request = app("secret")
+    const captured = capture()
+    const request = app("secret", captured.producer)
     const headers = {
+      "accept-encoding": "identity",
       "content-type": "application/json",
       "x-opencode-directory": dir.path,
       authorization: auth(),
@@ -181,14 +251,36 @@ describe("hosted approval v2 HttpApi", () => {
     expect((await post("x".repeat(16 * 1024 + 1))).status).toBe(400)
     const legacy = Object.fromEntries(Object.entries(valid).filter(([key]) => key !== "sessionIncarnation"))
     expect((await post(JSON.stringify(legacy))).status).toBe(400)
-    expect((await post(JSON.stringify(valid))).status).toBe(409)
-    expect((await post(JSON.stringify({ ...valid, runtimeInstanceId: `runtime_instance_${"f".repeat(32)}` }))).status).toBe(412)
+    const noncanonical = JSON.stringify(valid, null, 2)
+    const conflict = await post(noncanonical)
+    expect(conflict.status).toBe(409)
+    expect(await conflict.text()).toBe("")
+    expect((await request("/config", {
+      method: "PATCH",
+      headers,
+      body: JSON.stringify({ formatter: false }),
+    })).status).toBe(200)
+    expect((await post(JSON.stringify(valid))).status).toBe(412)
+    expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toEqual([])
+    const raw = captured.records.flatMap((item) => item.record.recordType === "hosted-reply-raw" ? [item.record] : [])
+    const conflictRaw = raw.find((record) => record.native.outcome === "conflict")!
+    expect(conflictRaw.native.requestBodySha256).toBe(HostedApprovalProvenance.sha256(noncanonical))
+    expect(raw.every((record) => record.native.responseSha256 === HostedApprovalProvenance.sha256(new Uint8Array()))).toBe(true)
+    const typed = captured.records.flatMap((item) => item.record.recordType === "hosted-reply" ? [item.record] : [])
+    expect(typed).toHaveLength(2)
+    expect(typed.every((record) => !("responseSha256" in record.native))).toBe(true)
+    for (const record of typed) {
+      expect(raw.find((candidate) => candidate.native.outcome === record.native.outcome)?.operationNonce)
+        .toBe(record.operationNonce)
+    }
   })
 
   test("authenticates and applies one real pending request exactly once", async () => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-    const request = app("secret")
+    const captured = capture()
+    const request = app("secret", captured.producer)
     const headers = {
+      "accept-encoding": "identity",
       "content-type": "application/json",
       "x-opencode-directory": dir.path,
       authorization: auth(),
@@ -239,7 +331,11 @@ describe("hosted approval v2 HttpApi", () => {
       decision: "allow_once",
     }
     const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
-    const applied = await request(path, { method: "POST", headers, body: JSON.stringify(body) })
+    const replies = await Promise.all([
+      request(path, { method: "POST", headers, body: JSON.stringify(body) }),
+      request(path, { method: "POST", headers, body: JSON.stringify(body) }),
+    ])
+    const applied = replies.find((response) => response.status === 200)!
     expect(applied.status).toBe(200)
     expect(await applied.json()).toMatchObject({
       status: "applied",
@@ -248,9 +344,170 @@ describe("hosted approval v2 HttpApi", () => {
       permissionDigest: pending.permissionDigest,
       decision: "allow_once",
     })
-    expect((await request(path, { method: "POST", headers, body: JSON.stringify(body) })).status).toBe(409)
+    expect(replies.map((response) => response.status).sort()).toEqual([200, 409])
     expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
     expect((await (await request(observePath, { headers })).json()).permissions).toEqual([])
+    const raw = captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")
+    const typed = captured.records.filter((item) => item.record.recordType === "hosted-reply")
+    const effects = captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")
+    expect(raw.map((item) => item.record.native.outcome).sort()).toEqual(["applied", "conflict"])
+    expect(typed.map((item) => item.record.native.outcome).sort()).toEqual(["applied", "conflict"])
+    expect(effects).toHaveLength(1)
+    expect(effects[0]).toMatchObject({
+      stream: "protectedEffectLedger",
+      record: {
+        native: {
+          decision: "once",
+          outcome: "applied",
+          requestId: requestID,
+          sessionId: sessionID,
+        },
+      },
+    })
+    const appliedRaw = raw.find((item) => item.record.native.outcome === "applied")!
+    const appliedTyped = typed.find((item) => item.record.native.outcome === "applied")!
+    expect(new Set([appliedRaw.record.operationNonce, appliedTyped.record.operationNonce, effects[0].record.operationNonce]).size).toBe(1)
+  })
+
+  test("captures one actual reject settlement and does not emit an effect for its duplicate", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const captured = capture()
+    const request = app("secret", captured.producer)
+    const headers = {
+      "accept-encoding": "identity",
+      authorization: auth(),
+      "content-type": "application/json",
+      "x-opencode-directory": dir.path,
+    }
+    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
+    const requestID = PermissionV1.ID.make("per_hosted_http_reject")
+    const sessionID = SessionID.make("ses_hosted_http_reject")
+    const asked = request.runFork(
+      InstanceStore.Service.use((store) =>
+        store.provide(
+          { directory: dir.path },
+          Permission.Service.use((permission) => permission.ask({
+            id: requestID,
+            sessionID,
+            permission: "bash",
+            patterns: ["rm -rf build"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          })),
+        ),
+      ),
+    )
+    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
+    const observed = await Effect.runPromise(
+      Effect.gen(function* () {
+        while (true) {
+          const response = yield* Effect.promise(() => request(observePath, { headers }))
+          const body = yield* Effect.promise(() => response.json())
+          if (body.permissions.length === 1) return body.permissions[0]
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(Effect.timeout("2 seconds")),
+    )
+    const body = JSON.stringify({
+      schemaVersion: 2,
+      protocol: "agent-teams-hosted-approval-v2",
+      runtimeInstanceId: capability.runtimeInstanceId,
+      expectedConfigGeneration: capability.configGeneration,
+      requestId: observed.requestId,
+      sessionId: observed.sessionId,
+      sessionIncarnation: observed.sessionIncarnation,
+      requestIncarnation: observed.requestIncarnation,
+      expectedPermissionDigest: observed.permissionDigest,
+      decision: "reject",
+    })
+    const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
+    expect((await request(path, { method: "POST", headers, body })).status).toBe(200)
+    expect((await request(path, { method: "POST", headers, body })).status).toBe(409)
+    expect(Exit.isFailure(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    const effects = captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")
+    expect(effects).toHaveLength(1)
+    expect(effects[0]).toMatchObject({
+      stream: "protectedEffectLedger",
+      record: {
+        native: {
+          decision: "reject",
+          outcome: "applied",
+          permissionDigest: observed.permissionDigest,
+          requestId: requestID,
+          sessionId: sessionID,
+        },
+      },
+    })
+  })
+
+  test("capture failure after settlement remains poisoned and cannot become a retry-safe conflict", async () => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const captured = capture()
+    const request = app("secret", captured.producer)
+    const headers = {
+      "accept-encoding": "identity",
+      authorization: auth(),
+      "content-type": "application/json",
+      "x-opencode-directory": dir.path,
+    }
+    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
+    const requestID = PermissionV1.ID.make("per_hosted_capture_failure")
+    const sessionID = SessionID.make("ses_hosted_capture_failure")
+    const asked = request.runFork(
+      InstanceStore.Service.use((store) =>
+        store.provide(
+          { directory: dir.path },
+          Permission.Service.use((permission) => permission.ask({
+            id: requestID,
+            sessionID,
+            permission: "bash",
+            patterns: ["pwd"],
+            metadata: {},
+            always: [],
+            ruleset: [],
+          })),
+        ),
+      ),
+    )
+    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
+    const observed = await Effect.runPromise(
+      Effect.gen(function* () {
+        while (true) {
+          const response = yield* Effect.promise(() => request(observePath, { headers }))
+          const body = yield* Effect.promise(() => response.json())
+          if (body.permissions.length === 1) return body.permissions[0]
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(Effect.timeout("2 seconds")),
+    )
+    const body = JSON.stringify({
+      schemaVersion: 2,
+      protocol: "agent-teams-hosted-approval-v2",
+      runtimeInstanceId: capability.runtimeInstanceId,
+      expectedConfigGeneration: capability.configGeneration,
+      requestId: observed.requestId,
+      sessionId: observed.sessionId,
+      sessionIncarnation: observed.sessionIncarnation,
+      requestIncarnation: observed.requestIncarnation,
+      expectedPermissionDigest: observed.permissionDigest,
+      decision: "allow_once",
+    })
+    const path = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${requestID}/reply`
+    captured.failTimeline()
+    const first = await request(path, { method: "POST", headers, body }).then(
+      (response) => response.status,
+      () => 0,
+    )
+    const second = await request(path, { method: "POST", headers, body }).then(
+      (response) => response.status,
+      () => 0,
+    )
+    expect(first).not.toBe(200)
+    expect(second).not.toBe(409)
+    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
+    expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
   })
 
   test("config mutation rotates the same authority observed by hosted routes", async () => {

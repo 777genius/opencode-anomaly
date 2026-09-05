@@ -9,6 +9,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { randomUUID } from "node:crypto"
 import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
+import { HostedApprovalProvenance } from "@/hosted-approval/provenance"
+import { digest, rawPermission } from "@/hosted-approval/protocol"
 
 export const Event = PermissionV1.Event
 
@@ -36,10 +38,20 @@ export interface ConditionalReplyInput {
   readonly message?: string
   /** Runs synchronously while the permission state lock is held. */
   readonly matches: (request: PermissionV1.Request) => boolean
+  readonly provenanceOperationNonce?: string
 }
 
 export type ConditionalReplyResult =
-  | { readonly status: "applied"; readonly request: PermissionV1.Request }
+  | {
+      readonly status: "applied"
+      readonly request: PermissionV1.Request
+      readonly runtimeInstanceId: string
+      readonly configGeneration: string
+      readonly sessionIncarnation: string
+      readonly requestIncarnation: string
+      readonly permissionDigest: string
+      readonly reply: "once" | "reject"
+    }
   | { readonly status: "mismatch" }
 
 export interface HostedPendingRequest {
@@ -84,6 +96,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
     const hostedApproval = yield* HostedApprovalCoordinator.Service
+    const provenance = (yield* HostedApprovalProvenance.Service).producer
     const mutex = Semaphore.makeUnsafe(1)
     const state = yield* InstanceState.make<State>(
       Effect.fn("Permission.state")(function* (ctx) {
@@ -290,7 +303,35 @@ const layer = Layer.effect(
                   : new PermissionV1.RejectedError(),
               )
             }
-            return { status: "applied", request: existing.info } as const
+            const snapshot = hostedApproval.snapshot()
+            const permissionDigest = digest(rawPermission(existing.info))
+            const operationNonce = input.provenanceOperationNonce
+            if (provenance && operationNonce) {
+              yield* Effect.sync(() => provenance.emit("protectedEffectLedger", {
+                recordType: "conditional-reply-effect",
+                operationNonce,
+                native: {
+                  configGeneration: snapshot.configGeneration,
+                  decision: input.reply,
+                  outcome: "applied",
+                  permissionDigest,
+                  requestId: existing.info.id,
+                  requestIncarnation: existing.requestIncarnation,
+                  runtimeInstanceId: snapshot.runtimeInstanceId,
+                  sessionId: existing.info.sessionID,
+                  sessionIncarnation: existing.sessionIncarnation,
+                },
+              }))
+            }
+            return {
+              status: "applied",
+              request: existing.info,
+              ...snapshot,
+              sessionIncarnation: existing.sessionIncarnation,
+              requestIncarnation: existing.requestIncarnation,
+              permissionDigest,
+              reply: input.reply,
+            } as const
           }),
         ),
       ),
@@ -368,7 +409,7 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [EventV2Bridge.node, HostedApprovalCoordinator.node],
+  deps: [EventV2Bridge.node, HostedApprovalCoordinator.node, HostedApprovalProvenance.node],
 })
 
 export * as Permission from "."
