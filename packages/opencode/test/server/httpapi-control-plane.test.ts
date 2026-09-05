@@ -17,6 +17,7 @@ import { globalHandlers } from "../../src/server/routes/instance/httpapi/handler
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
+import { HostedApprovalCoordinator } from "../../src/hosted-approval/coordinator"
 
 const input = MoveSession.Input.make({
   sessionID: SessionV2.ID.make("ses_move"),
@@ -28,6 +29,7 @@ const called = Ref.makeUnsafe<MoveSession.Input | undefined>(undefined)
 const apiLayer = HttpRouter.serve(
   HttpApiBuilder.layer(RootHttpApi).pipe(
     Layer.provide([controlHandlers, controlPlaneHandlers, globalHandlers]),
+    Layer.provide(HostedApprovalCoordinator.layer),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // Raw HttpApi routes expose an opaque handler context at the request boundary.
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
