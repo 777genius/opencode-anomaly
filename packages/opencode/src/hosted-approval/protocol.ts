@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer"
 import { createHash } from "node:crypto"
 
 export const protocol = "agent-teams-hosted-approval-v2" as const
@@ -12,7 +13,7 @@ export function canonicalJson(value: unknown): string {
   if (!value || typeof value !== "object") throw new TypeError("Unsupported hosted approval canonical value")
   const record = value as Record<string, unknown>
   return `{${Object.keys(record)
-    .sort()
+    .sort((left, right) => Buffer.from(left).compare(Buffer.from(right)))
     .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
     .join(",")}}`
 }

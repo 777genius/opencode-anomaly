@@ -25,6 +25,18 @@ describe("hosted approval protocol", () => {
     expect(canonicalJson({ z: [{ b: 2, a: 1 }], a: true })).toBe('{"a":true,"z":[{"a":1,"b":2}]}')
   })
 
+  test("sorts divergent Unicode keys by unsigned UTF-8 bytes", () => {
+    const reversed = { "\u{10000}": 1, "\uE000": 2 }
+    const canonical = '{"\uE000":2,"\u{10000}":1}'
+
+    expect(canonicalJson(reversed)).toBe(canonical)
+    expect(digest(reversed)).toBe("daec79d8b6582badd3b46bd783a72379bc0b5ae29f5d59f6133025aad69bc8d4")
+    expect(canonicalJson({ "\uE000": 2, "\u{10000}": 1 })).toBe(canonical)
+    expect(canonicalJson({ nested: [reversed, "\u{10000}", "\uE000"] })).toBe(
+      '{"nested":[{"\uE000":2,"\u{10000}":1},"\u{10000}","\uE000"]}',
+    )
+  })
+
   test("digests the JSON wire projection without undefined fields", () => {
     const internal = { id: "permission_1", tool: undefined, metadata: { value: 1, absent: undefined } }
     const wire = rawPermission(internal) as unknown

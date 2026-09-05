@@ -29,8 +29,9 @@ return 409 with no effect. Successful replies settle exactly one request; reject
 never cascades and `always` is not supported.
 
 Permission digests are lowercase SHA-256 over UTF-8 canonical JSON. Object keys
-are recursively sorted by JavaScript UTF-16 order, arrays retain order, and
-JSON primitives use `JSON.stringify`. Golden vectors:
+are recursively sorted by unsigned UTF-8 byte lexicographic order, arrays retain
+order, and JSON primitives use `JSON.stringify`. Golden vectors:
 
 - `{"requestID":"permission_1","sessionID":"session_1","tool":"bash"}` -> `bf6bdf3651bc31505a7430699c5b3e55b6c51c787cd1ab27cc2017736fa679b2`
 - `{"always":[],"id":"per_1","metadata":{"cwd":"/tmp","risk":1},"patterns":["ls","pwd"],"permission":"bash","sessionID":"ses_1"}` -> `04c8063915eb1c84563b998516a670e59885c0fc453318e7ca8545a94b8accca`
+- `{"":2,"𐀀":1}` -> `daec79d8b6582badd3b46bd783a72379bc0b5ae29f5d59f6133025aad69bc8d4`
