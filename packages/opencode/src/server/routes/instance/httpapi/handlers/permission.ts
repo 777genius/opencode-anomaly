@@ -296,8 +296,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       if (ctx.params.requestID !== ctx.payload.requestId || ctx.params.sessionID !== ctx.payload.sessionId) {
         return yield* new HttpApiError.BadRequest()
       }
-      return yield* hostedApproval.withConditionalReply(
-        Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
           const snapshot = hostedApproval.snapshot()
           if (
             snapshot.runtimeInstanceId !== ctx.payload.runtimeInstanceId ||
@@ -327,8 +326,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             permissionDigest: result.permissionDigest,
             decision: result.reply === "once" ? "allow_once" as const : "reject" as const,
           }
-        }),
-      )
+        })
     })
 
     const hostedReplyRaw = Effect.fn("PermissionHttpApi.hostedReplyRaw")(function* (ctx: {
@@ -390,7 +388,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
         emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
         return response
       }
-      return yield* Effect.uninterruptible(Effect.gen(function* () {
+      return yield* hostedApproval.withConditionalReply(Effect.uninterruptible(Effect.gen(function* () {
         const result = yield* hostedReply({ params: ctx.params, payload, operationNonce }).pipe(
           Effect.map((response) => ({ response } as const)),
           Effect.catchTags({
@@ -441,7 +439,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
           },
         })
         return response
-      }))
+      })))
     })
 
     const list = Effect.fn("PermissionHttpApi.list")(function* () {

@@ -598,6 +598,124 @@ describe("hosted approval v2 HttpApi", () => {
     if (boundary === "abort") await Effect.runPromise(Fiber.interrupt(listener))
   })
 
+  test.each(["no capsule", "capture"] as const)("cancels a validated reply waiting behind publication with %s", async (mode) => {
+    await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
+    const captured = mode === "capture" ? capture() : undefined
+    const request = app("secret", captured?.producer)
+    const headers = {
+      "accept-encoding": "identity",
+      authorization: auth(),
+      "content-type": "application/json",
+      "x-opencode-directory": dir.path,
+    }
+    const capability = await (await request("/experimental/agent-teams/hosted-approval-capability", { headers })).json()
+    const requestID = PermissionV1.ID.make(`per_hosted_coordinator_a_${mode.replace(" ", "_")}`)
+    const requestIDB = PermissionV1.ID.make(`per_hosted_coordinator_b_${mode.replace(" ", "_")}`)
+    const sessionID = SessionID.make(`ses_hosted_coordinator_${mode.replace(" ", "_")}`)
+    const ask = (id: PermissionV1.ID, command: string) => request.runFork(
+      InstanceStore.Service.use((store) => store.provide(
+        { directory: dir.path },
+        Permission.Service.use((permission) => permission.ask({
+          id,
+          sessionID,
+          permission: "bash",
+          patterns: [command],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        })),
+      )),
+    )
+    const asked = ask(requestID, "pwd")
+    const askedB = ask(requestIDB, "whoami")
+    const observePath = `/experimental/agent-teams/hosted-approval/session/${sessionID}/permissions`
+    const observed = await Effect.runPromise(
+      Effect.gen(function* () {
+        while (true) {
+          const response = yield* Effect.promise(() => request(observePath, { headers }))
+          const body = yield* Effect.promise(() => response.json())
+          if (body.permissions.length === 2) return body.permissions
+          yield* Effect.sleep("10 millis")
+        }
+      }).pipe(Effect.timeout("2 seconds")),
+    )
+    const pending = new Map(observed.map((item: { requestId: string }) => [item.requestId, item]))
+    const bodyFor = (item: (typeof observed)[number]) => JSON.stringify({
+      schemaVersion: 2,
+      protocol: "agent-teams-hosted-approval-v2",
+      runtimeInstanceId: capability.runtimeInstanceId,
+      expectedConfigGeneration: capability.configGeneration,
+      requestId: item.requestId,
+      sessionId: item.sessionId,
+      sessionIncarnation: item.sessionIncarnation,
+      requestIncarnation: item.requestIncarnation,
+      expectedPermissionDigest: item.permissionDigest,
+      decision: "allow_once",
+    })
+    const path = (id: PermissionV1.ID) => `/experimental/agent-teams/hosted-approval/session/${sessionID}/permission/${id}/reply`
+    const registered = Effect.runSync(Deferred.make<void>())
+    const published = Effect.runSync(Deferred.make<void>())
+    const release = Effect.runSync(Deferred.make<void>())
+    const listener = request.runFork(Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const unsubscribe = yield* events.listen((event) => {
+        if (
+          event.type !== Permission.Event.Replied.type ||
+          (event.data as { requestID: PermissionV1.ID }).requestID !== requestID
+        ) return Effect.void
+        Deferred.doneUnsafe(published, Effect.void)
+        return Deferred.await(release)
+      })
+      Deferred.doneUnsafe(registered, Effect.void)
+      yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
+    }))
+    await Effect.runPromise(Deferred.await(registered))
+    const firstResponse = request(path(requestID), {
+      method: "POST",
+      headers,
+      body: bodyFor(pending.get(requestID)!),
+    })
+    await Effect.runPromise(Deferred.await(published))
+    const bodyRead = Promise.withResolvers<void>()
+    const controller = new AbortController()
+    const secondResponse = request(path(requestIDB), {
+      method: "POST",
+      headers,
+      signal: controller.signal,
+      body: new ReadableStream({
+        pull(stream) {
+          stream.enqueue(new TextEncoder().encode(bodyFor(pending.get(requestIDB)!)))
+          stream.close()
+          bodyRead.resolve()
+        },
+      }),
+      duplex: "half",
+    } as RequestInit).then((response) => response.status, () => 0)
+    await bodyRead.promise
+    while (captured && captured.nonces() < 4) await Promise.resolve()
+    for (let index = 0; index < 10; index++) await Promise.resolve()
+    controller.abort()
+    Deferred.doneUnsafe(release, Effect.void)
+    expect((await firstResponse).status).toBe(200)
+    expect(await secondResponse).not.toBe(200)
+    expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked)))).toBe(true)
+    expect(askedB.pollUnsafe()).toBeUndefined()
+    const remaining = await Effect.runPromise(Fiber.join(request.runFork(
+      InstanceStore.Service.use((store) => store.provide(
+        { directory: dir.path },
+        Permission.Service.use((permission) => permission.hostedList()),
+      )),
+    )))
+    expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
+    if (captured) {
+      expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
+      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(1)
+      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(1)
+      captured.producer.assertHealthy()
+    }
+    await Effect.runPromise(Fiber.interrupt(listener))
+  })
+
   test("capture failure after A settlement leaves B pending and unsettled", async () => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
     const captured = capture()
