@@ -199,7 +199,7 @@ for (const answered of [false, true]) {
       yield* TestClock.adjust("999 millis")
       expect(waiting.pollUnsafe()).toBeUndefined()
       if (answered) {
-        const response = { jsonrpc: "2.0", id: 1, result: { protocolVersion: 1 } }
+        const response = { jsonrpc: "2.0", id: 1, result: { protocolVersion: 1 } } as const
         yield* Queue.offer(responses, response)
         expect(yield* Fiber.join(waiting)).toEqual(Exit.succeed(response))
         return
