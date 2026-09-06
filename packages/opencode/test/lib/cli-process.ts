@@ -150,6 +150,7 @@ export type AcpHandle = {
   // calls this, so tests only need it when asserting exit behavior.
   readonly close: () => void
   readonly exited: Promise<number>
+  readonly diagnostics: () => string
 }
 
 export type OpencodeCli = {
@@ -386,6 +387,7 @@ export function withCliFixture<A, E>(
     })
 
     const acp = Effect.fn("opencode.acp")(function* (opts?: AcpOpts) {
+      const started = Date.now()
       const argv = ["acp"]
       if (opts?.cwd) argv.push("--cwd", opts.cwd)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
@@ -395,7 +397,7 @@ export function withCliFixture<A, E>(
       // Either way we await proc.exited so the test scope doesn't leak.
       const proc = yield* Effect.acquireRelease(
         Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+          Bun.spawn([process.execPath, "run", "--conditions=browser", cliEntry, ...argv], {
             cwd: opts?.cwd ?? home,
             env: { ...process.env, ...env, ...opts?.env },
             stdin: "pipe",
@@ -461,6 +463,9 @@ export function withCliFixture<A, E>(
         // proc.stdin.end() is idempotent in Bun; no try/catch needed.
         close: () => proc.stdin.end(),
         exited: proc.exited as Promise<number>,
+        diagnostics: () =>
+          `ACP elapsed since spawn=${Date.now() - started}ms exitCode=${proc.exitCode}\n` +
+          `stderr (last 6000):\n${stderrChunks.join("").slice(-6000)}`,
       } satisfies AcpHandle
     })
 

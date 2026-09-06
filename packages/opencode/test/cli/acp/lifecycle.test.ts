@@ -15,10 +15,43 @@ describe("opencode acp lifecycle subprocess", () => {
     "stdin EOF exits cleanly",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* opencode.acp()
+        const acp = yield* opencode.acp({ env: { OPENCODE_ACP_PROFILE: "1" } })
         acp.close()
 
-        const code = yield* Effect.promise(() => acp.exited).pipe(Effect.timeout(Duration.seconds(5)))
+        const code = yield* Effect.promise(() => acp.exited).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(5),
+            orElse: () => Effect.fail(new Error(`Immediate EOF exit deadline exceeded\n${acp.diagnostics()}`)),
+          }),
+        )
+        expect(code).toBe(0)
+      }),
+    60_000,
+  )
+
+  cliIt.live(
+    "stdin EOF after initialize exits cleanly",
+    ({ opencode }) =>
+      Effect.gen(function* () {
+        const acp = yield* opencode.acp({ env: { OPENCODE_ACP_PROFILE: "1" } })
+        yield* acp.send({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: { protocolVersion: 1, clientCapabilities: {} },
+        })
+        expect(yield* acp.receive.pipe(Effect.timeout(Duration.seconds(15)))).toMatchObject({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { protocolVersion: 1 },
+        })
+        acp.close()
+        const code = yield* Effect.promise(() => acp.exited).pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.seconds(5),
+            orElse: () => Effect.fail(new Error(`Post-initialize EOF exit deadline exceeded\n${acp.diagnostics()}`)),
+          }),
+        )
         expect(code).toBe(0)
       }),
     60_000,
