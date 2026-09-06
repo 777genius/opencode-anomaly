@@ -32,7 +32,7 @@ import { Heap } from "./cli/heap"
 import { HostedApprovalProvenance } from "./hosted-approval/provenance"
 
 const args = hideBin(process.argv)
-HostedApprovalProvenance.initialize(process.env, import.meta.path)
+await HostedApprovalProvenance.initialize(process.env, import.meta.path)
 
 function show(out: string) {
   const text = out.trimStart()

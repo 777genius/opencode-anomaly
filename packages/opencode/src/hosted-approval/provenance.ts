@@ -11,6 +11,7 @@ import {
 } from "node:fs"
 import { Context, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { deriveCompiledIdentity, readCompiledModuleBytes } from "./compiled-identity"
 
 export const environmentKey = "CLAUDE_TEAM_PRODUCER_PROVENANCE_V2"
 export const contract = "claude-team/hosted-producer-provenance"
@@ -72,7 +73,10 @@ interface DescriptorIdentity {
 }
 
 export interface Operations {
+  // Explicitly trusted in-process injection only. Neither identity reader can
+  // be selected or overridden by capsule data or environment configuration.
   readonly deriveIdentity: (modulePath: string) => DerivedIdentity
+  readonly deriveCompiledIdentity?: (modulePath: string) => Promise<DerivedIdentity>
   readonly descriptorIdentity: (fd: number) => DescriptorIdentity
   readonly randomNonce: () => string
   readonly write: (fd: number, bytes: Uint8Array, offset: number) => number
@@ -176,30 +180,98 @@ export interface Producer {
   readonly close: () => void
 }
 
-let processProducer: Producer | null = null
-let processInitialized = false
+type BootstrapState =
+  | { readonly status: "uninitialized" | "initializing" | "closed" }
+  | { readonly status: "ready"; readonly producer: Producer | null }
+  | { readonly status: "failed"; readonly error: unknown }
 
-export function initialize(environment: Readonly<Record<string, string | undefined>>, modulePath: string) {
-  if (processInitialized) throw new FatalError("producer-provenance-process-already-initialized")
-  processInitialized = true
-  processProducer = createFromEnvironment(environment, { modulePath })
-  return processProducer
-}
+// A factory permits isolated lifecycle tests without resetting process state.
+// Supplying Operations is a privileged test seam, not an activation mechanism.
+export function createTrustedBootstrap(trustedOperations?: Operations) {
+  let state: BootstrapState = { status: "uninitialized" }
 
-export function current() {
-  return processProducer
-}
+  const assertSettled = () => {
+    if (state.status === "failed") throw state.error
+    if (state.status === "initializing") throw new FatalError("producer-provenance-process-initializing")
+  }
+  const assertInitializing = () => {
+    if (state.status === "failed") throw state.error
+    if (state.status !== "initializing") throw new FatalError("producer-provenance-process-not-initializing")
+  }
+  const fail = (error: unknown): never => {
+    if (state.status === "failed") throw state.error
+    state = { status: "failed", error }
+    throw error
+  }
 
-export function assertInitialized(environment: Readonly<Record<string, string | undefined>>) {
-  if (environment[environmentKey] !== undefined && (!processInitialized || processProducer === null)) {
-    throw new FatalError("producer-provenance-process-not-initialized")
+  return {
+    async initialize(environment: Readonly<Record<string, string | undefined>>, modulePath: string) {
+      if (state.status !== "uninitialized") throw new FatalError("producer-provenance-process-already-initialized")
+      state = { status: "initializing" }
+      try {
+        const source = environment[environmentKey]
+        if (source === undefined) {
+          state = { status: "ready", producer: null }
+          return null
+        }
+        // Parse before taking ownership of descriptors, just as the synchronous
+        // source factory does. Snapshot the capsule before any asynchronous work.
+        const capsule = parseCapsule(source)
+        const operations = trustedOperations ?? createNodeOperations()
+        try {
+          const identity = modulePath.startsWith("/$bunfs/")
+            ? await operations.deriveCompiledIdentity?.(modulePath)
+            : operations.deriveIdentity(modulePath)
+          if (identity === undefined) throw new TypeError("producer-provenance-compiled-unavailable")
+          assertInitializing()
+          const producer = validateProducer(capsule, identity, operations)
+          state = { status: "ready", producer }
+          return producer
+        } catch (error) {
+          closeDescriptors(capsule, operations)
+          throw error
+        }
+      } catch (error) {
+        return fail(error)
+      }
+    },
+    current() {
+      assertSettled()
+      return state.status === "ready" ? state.producer : null
+    },
+    assertInitialized(environment: Readonly<Record<string, string | undefined>>) {
+      // Failure/in-flight state cannot be hidden by removing the environment key.
+      assertSettled()
+      if (environment[environmentKey] !== undefined && (state.status !== "ready" || state.producer === null)) {
+        throw new FatalError("producer-provenance-process-not-initialized")
+      }
+      if (state.status === "ready") state.producer?.assertHealthy()
+    },
+    close() {
+      if (state.status === "initializing") {
+        // Do not close owned FDs while the byte read is outstanding. The pending
+        // initializer will clean up and reject before publishing any open record.
+        state = { status: "failed", error: new FatalError("producer-provenance-process-closed-during-initialization") }
+        return
+      }
+      if (state.status !== "ready") return
+      const producer = state.producer
+      state = { status: "closed" }
+      try {
+        producer?.close()
+      } catch (error) {
+        state = { status: "failed", error }
+        throw error
+      }
+    },
   }
 }
 
-export function close() {
-  processProducer?.close()
-  processProducer = null
-}
+const processBootstrap = createTrustedBootstrap()
+export const initialize = processBootstrap.initialize
+export const current = processBootstrap.current
+export const assertInitialized = processBootstrap.assertInitialized
+export const close = processBootstrap.close
 
 export interface Interface {
   readonly producer: Producer | null
@@ -220,43 +292,50 @@ export function createFromEnvironment(
   const capsule = parseCapsule(source)
   const operations = options.operations ?? createNodeOperations()
   try {
-    const identity = operations.deriveIdentity(options.modulePath)
-    if (
-      identity.pid !== process.pid ||
-      !Number.isSafeInteger(identity.pid) ||
-      identity.pid < 1 ||
-      !DECIMAL.test(identity.startTicks) ||
-      !DECIMAL.test(identity.exeDevice) ||
-      !DECIMAL.test(identity.exeInode) ||
-      !DECIMAL.test(identity.moduleDevice) ||
-      !DECIMAL.test(identity.moduleInode) ||
-      !HEX.test(identity.exeSha256) ||
-      identity.exeSha256 !== capsule.expectedProducer.executableSha256 ||
-      identity.moduleSha256 !== capsule.expectedProducer.moduleSha256
-    ) throw new TypeError("producer-provenance-producer-identity")
-
-    for (const descriptor of Object.values(capsule.streams)) {
-      const observed = operations.descriptorIdentity(descriptor.fd)
-      if (
-        !observed.regularFile ||
-        !observed.append ||
-        !observed.writeOnly ||
-        observed.mode !== 0o600 ||
-        observed.nlink !== "1" ||
-        observed.size !== "0" ||
-        observed.device !== descriptor.device ||
-        observed.inode !== descriptor.inode
-      ) throw new TypeError("producer-provenance-descriptor-identity")
-    }
-    return makeProducer(capsule, identity, operations)
+    return validateProducer(capsule, operations.deriveIdentity(options.modulePath), operations)
   } catch (error) {
-    for (const descriptor of Object.values(capsule.streams)) {
-      try {
-        operations.close(descriptor.fd)
-      } catch {}
-    }
+    closeDescriptors(capsule, operations)
     throw error
   }
+}
+
+function closeDescriptors(capsule: Capsule, operations: Operations) {
+  for (const descriptor of Object.values(capsule.streams)) {
+    try {
+      operations.close(descriptor.fd)
+    } catch {}
+  }
+}
+
+function validateProducer(capsule: Capsule, identity: DerivedIdentity, operations: Operations) {
+  if (
+    identity.pid !== process.pid ||
+    !Number.isSafeInteger(identity.pid) ||
+    identity.pid < 1 ||
+    !DECIMAL.test(identity.startTicks) ||
+    !DECIMAL.test(identity.exeDevice) ||
+    !DECIMAL.test(identity.exeInode) ||
+    !DECIMAL.test(identity.moduleDevice) ||
+    !DECIMAL.test(identity.moduleInode) ||
+    !HEX.test(identity.exeSha256) ||
+    identity.exeSha256 !== capsule.expectedProducer.executableSha256 ||
+    identity.moduleSha256 !== capsule.expectedProducer.moduleSha256
+  ) throw new TypeError("producer-provenance-producer-identity")
+
+  for (const descriptor of Object.values(capsule.streams)) {
+    const observed = operations.descriptorIdentity(descriptor.fd)
+    if (
+      !observed.regularFile ||
+      !observed.append ||
+      !observed.writeOnly ||
+      observed.mode !== 0o600 ||
+      observed.nlink !== "1" ||
+      observed.size !== "0" ||
+      observed.device !== descriptor.device ||
+      observed.inode !== descriptor.inode
+    ) throw new TypeError("producer-provenance-descriptor-identity")
+  }
+  return makeProducer(capsule, identity, operations)
 }
 
 export function parseCapsule(source: string): Capsule {
@@ -616,6 +695,26 @@ export function createNodeOperations(): Operations {
         moduleSha256: module.sha256,
       }
     },
+    deriveCompiledIdentity: (modulePath) => deriveCompiledIdentity(modulePath, {
+      executableIdentity() {
+        if (process.platform !== "linux") throw new TypeError("producer-provenance-compiled-platform")
+        const executable = hashOpenFile("/proc/self/exe")
+        const stat = readFileSync("/proc/self/stat", "utf8")
+        const end = stat.lastIndexOf(") ")
+        const startTicks = end < 0 ? undefined : stat.slice(end + 2).trim().split(/\s+/)[19]
+        if (Number(stat.slice(0, stat.indexOf(" "))) !== process.pid || startTicks === undefined || !DECIMAL.test(startTicks)) {
+          throw new TypeError("producer-provenance-process-stat")
+        }
+        return {
+          pid: process.pid,
+          startTicks,
+          exeDevice: executable.device,
+          exeInode: executable.inode,
+          exeSha256: executable.sha256,
+        }
+      },
+      moduleBytes: readCompiledModuleBytes,
+    }),
     descriptorIdentity(fd) {
       if (process.platform !== "linux") throw new TypeError("producer-provenance-descriptor-flags-unavailable")
       const identity = fstatSync(fd, { bigint: true })
