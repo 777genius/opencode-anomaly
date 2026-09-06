@@ -23,7 +23,7 @@ describe("hosted coordinator readiness", () => {
     expect(JSON.parse(line)).toEqual({ format: readinessFormat, version: 1, ...snapshot })
   })
 
-  test.each([
+  test.each<Partial<typeof snapshot>>([
     { runtimeInstanceId: "predicted" },
     { runtimeInstanceId: `${snapshot.runtimeInstanceId}\n` },
     { configGeneration: "config_generation_invalid" },

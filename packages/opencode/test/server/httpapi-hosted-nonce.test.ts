@@ -122,7 +122,7 @@ describe("hosted operation HTTP nonce", () => {
       { body: JSON.stringify({ ...payload, requestId: "per_body", sessionId: "ses_body" }), outcome: "bad-request", status: 400 },
       { body: JSON.stringify(payload, null, 2), outcome: "conflict", status: 409 },
       { body: JSON.stringify({ ...payload, runtimeInstanceId: `runtime_instance_${"0".repeat(32)}` }), outcome: "precondition-failed", status: 412 },
-    ]
+    ] as const
     for (const item of cases) {
       const response = await request(replyPath, { method: "POST", headers, body: item.body })
       expect(response.status).toBe(item.status)
@@ -130,7 +130,7 @@ describe("hosted operation HTTP nonce", () => {
       const nonce = response.headers.get(operationNonceHeader)
       expect(nonce).toMatch(/^[0-9a-f]{64}$/)
       const group = captured.records.filter((entry) => entry.record.operationNonce === nonce).map((entry) => entry.record)
-      const typed = ["bad-request", "conflict", "precondition-failed"].includes(item.outcome)
+      const typed = item.outcome === "bad-request" || item.outcome === "conflict" || item.outcome === "precondition-failed"
       expect(group.map((record) => record.recordType)).toEqual(typed ? ["hosted-reply-raw", "hosted-reply"] : ["hosted-reply-raw"])
       expect(group[0].native).toEqual({
         configGeneration: null, runtimeInstanceId: null, requestIncarnation: null, sessionIncarnation: null,
