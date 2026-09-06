@@ -18,28 +18,33 @@ const descriptor = (fd: number) => {
   const stat = fstatSync(fd, { bigint: true })
   return { fd, device: stat.dev.toString(), inode: stat.ino.toString() }
 }
-const pending = initialize({
-  [environmentKey]: canonicalJson({
-    activation: {
-      controllerNonce: "a".repeat(64),
-      runId: "run_compiled_listen_test",
-      stackManifestSha256: "b".repeat(64),
-    },
-    contract,
-    contractSha256,
-    expectedProducer: {
-      artifactManifestSha256: "c".repeat(64),
-      executableSha256: "d".repeat(64),
-      implementationId,
-      moduleSha256: "e".repeat(64),
-    },
-    producerRole: "opencode",
-    streams: { openCodeTimeline: descriptor(9), protectedEffectLedger: descriptor(10) },
-    version: 2,
-  }),
-}, `/$bunfs/root/compiled-identity-missing-${process.pid}`)
+const pending = initialize(
+  {
+    [environmentKey]: canonicalJson({
+      activation: {
+        controllerNonce: "a".repeat(64),
+        runId: "run_compiled_listen_test",
+        stackManifestSha256: "b".repeat(64),
+      },
+      contract,
+      contractSha256,
+      expectedProducer: {
+        artifactManifestSha256: "c".repeat(64),
+        executableSha256: "d".repeat(64),
+        implementationId,
+        moduleSha256: "e".repeat(64),
+      },
+      producerRole: "opencode",
+      streams: { openCodeTimeline: descriptor(9), protectedEffectLedger: descriptor(10) },
+      version: 2,
+    }),
+  },
+  `/$bunfs/root/compiled-identity-missing-${process.pid}`,
+)
 const failure = pending.then(
-  () => { throw new Error("missing virtual module unexpectedly initialized") },
+  () => {
+    throw new Error("missing virtual module unexpectedly initialized")
+  },
   (error: unknown) => error,
 )
 

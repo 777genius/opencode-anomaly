@@ -1,14 +1,5 @@
 import { createHash, randomBytes } from "node:crypto"
-import {
-  closeSync,
-  constants,
-  fdatasyncSync,
-  fstatSync,
-  openSync,
-  readFileSync,
-  readSync,
-  writeSync,
-} from "node:fs"
+import { closeSync, constants, fdatasyncSync, fstatSync, openSync, readFileSync, readSync, writeSync } from "node:fs"
 import { Context, Layer } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { deriveCompiledIdentity, readCompiledModuleBytes } from "./compiled-identity"
@@ -320,7 +311,8 @@ function validateProducer(capsule: Capsule, identity: DerivedIdentity, operation
     !HEX.test(identity.exeSha256) ||
     identity.exeSha256 !== capsule.expectedProducer.executableSha256 ||
     identity.moduleSha256 !== capsule.expectedProducer.moduleSha256
-  ) throw new TypeError("producer-provenance-producer-identity")
+  )
+    throw new TypeError("producer-provenance-producer-identity")
 
   for (const descriptor of Object.values(capsule.streams)) {
     const observed = operations.descriptorIdentity(descriptor.fd)
@@ -333,7 +325,8 @@ function validateProducer(capsule: Capsule, identity: DerivedIdentity, operation
       observed.size !== "0" ||
       observed.device !== descriptor.device ||
       observed.inode !== descriptor.inode
-    ) throw new TypeError("producer-provenance-descriptor-identity")
+    )
+      throw new TypeError("producer-provenance-descriptor-identity")
   }
   return makeProducer(capsule, identity, operations)
 }
@@ -342,33 +335,56 @@ export function parseCapsule(source: string): Capsule {
   if (Buffer.byteLength(source) > MAX_CONTRACT_BYTES) throw new TypeError("producer-provenance-contract-bounded")
   const parsed: unknown = JSON.parse(source)
   if (canonicalJson(parsed) !== source) throw new TypeError("producer-provenance-contract-canonical")
-  const item = exactObject(parsed, [
-    "activation",
-    "contract",
-    "contractSha256",
-    "expectedProducer",
-    "producerRole",
-    "streams",
-    "version",
-  ], "producer-provenance-contract")
-  if (item.contract !== contract || item.contractSha256 !== contractSha256 || item.producerRole !== "opencode" || item.version !== 2) {
+  const item = exactObject(
+    parsed,
+    ["activation", "contract", "contractSha256", "expectedProducer", "producerRole", "streams", "version"],
+    "producer-provenance-contract",
+  )
+  if (
+    item.contract !== contract ||
+    item.contractSha256 !== contractSha256 ||
+    item.producerRole !== "opencode" ||
+    item.version !== 2
+  ) {
     throw new TypeError("producer-provenance-contract")
   }
-  const activation = exactObject(item.activation, ["controllerNonce", "runId", "stackManifestSha256"], "producer-provenance-activation")
-  const expected = exactObject(item.expectedProducer, ["artifactManifestSha256", "executableSha256", "implementationId", "moduleSha256"], "producer-provenance-expected-producer")
-  const streams = exactObject(item.streams, ["openCodeTimeline", "protectedEffectLedger"], "producer-provenance-streams")
+  const activation = exactObject(
+    item.activation,
+    ["controllerNonce", "runId", "stackManifestSha256"],
+    "producer-provenance-activation",
+  )
+  const expected = exactObject(
+    item.expectedProducer,
+    ["artifactManifestSha256", "executableSha256", "implementationId", "moduleSha256"],
+    "producer-provenance-expected-producer",
+  )
+  const streams = exactObject(
+    item.streams,
+    ["openCodeTimeline", "protectedEffectLedger"],
+    "producer-provenance-streams",
+  )
   if (
-    typeof activation.controllerNonce !== "string" || !HEX.test(activation.controllerNonce) ||
-    typeof activation.runId !== "string" || !SAFE_ID.test(activation.runId) ||
-    typeof activation.stackManifestSha256 !== "string" || !HEX.test(activation.stackManifestSha256) ||
-    typeof expected.artifactManifestSha256 !== "string" || !HEX.test(expected.artifactManifestSha256) ||
-    typeof expected.executableSha256 !== "string" || !HEX.test(expected.executableSha256) ||
+    typeof activation.controllerNonce !== "string" ||
+    !HEX.test(activation.controllerNonce) ||
+    typeof activation.runId !== "string" ||
+    !SAFE_ID.test(activation.runId) ||
+    typeof activation.stackManifestSha256 !== "string" ||
+    !HEX.test(activation.stackManifestSha256) ||
+    typeof expected.artifactManifestSha256 !== "string" ||
+    !HEX.test(expected.artifactManifestSha256) ||
+    typeof expected.executableSha256 !== "string" ||
+    !HEX.test(expected.executableSha256) ||
     expected.implementationId !== implementationId ||
-    typeof expected.moduleSha256 !== "string" || !HEX.test(expected.moduleSha256)
-  ) throw new TypeError("producer-provenance-contract")
+    typeof expected.moduleSha256 !== "string" ||
+    !HEX.test(expected.moduleSha256)
+  )
+    throw new TypeError("producer-provenance-contract")
   const openCodeTimeline = parseDescriptor(streams.openCodeTimeline, 9)
   const protectedEffectLedger = parseDescriptor(streams.protectedEffectLedger, 10)
-  if (`${openCodeTimeline.device}:${openCodeTimeline.inode}` === `${protectedEffectLedger.device}:${protectedEffectLedger.inode}`) {
+  if (
+    `${openCodeTimeline.device}:${openCodeTimeline.inode}` ===
+    `${protectedEffectLedger.device}:${protectedEffectLedger.inode}`
+  ) {
     throw new TypeError("producer-provenance-descriptor-alias")
   }
   return Object.freeze({
@@ -396,9 +412,12 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
   let closed = false
 
   const fail = (error: unknown): never => {
-    fatal ??= error instanceof FatalError ? error : new FatalError("producer-provenance-fatal", {
-      cause: error instanceof Error ? error : new Error("producer-provenance-failure"),
-    })
+    fatal ??=
+      error instanceof FatalError
+        ? error
+        : new FatalError("producer-provenance-fatal", {
+            cause: error instanceof Error ? error : new Error("producer-provenance-failure"),
+          })
     throw fatal
   }
   const writeRecord = (stream: Stream, recordType: string, operationNonce: string | null, native: object) => {
@@ -406,36 +425,39 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
     if (closed) throw new FatalError("producer-provenance-writer-closed")
     try {
       const emissionNonce = operations.randomNonce()
-      if (!HEX.test(emissionNonce) || emissionNonces.has(emissionNonce)) throw new TypeError("producer-provenance-emission-nonce")
+      if (!HEX.test(emissionNonce) || emissionNonces.has(emissionNonce))
+        throw new TypeError("producer-provenance-emission-nonce")
       emissionNonces.add(emissionNonce)
       const sequence = sequences.get(stream) ?? 0
-      const line = Buffer.from(`${canonicalJson({
-        activation: capsule.activation,
-        contract,
-        contractSha256,
-        emissionNonce,
-        native,
-        operationNonce,
-        previousRecordSha256: previous.get(stream) ?? null,
-        producer: {
-          artifactManifestSha256: capsule.expectedProducer.artifactManifestSha256,
-          exeDev: identity.exeDevice,
-          exeIno: identity.exeInode,
-          exeSha256: identity.exeSha256,
-          implementationId,
-          moduleSha256: identity.moduleSha256,
-          pid: identity.pid,
-          role: "opencode",
-          startTicks: identity.startTicks,
-        },
-        recordType,
-        sequence,
-        stream,
-        version: 2,
-      })}\n`)
+      const line = Buffer.from(
+        `${canonicalJson({
+          activation: capsule.activation,
+          contract,
+          contractSha256,
+          emissionNonce,
+          native,
+          operationNonce,
+          previousRecordSha256: previous.get(stream) ?? null,
+          producer: {
+            artifactManifestSha256: capsule.expectedProducer.artifactManifestSha256,
+            exeDev: identity.exeDevice,
+            exeIno: identity.exeInode,
+            exeSha256: identity.exeSha256,
+            implementationId,
+            moduleSha256: identity.moduleSha256,
+            pid: identity.pid,
+            role: "opencode",
+            startTicks: identity.startTicks,
+          },
+          recordType,
+          sequence,
+          stream,
+          version: 2,
+        })}\n`,
+      )
       if (line.byteLength > MAX_LINE_BYTES) throw new RangeError("producer-provenance-line-bounded")
       const descriptor = capsule.streams[stream]
-      for (let offset = 0; offset < line.byteLength;) {
+      for (let offset = 0; offset < line.byteLength; ) {
         const written = operations.write(descriptor.fd, line, offset)
         if (!Number.isSafeInteger(written) || written < 1 || offset + written > line.byteLength) {
           throw new Error("producer-provenance-short-write")
@@ -520,7 +542,11 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
 function validateRecord(record: NativeRecord) {
   if (record.recordType === "hosted-capability") {
     const native = record.native
-    exactObject(native, ["configGeneration", "outcome", "responseSha256", "runtimeInstanceId", "status"], "producer-provenance-native-capability")
+    exactObject(
+      native,
+      ["configGeneration", "outcome", "responseSha256", "runtimeInstanceId", "status"],
+      "producer-provenance-native-capability",
+    )
     requireIds(native.configGeneration, native.runtimeInstanceId)
     requireHashes(native.responseSha256)
     if (native.outcome !== "ok" || native.status !== 200) throw new TypeError("producer-provenance-native-capability")
@@ -528,7 +554,11 @@ function validateRecord(record: NativeRecord) {
   }
   if (record.recordType === "hosted-observe") {
     const native = record.native
-    exactObject(native, ["configGeneration", "outcome", "permissionCount", "responseSha256", "runtimeInstanceId", "sessionId", "status"], "producer-provenance-native-observe")
+    exactObject(
+      native,
+      ["configGeneration", "outcome", "permissionCount", "responseSha256", "runtimeInstanceId", "sessionId", "status"],
+      "producer-provenance-native-observe",
+    )
     requireIds(native.configGeneration, native.runtimeInstanceId, native.sessionId)
     requireHashes(native.responseSha256)
     if (
@@ -544,42 +574,94 @@ function validateRecord(record: NativeRecord) {
   }
   if (record.recordType === "conditional-reply-effect") {
     const native = record.native
-    exactObject(native, ["configGeneration", "decision", "outcome", "permissionDigest", "requestId", "requestIncarnation", "runtimeInstanceId", "sessionId", "sessionIncarnation"], "producer-provenance-native-effect")
-    requireIds(native.configGeneration, native.requestId, native.requestIncarnation, native.runtimeInstanceId, native.sessionId, native.sessionIncarnation)
+    exactObject(
+      native,
+      [
+        "configGeneration",
+        "decision",
+        "outcome",
+        "permissionDigest",
+        "requestId",
+        "requestIncarnation",
+        "runtimeInstanceId",
+        "sessionId",
+        "sessionIncarnation",
+      ],
+      "producer-provenance-native-effect",
+    )
+    requireIds(
+      native.configGeneration,
+      native.requestId,
+      native.requestIncarnation,
+      native.runtimeInstanceId,
+      native.sessionId,
+      native.sessionIncarnation,
+    )
     requireHashes(native.permissionDigest)
-    if (native.outcome !== "applied" || !["once", "reject"].includes(native.decision)) throw new TypeError("producer-provenance-native-effect")
+    if (native.outcome !== "applied" || !["once", "reject"].includes(native.decision))
+      throw new TypeError("producer-provenance-native-effect")
     return
   }
-  const commonKeys = ["configGeneration", "requestId", "requestIncarnation", "runtimeInstanceId", "sessionId", "sessionIncarnation"]
+  const commonKeys = [
+    "configGeneration",
+    "requestId",
+    "requestIncarnation",
+    "runtimeInstanceId",
+    "sessionId",
+    "sessionIncarnation",
+  ]
   if (record.recordType === "hosted-reply-raw") {
     const native = record.native
-    exactObject(native, [...commonKeys, "outcome", "requestBodySha256", "responseSha256", "status"], "producer-provenance-native-raw-reply")
+    exactObject(
+      native,
+      [...commonKeys, "outcome", "requestBodySha256", "responseSha256", "status"],
+      "producer-provenance-native-raw-reply",
+    )
     requireIds(native.requestId, native.sessionId)
     requireHashes(native.responseSha256)
     const early = native.outcome === "unavailable" || native.outcome === "body-read-failed"
     const failed = native.outcome !== "applied"
-    if (![
-      "unavailable",
-      "body-read-failed",
-      "invalid-json",
-      "invalid-schema",
-      "bad-request",
-      "conflict",
-      "precondition-failed",
-      "applied",
-    ].includes(native.outcome)) throw new TypeError("producer-provenance-native-raw-reply")
-    const expectedStatus = native.outcome === "unavailable" ? 404
-      : native.outcome === "conflict" ? 409
-      : native.outcome === "precondition-failed" ? 412
-      : native.outcome === "applied" ? 200
-      : 400
+    if (
+      ![
+        "unavailable",
+        "body-read-failed",
+        "invalid-json",
+        "invalid-schema",
+        "bad-request",
+        "conflict",
+        "precondition-failed",
+        "applied",
+      ].includes(native.outcome)
+    )
+      throw new TypeError("producer-provenance-native-raw-reply")
+    const expectedStatus =
+      native.outcome === "unavailable"
+        ? 404
+        : native.outcome === "conflict"
+          ? 409
+          : native.outcome === "precondition-failed"
+            ? 412
+            : native.outcome === "applied"
+              ? 200
+              : 400
     if (
       native.status !== expectedStatus ||
-      (early ? native.requestBodySha256 !== null : typeof native.requestBodySha256 !== "string" || !HEX.test(native.requestBodySha256)) ||
+      (early
+        ? native.requestBodySha256 !== null
+        : typeof native.requestBodySha256 !== "string" || !HEX.test(native.requestBodySha256)) ||
       (failed
-        ? native.configGeneration !== null || native.requestIncarnation !== null || native.runtimeInstanceId !== null || native.sessionIncarnation !== null
-        : !validIds(native.configGeneration, native.requestIncarnation, native.runtimeInstanceId, native.sessionIncarnation))
-    ) throw new TypeError("producer-provenance-native-raw-reply")
+        ? native.configGeneration !== null ||
+          native.requestIncarnation !== null ||
+          native.runtimeInstanceId !== null ||
+          native.sessionIncarnation !== null
+        : !validIds(
+            native.configGeneration,
+            native.requestIncarnation,
+            native.runtimeInstanceId,
+            native.sessionIncarnation,
+          ))
+    )
+      throw new TypeError("producer-provenance-native-raw-reply")
     return
   }
   const native = record.native
@@ -594,14 +676,27 @@ function validateRecord(record: NativeRecord) {
   )
   requireIds(native.requestId, native.sessionId)
   requireHashes(native.permissionDigest)
-  const expectedStatus = native.outcome === "conflict" ? 409 : native.outcome === "precondition-failed" ? 412 : applied ? 200 : 400
+  const expectedStatus =
+    native.outcome === "conflict" ? 409 : native.outcome === "precondition-failed" ? 412 : applied ? 200 : 400
   if (
     native.status !== expectedStatus ||
     !["allow_once", "reject"].includes(native.decision) ||
     (applied
-      ? !validIds(native.configGeneration, native.requestIncarnation, native.runtimeInstanceId, native.sessionIncarnation) || typeof native.responseSha256 !== "string" || !HEX.test(native.responseSha256)
-      : native.configGeneration !== null || native.requestIncarnation !== null || native.runtimeInstanceId !== null || native.sessionIncarnation !== null || "responseSha256" in native)
-  ) throw new TypeError("producer-provenance-native-reply")
+      ? !validIds(
+          native.configGeneration,
+          native.requestIncarnation,
+          native.runtimeInstanceId,
+          native.sessionIncarnation,
+        ) ||
+        typeof native.responseSha256 !== "string" ||
+        !HEX.test(native.responseSha256)
+      : native.configGeneration !== null ||
+        native.requestIncarnation !== null ||
+        native.runtimeInstanceId !== null ||
+        native.sessionIncarnation !== null ||
+        "responseSha256" in native)
+  )
+    throw new TypeError("producer-provenance-native-reply")
 }
 
 function validIds(...values: unknown[]) {
@@ -613,12 +708,19 @@ function requireIds(...values: unknown[]) {
 }
 
 function requireHashes(...values: unknown[]) {
-  if (values.some((value) => typeof value !== "string" || !HEX.test(value))) throw new TypeError("producer-provenance-native-hash")
+  if (values.some((value) => typeof value !== "string" || !HEX.test(value)))
+    throw new TypeError("producer-provenance-native-hash")
 }
 
 function parseDescriptor(value: unknown, fd: 9 | 10): Descriptor {
   const item = exactObject(value, ["device", "fd", "inode"], "producer-provenance-descriptor")
-  if (item.fd !== fd || typeof item.device !== "string" || !DECIMAL.test(item.device) || typeof item.inode !== "string" || !DECIMAL.test(item.inode)) {
+  if (
+    item.fd !== fd ||
+    typeof item.device !== "string" ||
+    !DECIMAL.test(item.device) ||
+    typeof item.inode !== "string" ||
+    !DECIMAL.test(item.inode)
+  ) {
     throw new TypeError("producer-provenance-descriptor")
   }
   return Object.freeze({ fd, device: item.device, inode: item.inode })
@@ -628,7 +730,10 @@ function exactObject(value: unknown, keys: readonly string[], reason: string): R
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError(reason)
   const item = value as Record<string, unknown>
   const actual = Reflect.ownKeys(item)
-  if (actual.some((key) => typeof key !== "string") || (actual as string[]).sort(compareUtf8).join("\0") !== [...keys].sort(compareUtf8).join("\0")) {
+  if (
+    actual.some((key) => typeof key !== "string") ||
+    (actual as string[]).sort(compareUtf8).join("\0") !== [...keys].sort(compareUtf8).join("\0")
+  ) {
     throw new TypeError(reason)
   }
   return item
@@ -682,7 +787,13 @@ export function createNodeOperations(): Operations {
       const module = hashOpenFile(modulePath)
       const stat = readFileSync("/proc/self/stat", "utf8")
       const end = stat.lastIndexOf(") ")
-      const startTicks = end < 0 ? undefined : stat.slice(end + 2).trim().split(/\s+/)[19]
+      const startTicks =
+        end < 0
+          ? undefined
+          : stat
+              .slice(end + 2)
+              .trim()
+              .split(/\s+/)[19]
       if (startTicks === undefined || !DECIMAL.test(startTicks)) throw new TypeError("producer-provenance-process-stat")
       return {
         pid: process.pid,
@@ -695,26 +806,37 @@ export function createNodeOperations(): Operations {
         moduleSha256: module.sha256,
       }
     },
-    deriveCompiledIdentity: (modulePath) => deriveCompiledIdentity(modulePath, {
-      executableIdentity() {
-        if (process.platform !== "linux") throw new TypeError("producer-provenance-compiled-platform")
-        const executable = hashOpenFile("/proc/self/exe")
-        const stat = readFileSync("/proc/self/stat", "utf8")
-        const end = stat.lastIndexOf(") ")
-        const startTicks = end < 0 ? undefined : stat.slice(end + 2).trim().split(/\s+/)[19]
-        if (Number(stat.slice(0, stat.indexOf(" "))) !== process.pid || startTicks === undefined || !DECIMAL.test(startTicks)) {
-          throw new TypeError("producer-provenance-process-stat")
-        }
-        return {
-          pid: process.pid,
-          startTicks,
-          exeDevice: executable.device,
-          exeInode: executable.inode,
-          exeSha256: executable.sha256,
-        }
-      },
-      moduleBytes: readCompiledModuleBytes,
-    }),
+    deriveCompiledIdentity: (modulePath) =>
+      deriveCompiledIdentity(modulePath, {
+        executableIdentity() {
+          if (process.platform !== "linux") throw new TypeError("producer-provenance-compiled-platform")
+          const executable = hashOpenFile("/proc/self/exe")
+          const stat = readFileSync("/proc/self/stat", "utf8")
+          const end = stat.lastIndexOf(") ")
+          const startTicks =
+            end < 0
+              ? undefined
+              : stat
+                  .slice(end + 2)
+                  .trim()
+                  .split(/\s+/)[19]
+          if (
+            Number(stat.slice(0, stat.indexOf(" "))) !== process.pid ||
+            startTicks === undefined ||
+            !DECIMAL.test(startTicks)
+          ) {
+            throw new TypeError("producer-provenance-process-stat")
+          }
+          return {
+            pid: process.pid,
+            startTicks,
+            exeDevice: executable.device,
+            exeInode: executable.inode,
+            exeSha256: executable.sha256,
+          }
+        },
+        moduleBytes: readCompiledModuleBytes,
+      }),
     descriptorIdentity(fd) {
       if (process.platform !== "linux") throw new TypeError("producer-provenance-descriptor-flags-unavailable")
       const identity = fstatSync(fd, { bigint: true })

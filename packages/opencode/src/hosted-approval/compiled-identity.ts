@@ -47,7 +47,8 @@ export async function deriveCompiledIdentity(modulePath: string, operations: Com
     before.exeDevice !== after.exeDevice ||
     before.exeInode !== after.exeInode ||
     before.exeSha256 !== after.exeSha256
-  ) throw new TypeError("producer-provenance-compiled-identity-changed")
+  )
+    throw new TypeError("producer-provenance-compiled-identity-changed")
   if (!(bytes instanceof Uint8Array) || bytes.byteLength < 1 || bytes.byteLength > MAX_COMPILED_MODULE_BYTES) {
     throw new RangeError("producer-provenance-compiled-module-bounded")
   }
@@ -89,6 +90,10 @@ function requireCompiledModulePath(modulePath: string) {
   if (
     !modulePath.startsWith("/$bunfs/root/") ||
     /[\\\x00-\x20\x7f?#]/.test(modulePath) ||
-    modulePath.slice("/$bunfs/root/".length).split("/").some((part) => !part || part === "." || part === "..")
-  ) throw new TypeError("producer-provenance-compiled-module-path")
+    modulePath
+      .slice("/$bunfs/root/".length)
+      .split("/")
+      .some((part) => !part || part === "." || part === "..")
+  )
+    throw new TypeError("producer-provenance-compiled-module-path")
 }

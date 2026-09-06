@@ -56,7 +56,10 @@ function harness(options: { failClose?: boolean; failSync?: boolean } = {}) {
   const entered = Promise.withResolvers<void>()
   const calls: string[] = []
   const closed: number[] = []
-  const lines = new Map<number, string[]>([[9, []], [10, []]])
+  const lines = new Map<number, string[]>([
+    [9, []],
+    [10, []],
+  ])
   const identity = {
     pid: process.pid,
     startTicks: "456789",
@@ -110,7 +113,14 @@ function harness(options: { failClose?: boolean; failSync?: boolean } = {}) {
     },
   }
   const environment = { [environmentKey]: capsule() }
-  const records = (fd: number) => lines.get(fd)!.join("").trimEnd().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+  const records = (fd: number) =>
+    lines
+      .get(fd)!
+      .join("")
+      .trimEnd()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
   return {
     bootstrap: createTrustedBootstrap(operations),
     calls,
@@ -183,10 +193,14 @@ describe("compiled module identity", () => {
     "/ordinary/source.ts",
   ])("rejects unsupported virtual path %s before identity or module I/O", async (path) => {
     const fixture = harness()
-    await expect(deriveCompiledIdentity(path, fixture.compiled)).rejects.toThrow("producer-provenance-compiled-module-path")
-    await expect(readCompiledModuleBytes(path, () => {
-      throw new Error("must not select a file")
-    })).rejects.toThrow("producer-provenance-compiled-module-path")
+    await expect(deriveCompiledIdentity(path, fixture.compiled)).rejects.toThrow(
+      "producer-provenance-compiled-module-path",
+    )
+    await expect(
+      readCompiledModuleBytes(path, () => {
+        throw new Error("must not select a file")
+      }),
+    ).rejects.toThrow("producer-provenance-compiled-module-path")
     expect(fixture.calls).toEqual([])
   })
 
@@ -227,30 +241,40 @@ describe.skipIf(process.platform !== "linux")("bounded Bun module reader", () =>
     "rejects size %s before starting bytes()",
     async (size) => {
       const reads: number[] = []
-      await expect(readCompiledModuleBytes(modulePath, () => ({
-        size,
-        slice: () => {
-          reads.push(1)
-          throw new Error("must not read bytes")
-        },
-      }))).rejects.toThrow("producer-provenance-compiled-module-bounded")
+      await expect(
+        readCompiledModuleBytes(modulePath, () => ({
+          size,
+          slice: () => {
+            reads.push(1)
+            throw new Error("must not read bytes")
+          },
+        })),
+      ).rejects.toThrow("producer-provenance-compiled-module-bounded")
       expect(reads).toEqual([])
     },
   )
 
   test.each([0, 4, 6])("rejects a read with unexpected byte count %s", async (size) => {
-    await expect(readCompiledModuleBytes(modulePath, () => ({
-      size: 5,
-      slice: () => ({ bytes: async () => new Uint8Array(size) }),
-    }))).rejects.toThrow("producer-provenance-compiled-module-bounded")
+    await expect(
+      readCompiledModuleBytes(modulePath, () => ({
+        size: 5,
+        slice: () => ({ bytes: async () => new Uint8Array(size) }),
+      })),
+    ).rejects.toThrow("producer-provenance-compiled-module-bounded")
   })
 
   test("propagates a rejected Bun read without a fallback", async () => {
     const error = new Error("test Bun read failure")
-    await expect(readCompiledModuleBytes(modulePath, () => ({
-      size: 5,
-      slice: () => ({ bytes: async () => { throw error } }),
-    }))).rejects.toBe(error)
+    await expect(
+      readCompiledModuleBytes(modulePath, () => ({
+        size: 5,
+        slice: () => ({
+          bytes: async () => {
+            throw error
+          },
+        }),
+      })),
+    ).rejects.toBe(error)
   })
 })
 
@@ -269,7 +293,10 @@ describe("trusted compiled process bootstrap", () => {
 
   test("retains synchronous source factory behavior and uses its source reader in bootstrap", async () => {
     const source = harness()
-    const direct = createFromEnvironment(source.environment, { modulePath: "/source/index.ts", operations: source.operations })
+    const direct = createFromEnvironment(source.environment, {
+      modulePath: "/source/index.ts",
+      operations: source.operations,
+    })
     expect(direct).not.toBeNull()
     expect(source.calls).toEqual(["source:/source/index.ts", "descriptor:9", "descriptor:10"])
     direct!.close()
@@ -326,22 +353,22 @@ describe("trusted compiled process bootstrap", () => {
     await expect(fixture.bootstrap.initialize(fixture.environment, modulePath)).rejects.toThrow("already-initialized")
   })
 
-  test.each([
-    { executableSha256: "f".repeat(64) },
-    { moduleSha256: executableSha256 },
-  ])("checks independent capsule digest expectations %j", async (expected) => {
-    const fixture = harness()
-    const pending = fixture.bootstrap.initialize({ [environmentKey]: capsule(expected) }, modulePath)
-    await fixture.entered
-    fixture.read.resolve(moduleBytes)
-    await expect(pending).rejects.toThrow("producer-provenance-producer-identity")
-    expect(fixture.records(9)).toEqual([])
-    expect(fixture.records(10)).toEqual([])
-    expect(fixture.closed).toEqual([9, 10])
-    expect(() => fixture.bootstrap.current()).toThrow("producer-identity")
-    expect(() => fixture.bootstrap.assertInitialized({})).toThrow("producer-identity")
-    await expect(fixture.bootstrap.initialize(fixture.environment, modulePath)).rejects.toThrow("already-initialized")
-  })
+  test.each([{ executableSha256: "f".repeat(64) }, { moduleSha256: executableSha256 }])(
+    "checks independent capsule digest expectations %j",
+    async (expected) => {
+      const fixture = harness()
+      const pending = fixture.bootstrap.initialize({ [environmentKey]: capsule(expected) }, modulePath)
+      await fixture.entered
+      fixture.read.resolve(moduleBytes)
+      await expect(pending).rejects.toThrow("producer-provenance-producer-identity")
+      expect(fixture.records(9)).toEqual([])
+      expect(fixture.records(10)).toEqual([])
+      expect(fixture.closed).toEqual([9, 10])
+      expect(() => fixture.bootstrap.current()).toThrow("producer-identity")
+      expect(() => fixture.bootstrap.assertInitialized({})).toThrow("producer-identity")
+      await expect(fixture.bootstrap.initialize(fixture.environment, modulePath)).rejects.toThrow("already-initialized")
+    },
+  )
 
   test("retains a rejected read as terminal failure and attempts both closes", async () => {
     const fixture = harness({ failClose: true })
@@ -453,7 +480,9 @@ describe("trusted compiled process bootstrap", () => {
 
   test("rejects an unsupported virtual namespace and cleans up without a fallback", async () => {
     const fixture = harness()
-    await expect(fixture.bootstrap.initialize(fixture.environment, "/$bunfs/other/entry")).rejects.toThrow("compiled-module-path")
+    await expect(fixture.bootstrap.initialize(fixture.environment, "/$bunfs/other/entry")).rejects.toThrow(
+      "compiled-module-path",
+    )
     expect(fixture.calls).toEqual([])
     expect(fixture.closed).toEqual([9, 10])
     expect(fixture.records(9)).toEqual([])
@@ -462,9 +491,14 @@ describe("trusted compiled process bootstrap", () => {
 
   test("rejects capsule-selected module paths before claiming descriptors", async () => {
     const fixture = harness()
-    await expect(fixture.bootstrap.initialize({
-      [environmentKey]: capsule({ modulePath: "/fallback/source.ts" }),
-    }, modulePath)).rejects.toThrow("expected-producer")
+    await expect(
+      fixture.bootstrap.initialize(
+        {
+          [environmentKey]: capsule({ modulePath: "/fallback/source.ts" }),
+        },
+        modulePath,
+      ),
+    ).rejects.toThrow("expected-producer")
     expect(fixture.calls).toEqual([])
     expect(fixture.closed).toEqual([])
     expect(() => fixture.bootstrap.current()).toThrow("expected-producer")
@@ -491,48 +525,72 @@ describe("trusted compiled process bootstrap", () => {
     expect(index.indexOf(call)).toBeLessThan(index.indexOf("const cli = yargs(args)"))
     expect(index.indexOf(call)).toBeLessThan(index.indexOf("await cli.parse"))
     const server = readFileSync(new URL("../../src/server/server.ts", import.meta.url), "utf8")
-    expect(server).toContain("HostedApprovalProvenance.assertInitialized(process.env)\n  const listener = await Effect.runPromise(listenEffect(opts))")
+    expect(server).toContain(
+      "HostedApprovalProvenance.assertInitialized(process.env)\n  const listener = await Effect.runPromise(listenEffect(opts))",
+    )
   })
 
-  test.skipIf(process.platform !== "linux")("the real Server.listen rejects in-flight and failed native bootstrap before opening a socket", async () => {
-    const { spawnSync } = await import("node:child_process")
-    const { openSync, closeSync } = await import("node:fs")
-    const { tmpdir } = await import("../fixture/fixture")
-    await using tmp = await tmpdir()
-    const timeline = openSync(`${tmp.path}/timeline.jsonl`, "ax", 0o600)
-    try {
-      const effects = openSync(`${tmp.path}/effects.jsonl`, "ax", 0o600)
-      try {
-        const result = spawnSync(process.execPath, [`${import.meta.dir}/compiled-identity-listen.fixture.ts`], {
-          cwd: `${import.meta.dir}/../..`,
-          // Do not inherit credentials, real home directories, or activation.
-          env: {
-            PATH: process.env.PATH,
-            HOME: tmp.path,
-            XDG_DATA_HOME: `${tmp.path}/data`,
-            XDG_CACHE_HOME: `${tmp.path}/cache`,
-            XDG_CONFIG_HOME: `${tmp.path}/config`,
-            XDG_STATE_HOME: `${tmp.path}/state`,
-            OPENCODE_TEST_HOME: tmp.path,
-            OPENCODE_TEST_MANAGED_CONFIG_DIR: `${tmp.path}/managed`,
-            OPENCODE_DB: ":memory:",
-            OPENCODE_DISABLE_AUTOUPDATE: "1",
-            OPENCODE_DISABLE_MODELS_FETCH: "1",
-          },
-          stdio: ["ignore", "pipe", "pipe", "ignore", "ignore", "ignore", "ignore", "ignore", "ignore", timeline, effects],
-          encoding: "utf8",
-          timeout: 15000,
-        })
-        expect(result.error).toBeUndefined()
-        expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" })
-        expect(result.stdout).toContain("compiled-listen-guard-ok")
-        expect(readFileSync(`${tmp.path}/timeline.jsonl`, "utf8")).toBe("")
-        expect(readFileSync(`${tmp.path}/effects.jsonl`, "utf8")).toBe("")
-      } finally {
-        closeSync(effects)
+  test.skipIf(process.platform !== "linux")(
+    "the real Server.listen rejects in-flight and failed native bootstrap before opening a socket",
+    async () => {
+      const { spawnSync } = await import("node:child_process")
+      const { openSync, closeSync, mkdtempSync, rmSync } = await import("node:fs")
+      const { tmpdir } = await import("node:os")
+      const { join } = await import("node:path")
+      using tmp = {
+        path: mkdtempSync(join(tmpdir(), "opencode-compiled-listen-")),
+        [Symbol.dispose]() {
+          rmSync(this.path, { recursive: true, force: true })
+        },
       }
-    } finally {
-      closeSync(timeline)
-    }
-  })
+      const timeline = openSync(`${tmp.path}/timeline.jsonl`, "ax", 0o600)
+      try {
+        const effects = openSync(`${tmp.path}/effects.jsonl`, "ax", 0o600)
+        try {
+          const result = spawnSync(process.execPath, [`${import.meta.dir}/compiled-identity-listen.fixture.ts`], {
+            cwd: `${import.meta.dir}/../..`,
+            // Do not inherit credentials, real home directories, or activation.
+            env: {
+              PATH: process.env.PATH,
+              HOME: tmp.path,
+              XDG_DATA_HOME: `${tmp.path}/data`,
+              XDG_CACHE_HOME: `${tmp.path}/cache`,
+              XDG_CONFIG_HOME: `${tmp.path}/config`,
+              XDG_STATE_HOME: `${tmp.path}/state`,
+              OPENCODE_TEST_HOME: tmp.path,
+              OPENCODE_TEST_MANAGED_CONFIG_DIR: `${tmp.path}/managed`,
+              OPENCODE_DB: ":memory:",
+              OPENCODE_DISABLE_AUTOUPDATE: "1",
+              OPENCODE_DISABLE_MODELS_FETCH: "1",
+            },
+            stdio: [
+              "ignore",
+              "pipe",
+              "pipe",
+              "ignore",
+              "ignore",
+              "ignore",
+              "ignore",
+              "ignore",
+              "ignore",
+              timeline,
+              effects,
+            ],
+            encoding: "utf8",
+            timeout: 15000,
+          })
+          expect(result.error).toBeUndefined()
+          expect({ status: result.status, stderr: result.stderr }).toEqual({ status: 0, stderr: "" })
+          expect(result.stdout).toContain("compiled-listen-guard-ok")
+          expect(readFileSync(`${tmp.path}/timeline.jsonl`, "utf8")).toBe("")
+          expect(readFileSync(`${tmp.path}/effects.jsonl`, "utf8")).toBe("")
+        } finally {
+          closeSync(effects)
+        }
+      } finally {
+        closeSync(timeline)
+      }
+    },
+    30_000,
+  )
 })
