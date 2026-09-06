@@ -1,148 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test"
-import { Cause, ConfigProvider, Deferred, Effect, Exit, Fiber, Layer, ManagedRuntime } from "effect"
-import { HttpRouter } from "effect/unstable/http"
+import { Cause, Deferred, Effect, Exit, Fiber } from "effect"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
-import { AppLayer } from "../../src/effect/app-runtime"
-import { attach } from "../../src/effect/run-service"
 import { Permission } from "../../src/permission"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { InstanceStore } from "../../src/project/instance-store"
-import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
-import { ServerAuth } from "../../src/server/auth"
 import { SessionID } from "../../src/session/schema"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { resetDatabase } from "../fixture/db"
-import {
-  canonicalJson,
-  contract,
-  contractSha256,
-  createFromEnvironment,
-  environmentKey,
-  HostedApprovalProvenance,
-  implementationId,
-  type NativeRecord,
-  type Operations,
-  type Producer,
-  type Stream,
-} from "../../src/hosted-approval/provenance"
-
-const apps = new Set<{ dispose: () => Promise<void> }>()
-
-function app(password?: string, producer?: Producer) {
-  const memoMap = Layer.makeMemoMapUnsafe()
-  const runtime = ManagedRuntime.make(AppLayer, { memoMap })
-  const web = HttpRouter.toWebHandler(
-    (producer
-      ? HttpApiApp.createRoutes(undefined, HostedApprovalProvenance.makeLayer(producer))
-      : HttpApiApp.routes).pipe(
-      Layer.provide(
-        ConfigProvider.layer(
-          ConfigProvider.fromUnknown({
-            OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
-            OPENCODE_SERVER_PASSWORD: password,
-          }),
-        ),
-      ),
-    ),
-    { disableLogger: true, memoMap },
-  )
-  const entry = {
-    dispose: async () => {
-      apps.delete(entry)
-      await web.dispose()
-      await runtime.dispose()
-    },
-  }
-  apps.add(entry)
-  return Object.assign(
-    (path: string, init?: RequestInit) =>
-      web.handler(new Request(new URL(path, "http://localhost"), init), HttpApiApp.context),
-    {
-      runFork: <A, E>(effect: Effect.Effect<A, E, ManagedRuntime.ManagedRuntime.Services<typeof runtime>>) =>
-        runtime.runFork(attach(effect)),
-      dispose: entry.dispose,
-    },
-  )
-}
-
-function capture() {
-  const records: Array<{ stream: Stream; record: NativeRecord }> = []
-  const chunks = new Map<number, Uint8Array[]>([[9, []], [10, []]])
-  const consumed = new Map<number, number>([[9, 0], [10, 0]])
-  let nonce = 0
-  let failEffects = false
-  const executableSha256 = HostedApprovalProvenance.sha256("http test executable")
-  const moduleSha256 = HostedApprovalProvenance.sha256("http test module")
-  const operations: Operations = {
-    deriveIdentity: () => ({
-      pid: process.pid,
-      startTicks: "1234",
-      exeDevice: "31",
-      exeInode: "41",
-      exeSha256: executableSha256,
-      moduleDevice: "32",
-      moduleInode: "42",
-      moduleSha256,
-    }),
-    descriptorIdentity: (fd) => ({
-      device: fd === 9 ? "71" : "72",
-      inode: fd === 9 ? "91" : "92",
-      regularFile: true,
-      append: true,
-      writeOnly: true,
-      mode: 0o600,
-      nlink: "1",
-      size: "0",
-    }),
-    randomNonce: () => (++nonce).toString(16).padStart(64, "0"),
-    write: (fd, bytes, offset) => {
-      chunks.get(fd)!.push(bytes.slice(offset))
-      return bytes.byteLength - offset
-    },
-    sync: (fd) => {
-      const bytes = Buffer.concat(chunks.get(fd)!.map((chunk) => Buffer.from(chunk)))
-      const offset = consumed.get(fd)!
-      const lines = bytes.subarray(offset).toString("utf8").trimEnd().split("\n").filter(Boolean)
-      for (const line of lines) {
-        const record = JSON.parse(line) as { recordType: string }
-        if (record.recordType !== "producer-open" && record.recordType !== "producer-close") {
-          records.push({ stream: fd === 9 ? "openCodeTimeline" : "protectedEffectLedger", record: record as NativeRecord })
-        }
-      }
-      consumed.set(fd, bytes.byteLength)
-      if (failEffects && fd === 10) throw new Error("effect capture failed")
-    },
-    close: () => {},
-  }
-  const producer = createFromEnvironment({
-    [environmentKey]: canonicalJson({
-      activation: {
-        controllerNonce: "a".repeat(64),
-        runId: "run_http_capture",
-        stackManifestSha256: "b".repeat(64),
-      },
-      contract,
-      contractSha256,
-      expectedProducer: {
-        artifactManifestSha256: "c".repeat(64),
-        executableSha256,
-        implementationId,
-        moduleSha256,
-      },
-      producerRole: "opencode",
-      streams: {
-        openCodeTimeline: { device: "71", fd: 9, inode: "91" },
-        protectedEffectLedger: { device: "72", fd: 10, inode: "92" },
-      },
-      version: 2,
-    }),
-  }, { modulePath: "/admitted/opencode", operations })!
-  return { producer, records, failEffects: () => { failEffects = true }, nonces: () => nonce }
-}
-
-function auth(password = "secret") {
-  return ServerAuth.header({ username: "opencode", password }) ?? ""
-}
+import { HostedApprovalProvenance } from "../../src/hosted-approval/provenance"
+import { operationNonceHeader } from "../../src/hosted-approval/operation-header"
+import { app, auth, capture, disposeApps } from "../fixture/hosted-approval"
 
 function observe<A>(promise: Promise<A>) {
   return promise.then(
@@ -159,8 +26,7 @@ function bounded<A>(promise: Promise<A>, label: string) {
 }
 
 afterEach(async () => {
-  await Promise.all(Array.from(apps, (web) => web.dispose()))
-  apps.clear()
+  await disposeApps()
   await disposeAllInstances()
   await resetDatabase()
 })
@@ -412,10 +278,17 @@ describe("hosted approval v2 HttpApi", () => {
     ])
     const applied = replies.find((response) => response.status === 200)!
     expect(applied.status).toBe(200)
-    expect(await applied.json()).toMatchObject({
+    const receiptBytes = new Uint8Array(await applied.arrayBuffer())
+    expect(JSON.parse(new TextDecoder().decode(receiptBytes))).toEqual({
+      schemaVersion: 2,
+      protocol: "agent-teams-hosted-approval-v2",
       status: "applied",
+      runtimeInstanceId: capability.runtimeInstanceId,
+      configGeneration: capability.configGeneration,
       requestId: requestID,
       sessionId: sessionID,
+      sessionIncarnation: pending.sessionIncarnation,
+      requestIncarnation: pending.requestIncarnation,
       permissionDigest: pending.permissionDigest,
       decision: "allow_once",
     })
@@ -442,6 +315,16 @@ describe("hosted approval v2 HttpApi", () => {
     const appliedRaw = raw.find((item) => item.record.native.outcome === "applied")!
     const appliedTyped = typed.find((item) => item.record.native.outcome === "applied")!
     expect(new Set([appliedRaw.record.operationNonce, appliedTyped.record.operationNonce, effects[0].record.operationNonce]).size).toBe(1)
+    const nonce = applied.headers.get(operationNonceHeader)
+    expect(nonce).toBe(appliedRaw.record.operationNonce)
+    expect(captured.records.filter((item) => item.record.operationNonce === nonce)).toHaveLength(3)
+    expect(appliedRaw.record.native).toMatchObject({
+      requestBodySha256: HostedApprovalProvenance.sha256(JSON.stringify(body)),
+      responseSha256: HostedApprovalProvenance.sha256(receiptBytes),
+    })
+    expect(appliedTyped.record.native).toHaveProperty("responseSha256", HostedApprovalProvenance.sha256(receiptBytes))
+    expect(captured.records.indexOf(appliedRaw)).toBeLessThan(captured.records.indexOf(appliedTyped))
+    expect(replies.find((response) => response.status === 409)!.headers.get(operationNonceHeader)).not.toBe(nonce)
   })
 
   test("captures one actual reject settlement and does not emit an effect for its duplicate", async () => {
@@ -777,9 +660,13 @@ describe("hosted approval v2 HttpApi", () => {
     }
   })
 
-  test("capture failure after A settlement leaves B pending and unsettled", async () => {
+  test.each(["effect", "raw-write", "raw-sync", "typed-write", "typed-sync"] as const)(
+    "%s capture failure after A settlement leaves B pending and unsettled without a nonce header", async (failure) => {
     await using dir = await tmpdir({ git: true, config: { formatter: false, lsp: false } })
-    const captured = capture()
+    const captured = failure === "effect" ? capture() : capture({
+      failRecord: failure.startsWith("raw") ? "hosted-reply-raw" : "hosted-reply",
+      failPhase: failure.endsWith("write") ? "write" : "sync",
+    })
     const request = app("secret", captured.producer)
     const headers = {
       "accept-encoding": "identity",
@@ -865,7 +752,7 @@ describe("hosted approval v2 HttpApi", () => {
       yield* Effect.never.pipe(Effect.ensuring(unsubscribe))
     }))
     await Effect.runPromise(Deferred.await(registered).pipe(Effect.timeout("2 seconds")))
-    captured.failEffects()
+    if (failure === "effect") captured.failEffects()
     const firstResponse = observe(request(path(requestID), {
       method: "POST",
       headers,
@@ -917,9 +804,18 @@ describe("hosted approval v2 HttpApi", () => {
       if (first._tag === "failure") expect(String(first.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
       if (second._tag === "failure") expect(String(second.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
       if (retry._tag === "failure") expect(String(retry.error)).toMatch(/effect capture failed|producer-provenance-fatal/)
-      if (first._tag === "success") expect(first.value.status).not.toBe(200)
-      if (second._tag === "success") expect(second.value.status).not.toBe(409)
-      if (retry._tag === "success") expect(retry.value.status).not.toBe(409)
+      if (first._tag === "success") {
+        expect(first.value.status).not.toBe(200)
+        expect(first.value.headers.has(operationNonceHeader)).toBe(false)
+      }
+      if (second._tag === "success") {
+        expect(second.value.status).not.toBe(409)
+        expect(second.value.headers.has(operationNonceHeader)).toBe(false)
+      }
+      if (retry._tag === "success") {
+        expect(retry.value.status).not.toBe(409)
+        expect(retry.value.headers.has(operationNonceHeader)).toBe(false)
+      }
       expect(Exit.isSuccess(await Effect.runPromise(Fiber.await(asked).pipe(Effect.timeout("2 seconds"))))).toBe(true)
       expect(askedB.pollUnsafe()).toBeUndefined()
       const remaining = await Effect.runPromise(Fiber.join(request.runFork(
@@ -930,7 +826,7 @@ describe("hosted approval v2 HttpApi", () => {
       )).pipe(Effect.timeout("2 seconds")))
       expect(remaining.map((item) => item.request.id)).toContain(requestIDB)
       expect(captured.records.filter((item) => item.record.recordType === "conditional-reply-effect")).toHaveLength(1)
-      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(0)
+      expect(captured.records.filter((item) => item.record.recordType === "hosted-reply-raw")).toHaveLength(failure.startsWith("typed") ? 1 : 0)
       expect(captured.records.filter((item) => item.record.recordType === "hosted-reply")).toHaveLength(0)
       expect(() => captured.producer.assertHealthy()).toThrow("producer-provenance-fatal")
     } finally {

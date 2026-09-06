@@ -96,6 +96,90 @@ function create(operations: Operations) {
 }
 
 describe("native hosted approval provenance producer", () => {
+  test("pins the exact packaged canonical v2 schema bytes and refuses the superseded capsule digest", async () => {
+    const bytes = new Uint8Array(await Bun.file(new URL(
+      "../../src/hosted-approval/hosted-producer-provenance-v2.schema.json", import.meta.url,
+    )).arrayBuffer())
+    expect(sha256(bytes)).toBe("ef6aa8ac1f139d2b5e9312da8ff1e6dac21da788d46eefbd6e3d43da27da23ba")
+    expect(contractSha256).toBe(sha256(bytes))
+    expect(new TextDecoder().decode(bytes)).toBe(`${canonicalJson(JSON.parse(new TextDecoder().decode(bytes)))}\n`)
+    const fixture = harness()
+    expect(() => createFromEnvironment({
+      [environmentKey]: capsule({ contractSha256: "acde43e62b8ab42cc5fd2bbecc22f1b96d68f456bfa188b8c63730751222f498" }),
+    }, { modulePath: "/admitted/opencode", operations: fixture.operations })).toThrow("producer-provenance-contract")
+    expect(fixture.closed).toEqual([])
+    const producer = create(fixture.operations)
+    producer.close()
+    expect([...fixture.records(9), ...fixture.records(10)].every((record) => record.contractSha256 === sha256(bytes))).toBe(true)
+  })
+
+  test.each(["short", "A".repeat(64), `${"a".repeat(64)}\n`, "throw", "duplicate"])(
+    "permanently poisons after %s operation allocation even if the allocator recovers",
+    (invalid) => {
+      const fixture = harness()
+      const allocation = { fail: false }
+      const producer = create({
+        ...fixture.operations,
+        randomNonce: () => {
+          if (!allocation.fail) return fixture.operations.randomNonce()
+          if (invalid === "throw") throw new Error("allocator failed")
+          return invalid === "duplicate" ? allocated : invalid
+        },
+      })
+      const allocated = producer.operationNonce()
+      allocation.fail = true
+      let fatal: unknown
+      try { producer.operationNonce() } catch (error) { fatal = error }
+      expect(fatal).toBeInstanceOf(Error)
+      allocation.fail = false
+      expect(() => producer.operationNonce()).toThrow(fatal as Error)
+      expect(() => producer.assertHealthy()).toThrow(fatal as Error)
+      expect(() => producer.emit("openCodeTimeline", {
+        recordType: "hosted-capability",
+        operationNonce: allocated,
+        native: { configGeneration: "config_1", runtimeInstanceId: "runtime_1", outcome: "ok", status: 200, responseSha256: "3".repeat(64) },
+      })).toThrow(fatal as Error)
+      producer.close()
+      expect(fixture.records(9).map((record) => record.recordType)).toEqual(["producer-open"])
+      expect(fixture.records(10).map((record) => record.recordType)).toEqual(["producer-open"])
+      expect(fixture.closed).toEqual([9, 10])
+    },
+  )
+
+  test("retains one allocation across all three applied facts and refuses unallocated nonces", () => {
+    const fixture = harness({ writeLimit: 11 })
+    const producer = create(fixture.operations)
+    const operationNonce = producer.operationNonce()
+    const common = {
+      configGeneration: "config_1",
+      runtimeInstanceId: "runtime_1",
+      requestId: "per_1",
+      sessionId: "ses_1",
+      sessionIncarnation: "session_incarnation_1",
+      requestIncarnation: "request_incarnation_1",
+    }
+    producer.emit("protectedEffectLedger", {
+      recordType: "conditional-reply-effect", operationNonce,
+      native: { ...common, decision: "once", outcome: "applied", permissionDigest: "8".repeat(64) },
+    })
+    producer.emit("openCodeTimeline", {
+      recordType: "hosted-reply-raw", operationNonce,
+      native: { ...common, outcome: "applied", status: 200, requestBodySha256: "2".repeat(64), responseSha256: "3".repeat(64) },
+    })
+    producer.emit("openCodeTimeline", {
+      recordType: "hosted-reply", operationNonce,
+      native: { ...common, decision: "allow_once", outcome: "applied", status: 200, permissionDigest: "8".repeat(64), responseSha256: "3".repeat(64) },
+    })
+    producer.assertHealthy()
+    expect([...fixture.records(9), ...fixture.records(10)].filter((record) => record.operationNonce === operationNonce)).toHaveLength(3)
+    expect(fixture.syncs()).toBe(5)
+    expect(() => producer.emit("openCodeTimeline", {
+      recordType: "hosted-capability", operationNonce: "f".repeat(64),
+      native: { configGeneration: "config_1", runtimeInstanceId: "runtime_1", outcome: "ok", status: 200, responseSha256: "3".repeat(64) },
+    })).toThrow("producer-provenance-fatal")
+    producer.close()
+  })
+
   test("is inert without an authorized capsule", () => {
     const fixture = harness()
     expect(createFromEnvironment({}, { modulePath: "/admitted/opencode", operations: fixture.operations })).toBeNull()

@@ -6,7 +6,7 @@ import { deriveCompiledIdentity, readCompiledModuleBytes } from "./compiled-iden
 
 export const environmentKey = "CLAUDE_TEAM_PRODUCER_PROVENANCE_V2"
 export const contract = "claude-team/hosted-producer-provenance"
-export const contractSha256 = "acde43e62b8ab42cc5fd2bbecc22f1b96d68f456bfa188b8c63730751222f498"
+export const contractSha256 = "ef6aa8ac1f139d2b5e9312da8ff1e6dac21da788d46eefbd6e3d43da27da23ba"
 export const implementationId = "agent-teams.opencode.hosted-approval.v1"
 
 const HEX = /^[0-9a-f]{64}$/
@@ -407,6 +407,9 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
   const previous = new Map<Stream, string>()
   const sequences = new Map<Stream, number>()
   const emissionNonces = new Set<string>()
+  // Allocation is unique per operation; its two/three native facts retain the
+  // same nonce across both streams until the producer ends.
+  const operationNonces = new Set<string>()
   let fatal: FatalError | null = null
   let closing = false
   let closed = false
@@ -425,7 +428,12 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
     if (closed) throw new FatalError("producer-provenance-writer-closed")
     try {
       const emissionNonce = operations.randomNonce()
-      if (!HEX.test(emissionNonce) || emissionNonces.has(emissionNonce))
+      if (
+        typeof emissionNonce !== "string" ||
+        emissionNonce.length !== 64 ||
+        !HEX.test(emissionNonce) ||
+        emissionNonces.has(emissionNonce)
+      )
         throw new TypeError("producer-provenance-emission-nonce")
       emissionNonces.add(emissionNonce)
       const sequence = sequences.get(stream) ?? 0
@@ -487,13 +495,20 @@ function makeProducer(capsule: Capsule, identity: DerivedIdentity, operations: O
     operationNonce: () => {
       if (fatal) throw fatal
       if (closed || closing) throw new FatalError("producer-provenance-writer-closed")
-      const nonce = operations.randomNonce()
-      if (!HEX.test(nonce)) return fail(new TypeError("producer-provenance-operation-nonce"))
-      return nonce
+      try {
+        const nonce = operations.randomNonce()
+        if (typeof nonce !== "string" || nonce.length !== 64 || !HEX.test(nonce) || operationNonces.has(nonce)) {
+          throw new TypeError("producer-provenance-operation-nonce")
+        }
+        operationNonces.add(nonce)
+        return nonce
+      } catch (error) {
+        return fail(error)
+      }
     },
     emit(stream, record) {
       try {
-        if (!HEX.test(record.operationNonce)) throw new TypeError("producer-provenance-operation-nonce")
+        if (!operationNonces.has(record.operationNonce)) throw new TypeError("producer-provenance-operation-nonce")
         if (stream === "protectedEffectLedger" && record.recordType !== "conditional-reply-effect") {
           throw new TypeError("producer-provenance-stream-not-owned")
         }

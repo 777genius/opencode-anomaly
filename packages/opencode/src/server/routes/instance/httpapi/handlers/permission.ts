@@ -11,6 +11,7 @@ import { ServerAuth } from "@/server/auth"
 import { Schema, Stream } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HostedApprovalProvenance, sha256, type Producer } from "@/hosted-approval/provenance"
+import { withOperationNonce } from "@/hosted-approval/operation-header"
 
 function rejectDuplicateJsonKeys(text: string): void {
   let offset = 0
@@ -195,9 +196,10 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             authentication: "opencode-basic" as const,
           }
           const response = HttpServerResponse.jsonUnsafe(body)
+          const operationNonce = provenance?.operationNonce()
           provenance?.emit("openCodeTimeline", {
             recordType: "hosted-capability",
-            operationNonce: provenance.operationNonce(),
+            operationNonce: operationNonce!,
             native: {
               configGeneration: body.configGeneration,
               outcome: "ok",
@@ -206,7 +208,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
               status: 200,
             },
           })
-          return response
+          return withOperationNonce(response, operationNonce)
         }),
       )
     })
@@ -245,6 +247,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             permissions,
           }
           const bytes = Buffer.byteLength(JSON.stringify(response), "utf8")
+          const operationNonce = provenance?.operationNonce()
           if (permissions.length > 256 || bytes > 1024 * 1024) {
             yield* Effect.logWarning("hosted approval observe overflow", {
               sessionIdentity: digest(ctx.params.sessionID).slice(0, 16),
@@ -255,7 +258,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             const finalized = HttpServerResponse.jsonUnsafe(error, { status: 500 })
             provenance?.emit("openCodeTimeline", {
               recordType: "hosted-observe",
-              operationNonce: provenance.operationNonce(),
+              operationNonce: operationNonce!,
               native: {
                 configGeneration: response.configGeneration,
                 outcome: "overflow",
@@ -266,12 +269,12 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
                 status: 500,
               },
             })
-            return finalized
+            return withOperationNonce(finalized, operationNonce)
           }
           const finalized = HttpServerResponse.jsonUnsafe(response)
           provenance?.emit("openCodeTimeline", {
             recordType: "hosted-observe",
-            operationNonce: provenance.operationNonce(),
+            operationNonce: operationNonce!,
             native: {
               configGeneration: response.configGeneration,
               outcome: "ok",
@@ -282,7 +285,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
               status: 200,
             },
           })
-          return finalized
+          return withOperationNonce(finalized, operationNonce)
         }),
       )
     })
@@ -341,7 +344,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       if (unavailable) {
         const response = HttpServerResponse.empty({ status: 404 })
         emitRaw(provenance, operationNonce, ctx.params, "unavailable", null, 404)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       const bytes = yield* readHostedReplyBody(ctx.request.stream).pipe(
         Effect.catch(() => Effect.succeed(undefined)),
@@ -349,7 +352,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       if (!bytes) {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "body-read-failed", null, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       const requestBodySha256 = sha256(bytes)
       let text: string
@@ -359,24 +362,24 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       } catch {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "invalid-json", requestBodySha256, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       let untyped: unknown
       try { untyped = JSON.parse(text) } catch {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "invalid-json", requestBodySha256, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       if (!untyped || typeof untyped !== "object" || Array.isArray(untyped)) {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       const keys = Object.keys(untyped).sort()
       if (keys.length !== HOSTED_REPLY_KEYS.length || keys.some((key, index) => key !== HOSTED_REPLY_KEYS[index])) {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       const payload = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(HostedReplyPayload))(text, {
         onExcessProperty: "error",
@@ -386,7 +389,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
       if (!payload) {
         const response = HttpServerResponse.empty({ status: 400 })
         emitRaw(provenance, operationNonce, ctx.params, "invalid-schema", requestBodySha256, 400)
-        return response
+        return withOperationNonce(response, operationNonce)
       }
       return yield* hostedApproval.withConditionalReply(Effect.uninterruptible(Effect.gen(function* () {
         const result = yield* hostedReply({ params: ctx.params, payload, operationNonce }).pipe(
@@ -401,7 +404,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
           const response = HttpServerResponse.empty({ status: result.status })
           emitRaw(provenance, operationNonce, ctx.params, result.outcome, requestBodySha256, result.status)
           emitTypedFailure(provenance, operationNonce, payload, result.outcome, result.status)
-          return response
+          return withOperationNonce(response, operationNonce)
         }
         const responseSha256 = sha256(JSON.stringify(result.response))
         const response = HttpServerResponse.jsonUnsafe(result.response)
@@ -438,7 +441,7 @@ export const permissionHandlers = HttpApiBuilder.group(InstanceHttpApi, "permiss
             status: 200,
           },
         })
-        return response
+        return withOperationNonce(response, operationNonce)
       })))
     })
 
