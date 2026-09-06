@@ -1,4 +1,4 @@
-import { Clock, Deferred, Duration, Effect } from "effect"
+import { Clock, Deferred, Duration, Effect, Fiber } from "effect"
 
 // The harness runs TypeScript source, including Bun transpilation and Instance
 // loading. Use its existing 30s process budget for that phase, independently of
@@ -13,10 +13,19 @@ export function trackAcpStartup(input: {
 }) {
   return Effect.gen(function* () {
     const ready = yield* Deferred.make<number>()
+    // Observe the process once for the handle's scope, independently of waiters.
+    // Retain exit time even when the first wait happens after the deadline.
+    const exited = yield* input.exited.pipe(
+      Effect.flatMap((code) => Clock.currentTimeMillis.pipe(Effect.map((at) => ({ code, at })))),
+      Effect.forkScoped({ startImmediately: true }),
+    )
     const stderr = { tail: "" }
     const diagnostics = () =>
       `ACP elapsed since spawn=${Date.now() - input.started}ms exitCode=${input.exitCode()}\n` +
       `stderr (last 6000):\n${stderr.tail}`
+    const startupExpired = () => Effect.fail(new Error(`ACP startup deadline exceeded (30000ms)\n${diagnostics()}`))
+    const shutdownExpired = () =>
+      Effect.fail(new Error(`Immediate EOF exit deadline exceeded (5000ms after readiness)\n${diagnostics()}`))
     const observe = (chunk: string) =>
       Effect.gen(function* () {
         const text = stderr.tail + chunk
@@ -30,14 +39,16 @@ export function trackAcpStartup(input: {
       })
     const startup = Effect.gen(function* () {
       const now = yield* Clock.currentTimeMillis
-      return yield* Deferred.await(ready).pipe(
+      const result = yield* Deferred.await(ready).pipe(
         Effect.map((at) => ({ type: "ready" as const, at })),
-        Effect.raceFirst(input.exited.pipe(Effect.map((code) => ({ type: "exited" as const, code })))),
+        Effect.raceFirst(Fiber.join(exited).pipe(Effect.map((exit) => ({ type: "exited" as const, ...exit })))),
         Effect.timeoutOrElse({
           duration: Duration.millis(Math.max(0, input.started + startupTimeoutMs - now)),
-          orElse: () => Effect.fail(new Error(`ACP startup deadline exceeded (30000ms)\n${diagnostics()}`)),
+          orElse: startupExpired,
         }),
       )
+      if (result.at > input.started + startupTimeoutMs) return yield* startupExpired()
+      return result
     })
 
     return {
@@ -56,15 +67,14 @@ export function trackAcpStartup(input: {
         const result = yield* startup
         if (result.type === "exited") return result.code
         const now = yield* Clock.currentTimeMillis
-        return yield* input.exited.pipe(
+        const exit = yield* Fiber.join(exited).pipe(
           Effect.timeoutOrElse({
             duration: Duration.millis(Math.max(0, result.at + shutdownTimeoutMs - now)),
-            orElse: () =>
-              Effect.fail(
-                new Error(`Immediate EOF exit deadline exceeded (5000ms after readiness)\n${diagnostics()}`),
-              ),
+            orElse: shutdownExpired,
           }),
         )
+        if (exit.at > result.at + shutdownTimeoutMs) return yield* shutdownExpired()
+        return exit.code
       }),
     }
   })
