@@ -6,24 +6,19 @@ import type {
   ResumeSessionResponse,
 } from "@agentclientprotocol/sdk"
 import { Duration, Effect } from "effect"
-import { cliIt } from "../../lib/cli-process"
-import { expectOk, selectConfigOption } from "./acp-test-client"
-import { createAcpClient, initialize, newSession, verifierConfig } from "./helpers"
+import { cliIt, type CliFixture } from "../../lib/cli-process"
+import { createAcpClient, expectOk, selectConfigOption } from "./acp-test-client"
+import { initialize, newSession, verifierConfig } from "./helpers"
 
 describe("opencode acp lifecycle subprocess", () => {
   cliIt.live(
     "stdin EOF exits cleanly",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* opencode.acp({ env: { OPENCODE_ACP_PROFILE: "1" } })
+        const acp = yield* opencode.acp()
         acp.close()
 
-        const code = yield* Effect.promise(() => acp.exited).pipe(
-          Effect.timeoutOrElse({
-            duration: Duration.seconds(5),
-            orElse: () => Effect.fail(new Error(`Immediate EOF exit deadline exceeded\n${acp.diagnostics()}`)),
-          }),
-        )
+        const code = yield* acp.exitAfterStartup
         expect(code).toBe(0)
       }),
     60_000,
@@ -33,7 +28,8 @@ describe("opencode acp lifecycle subprocess", () => {
     "stdin EOF after initialize exits cleanly",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* opencode.acp({ env: { OPENCODE_ACP_PROFILE: "1" } })
+        const acp = yield* opencode.acp()
+        yield* acp.ready
         yield* acp.send({
           jsonrpc: "2.0",
           id: 1,
@@ -61,7 +57,7 @@ describe("opencode acp lifecycle subprocess", () => {
     "close capability and close request",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* createAcpClient(
+        const acp = yield* createLifecycleClient(
           { opencode },
           { OPENCODE_CONFIG_CONTENT: JSON.stringify(verifierConfig(llm.url)) },
         )
@@ -78,7 +74,7 @@ describe("opencode acp lifecycle subprocess", () => {
     "loadSession capability and load request return session config options",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* createAcpClient(
+        const acp = yield* createLifecycleClient(
           { opencode },
           { OPENCODE_CONFIG_CONTENT: JSON.stringify(verifierConfig(llm.url)) },
         )
@@ -102,7 +98,7 @@ describe("opencode acp lifecycle subprocess", () => {
     "list request includes a live ACP-created session",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* createAcpClient(
+        const acp = yield* createLifecycleClient(
           { opencode },
           { OPENCODE_CONFIG_CONTENT: JSON.stringify(verifierConfig(llm.url)) },
         )
@@ -119,7 +115,7 @@ describe("opencode acp lifecycle subprocess", () => {
     "resume capability advertisement",
     ({ opencode }) =>
       Effect.gen(function* () {
-        const initialized = yield* initialize(yield* createAcpClient({ opencode }))
+        const initialized = yield* initialize(yield* createLifecycleClient({ opencode }))
 
         expect(initialized.agentCapabilities?.sessionCapabilities?.resume).toEqual({})
       }),
@@ -130,7 +126,7 @@ describe("opencode acp lifecycle subprocess", () => {
     "resume request returns session config options",
     ({ home, llm, opencode }) =>
       Effect.gen(function* () {
-        const acp = yield* createAcpClient(
+        const acp = yield* createLifecycleClient(
           { opencode },
           { OPENCODE_CONFIG_CONTENT: JSON.stringify(verifierConfig(llm.url)) },
         )
@@ -149,3 +145,13 @@ describe("opencode acp lifecycle subprocess", () => {
     60_000,
   )
 })
+
+// Lifecycle RPC deadlines begin at transport readiness. Keep this local so the
+// raw harness and other tests can still exercise requests/EOF during startup.
+function createLifecycleClient(input: Pick<CliFixture, "opencode">, env?: Record<string, string>) {
+  return Effect.gen(function* () {
+    const acp = yield* input.opencode.acp(env ? { env } : undefined)
+    yield* acp.ready
+    return createAcpClient(acp)
+  })
+}

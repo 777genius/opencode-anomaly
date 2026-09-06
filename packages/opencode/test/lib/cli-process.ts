@@ -22,13 +22,14 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
-import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
+import { Clock, Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
 import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
 import { it } from "./effect"
+import { trackAcpStartup } from "./acp-startup"
 
 const opencodeRoot = path.resolve(import.meta.dir, "../../")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
@@ -140,6 +141,10 @@ export type AcpOpts = SpawnOpts & {
 }
 
 export type AcpHandle = {
+  // Opt-in waits: acp() itself returns before readiness so callers can close
+  // stdin immediately. Source startup is bounded separately from RPC/EOF.
+  readonly ready: Effect.Effect<void, Error>
+  readonly exitAfterStartup: Effect.Effect<number, Error>
   // Writes a single JSON-RPC message to the child's stdin as one ndjson line.
   readonly send: (msg: object) => Effect.Effect<void>
   // Resolves with the next parsed JSON-RPC line from the child's stdout.
@@ -387,7 +392,7 @@ export function withCliFixture<A, E>(
     })
 
     const acp = Effect.fn("opencode.acp")(function* (opts?: AcpOpts) {
-      const started = Date.now()
+      const started = yield* Clock.currentTimeMillis
       const argv = ["acp"]
       if (opts?.cwd) argv.push("--cwd", opts.cwd)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
@@ -399,7 +404,7 @@ export function withCliFixture<A, E>(
         Effect.sync(() =>
           Bun.spawn([process.execPath, "run", "--conditions=browser", cliEntry, ...argv], {
             cwd: opts?.cwd ?? home,
-            env: { ...process.env, ...env, ...opts?.env },
+            env: { ...process.env, ...env, ...opts?.env, OPENCODE_ACP_PROFILE: "1" },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
@@ -424,8 +429,18 @@ export function withCliFixture<A, E>(
           }).pipe(Effect.ignore),
       )
 
-      const stderrChunks: string[] = []
-      yield* forkStderrDrain(proc.stderr, stderrChunks)
+      const startup = yield* trackAcpStartup({
+        started,
+        exited: Effect.tryPromise({ try: () => proc.exited, catch: (cause) => new Error(String(cause)) }),
+        exitCode: () => proc.exitCode,
+      })
+      yield* Effect.forkScoped(
+        fromBunStream("stderr", () => proc.stderr).pipe(
+          Stream.decodeText(),
+          Stream.runForEach(startup.observe),
+          Effect.ignore({ log: true }),
+        ),
+      )
 
       // Each ndjson line becomes one queue entry. JSON.parse failures are
       // surfaced as the raw string so a malformed protocol message doesn't
@@ -463,9 +478,9 @@ export function withCliFixture<A, E>(
         // proc.stdin.end() is idempotent in Bun; no try/catch needed.
         close: () => proc.stdin.end(),
         exited: proc.exited as Promise<number>,
-        diagnostics: () =>
-          `ACP elapsed since spawn=${Date.now() - started}ms exitCode=${proc.exitCode}\n` +
-          `stderr (last 6000):\n${stderrChunks.join("").slice(-6000)}`,
+        ready: startup.ready,
+        exitAfterStartup: startup.exitAfterStartup,
+        diagnostics: startup.diagnostics,
       } satisfies AcpHandle
     })
 
