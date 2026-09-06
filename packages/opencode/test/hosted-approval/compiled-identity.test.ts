@@ -279,17 +279,20 @@ describe.skipIf(process.platform !== "linux")("bounded Bun module reader", () =>
 })
 
 describe("trusted compiled process bootstrap", () => {
-  test("is inert without configuration even for an unsupported module path", async () => {
-    const fixture = harness()
-    expect(fixture.bootstrap.current()).toBeNull()
-    expect(fixture.bootstrap.assertInitialized({})).toBeUndefined()
-    expect(await fixture.bootstrap.initialize({}, "/$bunfs/unsupported")).toBeNull()
-    expect(fixture.calls).toEqual([])
-    expect(fixture.bootstrap.current()).toBeNull()
-    fixture.bootstrap.close()
-    expect(fixture.closed).toEqual([])
-    await expect(fixture.bootstrap.initialize(fixture.environment, modulePath)).rejects.toThrow("already-initialized")
-  })
+  test.each(["/$bunfs/unsupported", "/source/index.ts", "C:\\source\\index.ts"])(
+    "is inert without configuration for %s",
+    async (path) => {
+      const fixture = harness()
+      expect(fixture.bootstrap.current()).toBeNull()
+      expect(fixture.bootstrap.assertInitialized({})).toBeUndefined()
+      expect(await fixture.bootstrap.initialize({}, path)).toBeNull()
+      expect(fixture.calls).toEqual([])
+      expect(fixture.bootstrap.current()).toBeNull()
+      fixture.bootstrap.close()
+      expect(fixture.closed).toEqual([])
+      await expect(fixture.bootstrap.initialize(fixture.environment, modulePath)).rejects.toThrow("already-initialized")
+    },
+  )
 
   test("retains synchronous source factory behavior and uses its source reader in bootstrap", async () => {
     const source = harness()
@@ -524,7 +527,7 @@ describe("trusted compiled process bootstrap", () => {
     expect(index.split(call)).toHaveLength(2)
     expect(index.indexOf(call)).toBeLessThan(index.indexOf("const cli = yargs(args)"))
     expect(index.indexOf(call)).toBeLessThan(index.indexOf("await cli.parse"))
-    const server = readFileSync(new URL("../../src/server/server.ts", import.meta.url), "utf8")
+    const server = readFileSync(new URL("../../src/server/server.ts", import.meta.url), "utf8").replaceAll("\r\n", "\n")
     expect(server).toContain(
       "HostedApprovalProvenance.assertInitialized(process.env)\n  const listener = await Effect.runPromise(listenEffect(opts))",
     )
