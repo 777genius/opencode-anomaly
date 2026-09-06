@@ -11,9 +11,9 @@ runs:
     # node-gyp@latest (invoked via bunx for native install scripts) requires Node >=22;
     # some runner images ship an older system Node on PATH
     - name: Setup Node
-      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
-        node-version: "24"
+        node-version: "24.19.0"
 
     - name: Get baseline download URL
       id: bun-url
@@ -35,6 +35,13 @@ runs:
         bun-version-file: ${{ !steps.bun-url.outputs.url && 'package.json' || '' }}
         bun-download-url: ${{ steps.bun-url.outputs.url }}
 
+    - name: Verify pinned Bun version
+      shell: bash
+      run: |
+        expected=$(node -p "require('./package.json').packageManager.split('@')[1]")
+        actual=$(bun --version)
+        test "$actual" = "$expected"
+
     - name: Get cache directory
       id: cache
       shell: bash
@@ -42,32 +49,24 @@ runs:
 
     - name: Restore Bun dependencies
       id: bun-cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.cache.outputs.dir }}
-        key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('package.json', '**/bun.lock') }}
         restore-keys: |
-          ${{ runner.os }}-bun-
+          ${{ runner.os }}-${{ runner.arch }}-bun-
 
     - name: Install setuptools for distutils compatibility
       run: python3 -m pip install setuptools || pip install setuptools || true
       shell: bash
 
     - name: Install dependencies
-      run: |
-        # Workaround for patched peer variants
-        # e.g. ./patches/ for standard-openapi
-        # https://github.com/oven-sh/bun/issues/28147
-        if [ "$RUNNER_OS" = "Windows" ]; then
-          bun install --linker hoisted ${{ inputs.install-flags }}
-        else
-          bun install ${{ inputs.install-flags }}
-        fi
+      run: bun install --frozen-lockfile ${{ inputs.install-flags }}
       shell: bash
 
     - name: Save Bun dependencies
       if: steps.bun-cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request' && github.event_name != 'pull_request_target'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.cache.outputs.dir }}
-        key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-bun-${{ hashFiles('package.json', '**/bun.lock') }}

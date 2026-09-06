@@ -29,8 +29,10 @@ import { DbCommand } from "./cli/cmd/db"
 import { errorMessage } from "./util/error"
 import { PluginCommand } from "./cli/cmd/plug"
 import { Heap } from "./cli/heap"
+import { HostedApprovalProvenance } from "./hosted-approval/provenance"
 
 const args = hideBin(process.argv)
+HostedApprovalProvenance.initialize(process.env, import.meta.path)
 
 function show(out: string) {
   const text = out.trimStart()
@@ -134,6 +136,7 @@ try {
   }
   process.exitCode = 1
 } finally {
+  HostedApprovalProvenance.close()
   // Some subprocesses don't react properly to SIGTERM and similar signals.
   // Most notably, some docker-container-based MCP servers don't handle such signals unless
   // run using `docker run --init`.
