@@ -13,6 +13,7 @@ const run = <A, E, R, E2>(
   layer: Layer.Layer<R, E2>,
   phase?: (label: string) => void,
 ) => {
+  // Capture the caller-bound observer through body finalizers and late promise settlement.
   phase?.("test.entry")
   const promise = Effect.gen(function* () {
     const exit = yield* body(
