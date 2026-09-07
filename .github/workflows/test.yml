@@ -12,10 +12,10 @@ env:
 
 jobs:
   unit:
-    name: Windows one-off phase measurement
-    if: github.ref == 'refs/heads/test/windows-unit-phase-measurement-r1018'
+    name: Windows focused fixture measurement
+    if: github.ref == 'refs/heads/test/windows-focused-fixture-measurement-r1085'
     runs-on: windows-2025
-    timeout-minutes: 40
+    timeout-minutes: 25
     defaults:
       run:
         shell: bash
@@ -79,84 +79,16 @@ jobs:
           $rg = Get-Command rg -ErrorAction Stop
           & $rg.Source --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $logs = Join-Path $env:RUNNER_TEMP "windows-phase-r1018"
+          $logs = Join-Path $env:RUNNER_TEMP "windows-focused-r1085"
           New-Item -ItemType Directory -Force -Path $logs | Out-Null
-          foreach ($mode in @("cold", "preimport", "opencode")) {
+          foreach ($mode in @("opencode")) {
             "not-started" | Set-Content (Join-Path $logs "$mode.status.txt")
           }
-
-      - name: Measure cold once
-        id: cold
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 3
-        working-directory: packages/core
-        shell: pwsh
-        env:
-          OPENCODE_VERTEX_ANTHROPIC_PHASES: "1"
-          OPENCODE_VERTEX_ANTHROPIC_PREIMPORT: "0"
-          OPENCODE_WINDOWS_UNIT_DIAGNOSTICS: "0"
-        run: |
-          $logs = Join-Path $env:RUNNER_TEMP "windows-phase-r1018"
-          $status = Join-Path $logs "cold.status.txt"
-          "started; exit=unavailable" | Set-Content $status
-          $process = Start-Process -FilePath (Get-Command bun -ErrorAction Stop).Source `
-            -ArgumentList "test ./test/plugin/provider-google-vertex-anthropic.test.ts" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
-            -RedirectStandardOutput (Join-Path $logs "cold.stdout.log") `
-            -RedirectStandardError (Join-Path $logs "cold.stderr.log")
-          $null = $process.Handle
-          if (!$process.WaitForExit(120000)) {
-            "watchdog-timeout; exit=unavailable" | Set-Content $status
-            $process.Kill($true)
-            if ($process.WaitForExit(5000)) {
-              "watchdog-timeout; exit=$($process.ExitCode)" | Set-Content $status
-            }
-            exit 1
-          }
-          $code = $process.ExitCode
-          # Bound redirected-stream drain as well as execution; never use WaitForExit().
-          $drained = $process.WaitForExitAsync().Wait(5000)
-          "exited; exit=$code; drained=$drained" | Set-Content $status
-          if (!$drained) { exit 1 }
-          exit $code
-
-      - name: Measure preimport once
-        id: preimport
-        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 3
-        working-directory: packages/core
-        shell: pwsh
-        env:
-          OPENCODE_VERTEX_ANTHROPIC_PHASES: "1"
-          OPENCODE_VERTEX_ANTHROPIC_PREIMPORT: "1"
-          OPENCODE_WINDOWS_UNIT_DIAGNOSTICS: "0"
-        run: |
-          $logs = Join-Path $env:RUNNER_TEMP "windows-phase-r1018"
-          $status = Join-Path $logs "preimport.status.txt"
-          "started; exit=unavailable" | Set-Content $status
-          $process = Start-Process -FilePath (Get-Command bun -ErrorAction Stop).Source `
-            -ArgumentList "test ./test/plugin/provider-google-vertex-anthropic.test.ts" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
-            -RedirectStandardOutput (Join-Path $logs "preimport.stdout.log") `
-            -RedirectStandardError (Join-Path $logs "preimport.stderr.log")
-          $null = $process.Handle
-          if (!$process.WaitForExit(120000)) {
-            "watchdog-timeout; exit=unavailable" | Set-Content $status
-            $process.Kill($true)
-            if ($process.WaitForExit(5000)) {
-              "watchdog-timeout; exit=$($process.ExitCode)" | Set-Content $status
-            }
-            exit 1
-          }
-          $code = $process.ExitCode
-          # Bound redirected-stream drain as well as execution; never use WaitForExit().
-          $drained = $process.WaitForExitAsync().Wait(5000)
-          "exited; exit=$code; drained=$drained" | Set-Content $status
-          if (!$drained) { exit 1 }
-          exit $code
 
       - name: Measure opencode once
         id: opencode
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        timeout-minutes: 20
+        timeout-minutes: 6
         working-directory: packages/opencode
         shell: pwsh
         env:
@@ -164,15 +96,15 @@ jobs:
           OPENCODE_VERTEX_ANTHROPIC_PREIMPORT: "0"
           OPENCODE_WINDOWS_UNIT_DIAGNOSTICS: "1"
         run: |
-          $logs = Join-Path $env:RUNNER_TEMP "windows-phase-r1018"
+          $logs = Join-Path $env:RUNNER_TEMP "windows-focused-r1085"
           $status = Join-Path $logs "opencode.status.txt"
           "started; exit=unavailable" | Set-Content $status
           $process = Start-Process -FilePath (Get-Command bun -ErrorAction Stop).Source `
-            -ArgumentList "run test" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
+            -ArgumentList "test --timeout 30000 ./test/lib/unit-diagnostic.test.ts ./test/mcp/lifecycle.test.ts ./test/skill/discovery.test.ts" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
             -RedirectStandardOutput (Join-Path $logs "opencode.stdout.log") `
             -RedirectStandardError (Join-Path $logs "opencode.stderr.log")
           $null = $process.Handle
-          if (!$process.WaitForExit(1180000)) {
+          if (!$process.WaitForExit(300000)) {
             "watchdog-timeout; exit=unavailable" | Set-Content $status
             $process.Kill($true)
             if ($process.WaitForExit(5000)) {
@@ -193,13 +125,11 @@ jobs:
         timeout-minutes: 2
         env:
           SETUP_OUTCOME: ${{ steps.setup.outcome }}
-          COLD_OUTCOME: ${{ steps.cold.outcome }}
-          PREIMPORT_OUTCOME: ${{ steps.preimport.outcome }}
           OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
         run: |
-          $logs = Join-Path $env:RUNNER_TEMP "windows-phase-r1018"
+          $logs = Join-Path $env:RUNNER_TEMP "windows-focused-r1085"
           New-Item -ItemType Directory -Force -Path $logs | Out-Null
-          @("setup=$env:SETUP_OUTCOME", "cold=$env:COLD_OUTCOME", "preimport=$env:PREIMPORT_OUTCOME", "opencode=$env:OPENCODE_OUTCOME") | Set-Content (Join-Path $logs "steps.status.txt")
+          @("setup=$env:SETUP_OUTCOME", "opencode=$env:OPENCODE_OUTCOME") | Set-Content (Join-Path $logs "steps.status.txt")
           # Keep a bounded tail per stream; record original size if truncation is needed.
           foreach ($file in Get-ChildItem $logs -Filter "*.log") {
             if ($file.Length -le 16MB) { continue }
@@ -220,7 +150,7 @@ jobs:
         timeout-minutes: 3
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-phase-r1018-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/windows-phase-r1018
+          name: windows-focused-r1085-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-focused-r1085
           if-no-files-found: warn
           retention-days: 7
