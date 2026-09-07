@@ -122,8 +122,12 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 20
-        run: GITHUB_ACTIONS=false bun turbo test
+        # Turbo run CLI: stream task logs immediately and retain all task output.
+        # https://turborepo.com/docs/reference/run#--log-order-option
+        # https://turborepo.com/docs/reference/run#--output-logs-option
+        run: GITHUB_ACTIONS=false bun turbo test --log-order=stream --output-logs=full
         env:
+          OPENCODE_WINDOWS_UNIT_DIAGNOSTICS: ${{ runner.os == 'Windows' && vars.OPENCODE_WINDOWS_UNIT_DIAGNOSTICS == '1' && '1' || '0' }}
           OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER: ${{ runner.os == 'Windows' && 'true' || 'false' }}
 
       - name: Check generated client

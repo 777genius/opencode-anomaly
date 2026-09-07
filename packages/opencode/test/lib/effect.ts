@@ -1,3 +1,4 @@
+import { diagnosticBody, diagnosticTest, unitDiagnostic } from "./unit-diagnostic"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -37,7 +38,7 @@ type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Lay
 
 const isolatedRun: Runner = (value, layer) =>
   Effect.gen(function* () {
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
+    const exit = yield* diagnosticBody(body(value)).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
         yield* Effect.logError(err)
@@ -52,10 +53,15 @@ const isolatedRun: Runner = (value, layer) =>
 // the server's handlers.
 const sharedRun: Runner = (value, layer) =>
   Effect.gen(function* () {
+    const mark = unitDiagnostic("test")
+    mark("shared-layer.build.start")
     const scope = yield* Scope.make()
     const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+    mark("shared-layer.build.settled")
+    const exit = yield* diagnosticBody(body(value)).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+    mark("shared-layer.close.start")
     yield* Scope.close(scope, Exit.void)
+    mark("shared-layer.close.settled")
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
         yield* Effect.logError(err)
@@ -66,22 +72,22 @@ const sharedRun: Runner = (value, layer) =>
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, testLayer), opts)
+    test(name, diagnosticTest(name, () => run(value, testLayer)), opts)
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, testLayer), opts)
+    test.only(name, diagnosticTest(name, () => run(value, testLayer)), opts)
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, testLayer), opts)
+    test.skip(name, diagnosticTest(name, () => run(value, testLayer)), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer), opts)
+    test(name, diagnosticTest(name, () => run(value, liveLayer)), opts)
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer), opts)
+    test.only(name, diagnosticTest(name, () => run(value, liveLayer)), opts)
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, liveLayer), opts)
+    test.skip(name, diagnosticTest(name, () => run(value, liveLayer)), opts)
 
   const instance = <A, E2, E3 = never>(
     name: string,
@@ -92,7 +98,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticTest(name, () => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer)),
       args.testOptions,
     )
   }
@@ -106,7 +112,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticTest(name, () => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer)),
       args.testOptions,
     )
   }
@@ -120,7 +126,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticTest(name, () => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer)),
       args.testOptions,
     )
   }

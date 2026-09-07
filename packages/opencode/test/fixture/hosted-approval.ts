@@ -1,3 +1,4 @@
+import { unitDiagnostic } from "../lib/unit-diagnostic"
 import { ConfigProvider, Effect, Layer, ManagedRuntime } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { AppLayer } from "../../src/effect/app-runtime"
@@ -38,11 +39,16 @@ export function app(password?: string, producer?: Producer) {
     ),
     { disableLogger: true, memoMap },
   )
+  const mark = unitDiagnostic("hosted", "test/fixture/hosted-approval.ts")
   const entry = {
     dispose: async () => {
       apps.delete(entry)
+      mark("web.dispose.start")
       await web.dispose()
+      mark("web.dispose.settled")
+      mark("runtime.dispose.start")
       await runtime.dispose()
+      mark("runtime.dispose.settled")
     },
   }
   apps.add(entry)
