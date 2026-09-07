@@ -1,11 +1,11 @@
-import { diagnosticPhase, unitDiagnostic } from "@/util/windows-unit-diagnostic"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient, path } from "@opencode-ai/core/effect/app-node-platform"
-import { NodePath } from "@effect/platform-node"
 import { Effect, Layer, Path, Schema, Context } from "effect"
-import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
+import { SkillPublication } from "./publication"
 import { Global } from "@opencode-ai/core/global"
 
 const skillConcurrency = 4
@@ -27,24 +27,26 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SkillDiscovery") {}
 
-const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient.HttpClient> = Layer.effect(
+const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const path = yield* Path.Path
     const http = HttpClient.filterStatusOk(withTransientReadRetry(yield* HttpClient.HttpClient))
+    const flock = yield* EffectFlock.Service
     const cache = path.join(Global.Path.cache, "skills")
 
     const download = Effect.fn("Discovery.download")(function* (url: string, dest: string) {
-      if (yield* fs.exists(dest).pipe(Effect.orDie)) return true
+      if (yield* fs.exists(dest)) return true
 
-      return yield* HttpClientRequest.get(url).pipe(
-        (request) =>
-          diagnosticPhase(http.execute(request).pipe(Effect.flatMap((res) => res.arrayBuffer)), "discovery.download"),
-        Effect.flatMap((body) => diagnosticPhase(fs.writeWithDirs(dest, new Uint8Array(body)), "discovery.write")),
-        Effect.as(true),
-        Effect.catch((err) => Effect.logError("failed to download", { url: url, error: err }).pipe(Effect.as(false))),
+      const body = yield* HttpClientRequest.get(url).pipe(
+        http.execute,
+        Effect.flatMap((res) => res.arrayBuffer),
+        Effect.catch((err) => Effect.logError("failed to download", { url: url, error: err }).pipe(Effect.as(null))),
       )
+      if (body === null) return false
+      yield* fs.writeWithDirs(dest, new Uint8Array(body))
+      return true
     })
 
     const pull = Effect.fn("Discovery.pull")(function* (url: string) {
@@ -71,71 +73,65 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
         (skill) => Effect.logWarning("skill entry missing SKILL.md", { url: index, skill: skill.name }),
         { discard: true },
       )
-      const list = data.skills.filter((skill) => skill.files.includes("SKILL.md"))
+      const list = data.skills.filter(
+        (skill, index, skills) =>
+          skills.findIndex((entry) => entry.name.toLowerCase() === skill.name.toLowerCase()) === index &&
+          skill.files.includes("SKILL.md") &&
+          safePart(skill.name) &&
+          skill.files.every((file) => file.split("/").every(safePart) && file !== ".opencode-version"),
+      )
 
       const dirs = yield* Effect.forEach(
         list,
         (skill) =>
           Effect.gen(function* () {
             const root = path.join(cache, skill.name)
-            const versionFile = path.join(root, ".opencode-version")
-            const version = skill.version
-            const current =
-              version === undefined
-                ? undefined
-                : yield* fs.readFileStringSafe(versionFile).pipe(Effect.catch(() => Effect.succeed(undefined)))
-
-            if (version === undefined || current === version) {
+            // Lazy construction must use this Discovery service's captured dependencies.
+            const publication = yield* SkillPublication.make(
+              root,
+              path.join(Global.Path.cache, "skill-generations", skill.name),
+            ).pipe(Effect.provideService(FSUtil.Service, fs), Effect.provideService(Path.Path, path))
+            const selected = yield* publication
+              .read()
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.logError("failed to read skill selection", { error }).pipe(Effect.as(null)),
+                ),
+              )
+            if (selected === null) return null
+            if (skill.version === undefined) {
+              if (selected) return selected
+              if (yield* fs.exists(path.join(root, ".opencode-version"))) return yield* publication.available(root)
               yield* Effect.forEach(
                 skill.files,
                 (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(root, file)),
                 { concurrency: fileConcurrency, discard: true },
               )
-            } else {
-              const token = crypto.randomUUID()
-              const staging = `${root}.tmp-${token}`
-              const backup = `${root}.old-${token}`
-              yield* Effect.gen(function* () {
-                const downloaded = yield* Effect.forEach(
+              return yield* publication.available(root)
+            }
+            return yield* publication
+              .refresh(skill.version, (staging) =>
+                Effect.forEach(
                   skill.files,
                   (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(staging, file)),
                   { concurrency: fileConcurrency },
-                )
-                if (!downloaded.every(Boolean)) {
-                  unitDiagnostic("other", "Discovery")("discovery.refresh.download-incomplete")
-                  return
-                }
-                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) {
-                  unitDiagnostic("other", "Discovery")("discovery.refresh.staging-missing")
-                  return
-                }
-                yield* diagnosticPhase(
-                  fs.writeFileString(path.join(staging, ".opencode-version"), version),
-                  "discovery.version.write",
-                )
-                yield* Effect.uninterruptible(
-                  Effect.gen(function* () {
-                    const cached = yield* fs.exists(root).pipe(Effect.orDie)
-                    if (cached) yield* diagnosticPhase(fs.rename(root, backup), "discovery.rename.backup")
-                    yield* diagnosticPhase(fs.rename(staging, root), "discovery.rename.publish").pipe(
-                      Effect.catch((error) =>
-                        Effect.gen(function* () {
-                          if (cached)
-                            yield* diagnosticPhase(fs.rename(backup, root), "discovery.rollback").pipe(Effect.ignore)
-                          return yield* Effect.fail(error)
-                        }),
-                      ),
-                    )
-                    if (cached) yield* fs.remove(backup, { recursive: true, force: true }).pipe(Effect.ignore)
-                  }),
-                )
-              }).pipe(
-                (effect) => diagnosticPhase(effect, "discovery.refresh"),
-                Effect.catch((error) => Effect.logError("failed to refresh skill", { skill: skill.name, error })),
-                Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
+                ).pipe(
+                  Effect.flatMap((downloaded) =>
+                    downloaded.every(Boolean)
+                      ? Effect.void
+                      : Effect.fail(new FSUtil.FileSystemError({ method: "incomplete skill download" })),
+                  ),
+                ),
               )
-            }
-            return (yield* fs.exists(path.join(root, "SKILL.md")).pipe(Effect.orDie)) ? root : null
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.gen(function* () {
+                    yield* Effect.logError("failed to refresh skill", { skill: skill.name, error })
+                    const previous = selected ?? root
+                    return yield* publication.available(previous)
+                  }),
+                ),
+              )
           }),
         { concurrency: skillConcurrency },
       )
@@ -143,10 +139,36 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
       return dirs.filter((dir): dir is string => dir !== null)
     })
 
-    return Service.of({ pull })
+    // Acquire before fetching the index: a delayed index response cannot overwrite
+    // a newer winner. The lock lives in state/locks, outside every scanned root.
+    return Service.of({
+      pull: (url) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* flock.acquire(`skill-discovery:${cache}`)
+            return yield* pull(url)
+          }),
+        ).pipe(Effect.catch((error) => Effect.logError("failed to pull skill cache", { error }).pipe(Effect.as([])))),
+    })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [FSUtil.node, path, httpClient] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [FSUtil.node, path, httpClient, EffectFlock.node],
+})
+
+function safePart(value: string) {
+  return (
+    value.length > 0 &&
+    value.length <= 255 &&
+    value !== "." &&
+    value !== ".." &&
+    !/[\/<>:"\\|?*\x00-\x1f]/.test(value) &&
+    !/[. ]$/.test(value) &&
+    !/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\.|$)/i.test(value)
+  )
+}
 
 export * as Discovery from "./discovery"
