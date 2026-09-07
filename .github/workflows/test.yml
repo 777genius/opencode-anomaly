@@ -18,10 +18,10 @@ jobs:
         settings:
           - name: windows-baseline
             host: windows-2025
-            video: retain-on-failure
+            video: "retain-on-failure"
           - name: windows-video-off
             host: windows-2025
-            video: off
+            video: "off"
     runs-on: ${{ matrix.settings.host }}
     env:
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-browsers
