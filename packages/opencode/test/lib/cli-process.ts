@@ -1,6 +1,9 @@
 import {
   diagnosticAcp,
+  DiagnosticOwner,
   diagnosticBody,
+  diagnosticCallback,
+  diagnosticContext,
   diagnosticDrain,
   diagnosticExit,
   diagnosticTest,
@@ -226,7 +229,8 @@ export function withCliFixture<A, E>(
     const env = isolatedEnv(home, configJson)
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
-      const mark = unitDiagnostic(args[0] === "run" ? "run" : "other")
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic(args[0] === "run" ? "run" : "other", undefined, owner)
       mark("app-process.run.start")
       const start = Date.now()
       const timeoutMs = opts?.timeoutMs ?? 30_000
@@ -303,7 +307,8 @@ export function withCliFixture<A, E>(
     }
 
     const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
-      const mark = unitDiagnostic("run")
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("run", undefined, owner)
       mark("spawn.request")
       const start = Date.now()
       const options = runOpts(opts)
@@ -350,7 +355,8 @@ export function withCliFixture<A, E>(
     })
 
     const serve = Effect.fn("opencode.serve")(function* (opts?: ServeOpts) {
-      const mark = unitDiagnostic("serve")
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("serve", undefined, owner)
       mark("spawn.request")
       const argv = ["serve"]
       // Default port 0 — let the OS pick a free port, parse the actual one
@@ -433,7 +439,8 @@ export function withCliFixture<A, E>(
     })
 
     const acp = Effect.fn("opencode.acp")(function* (opts?: AcpOpts) {
-      const mark = unitDiagnostic("acp")
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("acp", undefined, owner)
       mark("spawn.request")
       const started = yield* Clock.currentTimeMillis
       const argv = ["acp"]
@@ -548,7 +555,8 @@ export function withCliFixture<A, E>(
 
     const opencode: OpencodeCli = { run, startRun, serve, acp, spawn, expectExit, parseJsonEvents }
 
-    return yield* diagnosticBody(fn({ llm, home, opencode }), "callback")
+    const owner = yield* DiagnosticOwner
+    return yield* diagnosticCallback(() => fn({ llm, home, opencode }), owner)
     // FetchHttpClient is provided so test bodies can `yield* HttpClient.HttpClient`
     // and hit endpoints on `opencode.serve()` without rolling their own fetch.
   }).pipe(
@@ -611,7 +619,7 @@ export const cliIt = {
   ) =>
     (process.platform === "win32" ? test : test.concurrent)(
       name,
-      diagnosticTest(name, () => Effect.runPromise(Effect.scoped(diagnosticBody(withCliFixture(body))))),
+      diagnosticTest(name, (owner: DiagnosticOwner | undefined = undefined) => Effect.runPromise(diagnosticContext(Effect.scoped(diagnosticBody(withCliFixture(body))), owner))),
       opts,
     ),
 }

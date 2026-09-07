@@ -1,9 +1,17 @@
-import { AsyncLocalStorage } from "node:async_hooks"
 import { writeSync } from "node:fs"
-import { Effect } from "effect"
+import { Context, Effect } from "effect"
 
 export const unitDiagnosticEnabled = process.platform === "win32" && process.env.OPENCODE_WINDOWS_UNIT_DIAGNOSTICS === "1"
-const context = new AsyncLocalStorage<{ file: string; test: string; id: number }>()
+export type DiagnosticOwner = { readonly file: string; readonly test: string; readonly id: number }
+
+export const DiagnosticOwner = Context.Reference<DiagnosticOwner | undefined>("~test/DiagnosticOwner", {
+  defaultValue: () => undefined,
+})
+
+export function diagnosticContext<A, E, R>(effect: Effect.Effect<A, E, R>, owner?: DiagnosticOwner) {
+  if (!unitDiagnosticEnabled) return effect
+  return Effect.provideService(effect, DiagnosticOwner, owner)
+}
 const budget = { records: 0, ids: 0 }
 
 // A process-wide cap bounds CI output; no timers, buffered logger, or raw payloads.
@@ -12,9 +20,9 @@ const silent = (_phase: string, _childpid: number | null = null) => {}
 export function unitDiagnostic(
   kind: "test" | "run" | "serve" | "acp" | "other" | "hosted" | "preload",
   file?: string,
+  owner?: DiagnosticOwner,
 ) {
   if (!unitDiagnosticEnabled || budget.records >= 20000) return silent
-  const owner = context.getStore()
   const id = ++budget.ids
   const start = performance.now()
   return (phase: string, childpid: number | null = null) => {
@@ -35,28 +43,44 @@ export function unitDiagnostic(
   }
 }
 
-export function diagnosticTest<A>(name: string, run: () => Promise<A>) {
+export function diagnosticTest<A>(name: string, run: (owner?: DiagnosticOwner) => Promise<A>) {
   if (!unitDiagnosticEnabled) return run
   // Capture only the repository-relative test frame, never emit a raw stack.
   const file = new Error().stack?.replaceAll("\\", "/").match(/(?:packages\/opencode\/)?test\/[^\s():]+\.test\.tsx?/)?.[0] ?? "unattributed"
-  return () => context.run({ file, test: name, id: ++budget.ids }, async () => {
-    const mark = unitDiagnostic("test")
+  return async () => {
+    const owner = { file, test: name, id: ++budget.ids }
+    const mark = unitDiagnostic("test", undefined, owner)
     mark("test.entry")
     try {
-      return await run()
+      return await run(owner)
     } finally {
       mark("scope.settled")
     }
-  })
+  }
 }
 
 export function diagnosticBody<A, E, R>(effect: Effect.Effect<A, E, R>, phase = "body") {
   if (!unitDiagnosticEnabled) return effect
-  return Effect.suspend(() => {
-    const mark = unitDiagnostic("test")
+  return Effect.gen(function* () {
+    const owner = yield* DiagnosticOwner
+    const mark = unitDiagnostic("test", undefined, owner)
     mark(`${phase}.entry`)
-    return effect.pipe(Effect.onExit(() => Effect.sync(() => mark(`${phase}.settled`))))
+    return yield* effect.pipe(Effect.onExit(() => Effect.sync(() => mark(`${phase}.settled`))))
   })
+}
+
+// Invoke synchronously at the caller's original boundary. A thrown defect must
+// settle the marker too; onExit only covers an Effect successfully returned by fn.
+export function diagnosticCallback<A, E, R>(fn: () => Effect.Effect<A, E, R>, owner?: DiagnosticOwner) {
+  if (!unitDiagnosticEnabled) return fn()
+  const mark = unitDiagnostic("test", undefined, owner)
+  mark("callback.entry")
+  try {
+    return fn().pipe(Effect.onExit(() => Effect.sync(() => mark("callback.settled"))))
+  } catch (error) {
+    mark("callback.settled")
+    throw error
+  }
 }
 
 export function diagnosticDrain<A, E, R>(
