@@ -1,3 +1,4 @@
+import "@opencode-ai/core/plugin/internal"
 import { AISDK } from "@opencode-ai/core/aisdk"
 import type { LanguageModelV3 } from "@ai-sdk/provider"
 import { describe, expect } from "bun:test"
