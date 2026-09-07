@@ -5,6 +5,7 @@ import { Effect } from "effect"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
+import fs from "node:fs"
 import { readFile, rm, stat } from "fs/promises"
 import path from "path"
 import { testEffect } from "../lib/effect"
@@ -194,7 +195,9 @@ describe("Discovery.pull", () => {
           bun: { size: file.size, lastModified: file.lastModified },
         }
       })
-      yield* Effect.logInfo("mutable skill v3 observation", observation)
+      if (process.env.OPENCODE_WINDOWS_UNIT_DIAGNOSTICS === "1") {
+        fs.writeSync(2, "mutable-skill-v3 " + JSON.stringify(observation) + "\n")
+      }
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())).toBe("# New")
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "old.md")).exists())).toBe(false)
       expect(mutableDownloadCount).toBe(3)
