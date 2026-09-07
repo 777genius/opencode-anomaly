@@ -1,3 +1,4 @@
+import { diagnosticPhase } from "@/util/windows-unit-diagnostic"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { Plugin } from "../plugin"
 import { Format } from "../format"
@@ -33,14 +34,18 @@ const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
-      yield* config.get()
+      yield* diagnosticPhase(config.get(), "bootstrap.config")
       // Plugin can mutate config so it has to be initialized before anything else.
-      yield* plugin.init()
+      yield* diagnosticPhase(plugin.init(), "bootstrap.plugin")
       // Each service self-manages its own slow work via Effect.forkScoped against
       // its per-instance state scope. We just await materialization here.
       yield* Effect.forEach(
         [lsp, shareNext, format, vcs, snapshot, project],
-        (s) => s.init().pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
+        (s, index) =>
+          diagnosticPhase(
+            s.init(),
+            `bootstrap.${["lsp", "share", "format", "vcs", "snapshot", "project"][index]}`,
+          ).pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
         { concurrency: "unbounded", discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.init"))
     }).pipe(Effect.withSpan("InstanceBootstrap"))

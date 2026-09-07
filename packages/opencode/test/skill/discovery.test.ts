@@ -5,7 +5,7 @@ import { Effect } from "effect"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
-import fs from "node:fs"
+import { diagnosticError, diagnosticObservation } from "../../src/util/windows-unit-diagnostic"
 import { readFile, rm, stat } from "fs/promises"
 import path from "path"
 import { testEffect } from "../lib/effect"
@@ -175,7 +175,7 @@ describe("Discovery.pull", () => {
       mutableVersion = "3"
       mutableContent = "# New"
       mutableFiles = ["SKILL.md"]
-      const third = yield* discovery.pull(url)
+      yield* discovery.pull(url)
       // Keep both readers visible until Windows evidence distinguishes a failed swap from a stale oracle.
       const observation = yield* Effect.promise(async () => {
         const file = Bun.file(path.join(second[0], "SKILL.md"))
@@ -185,19 +185,25 @@ describe("Discovery.pull", () => {
           stat(path.join(second[0], "SKILL.md")),
           file.text(),
         ])
+        const version = reads[0].status === "fulfilled" ? reads[0].value : undefined
+        const native = reads[1].status === "fulfilled" ? reads[1].value : undefined
+        const metadata = reads[2].status === "fulfilled" ? reads[2].value : undefined
+        const bun = reads[3].status === "fulfilled" ? reads[3].value : undefined
         return {
-          version: mutableVersion,
+          version: version === "1" || version === "3" ? version : version === undefined ? "read-error" : "other",
+          native:
+            native === "# Old" ? "old" : native === "# New" ? "new" : native === undefined ? "read-error" : "other",
+          bun: bun === "# Old" ? "old" : bun === "# New" ? "new" : bun === undefined ? "read-error" : "other",
           downloads: mutableDownloadCount,
-          directories: third,
-          reads: reads.map((result) => result.status === "fulfilled"
-            ? { status: result.status, value: result.value }
-            : { status: result.status, error: String(result.reason) }),
-          bun: { size: file.size, lastModified: file.lastModified },
-        }
+          nativeSize: metadata?.size ?? null,
+          nativeMtimeMs: metadata?.mtimeMs ?? null,
+          bunSize: file.size,
+          bunLastModified: file.lastModified,
+          errors: reads.map((result) => (result.status === "rejected" ? diagnosticError(result.reason) : "none")),
+        } as const
       })
-      if (process.env.OPENCODE_WINDOWS_UNIT_DIAGNOSTICS === "1") {
-        fs.writeSync(2, "mutable-skill-v3 " + JSON.stringify(observation) + "\n")
-      }
+      // Emit before assertions so failed refreshes retain the already-performed observations.
+      diagnosticObservation(observation)
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())).toBe("# New")
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "old.md")).exists())).toBe(false)
       expect(mutableDownloadCount).toBe(3)

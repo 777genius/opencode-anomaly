@@ -1,3 +1,4 @@
+import { diagnosticPhase, unitDiagnostic } from "@/util/windows-unit-diagnostic"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient, path } from "@opencode-ai/core/effect/app-node-platform"
 import { NodePath } from "@effect/platform-node"
@@ -38,9 +39,9 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
       if (yield* fs.exists(dest).pipe(Effect.orDie)) return true
 
       return yield* HttpClientRequest.get(url).pipe(
-        http.execute,
-        Effect.flatMap((res) => res.arrayBuffer),
-        Effect.flatMap((body) => fs.writeWithDirs(dest, new Uint8Array(body))),
+        (request) =>
+          diagnosticPhase(http.execute(request).pipe(Effect.flatMap((res) => res.arrayBuffer)), "discovery.download"),
+        Effect.flatMap((body) => diagnosticPhase(fs.writeWithDirs(dest, new Uint8Array(body)), "discovery.write")),
         Effect.as(true),
         Effect.catch((err) => Effect.logError("failed to download", { url: url, error: err }).pipe(Effect.as(false))),
       )
@@ -100,17 +101,27 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                   (file) => download(new URL(file, `${host}/${skill.name}/`).href, path.join(staging, file)),
                   { concurrency: fileConcurrency },
                 )
-                if (!downloaded.every(Boolean)) return
-                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) return
-                yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
+                if (!downloaded.every(Boolean)) {
+                  unitDiagnostic("other", "Discovery")("discovery.refresh.download-incomplete")
+                  return
+                }
+                if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) {
+                  unitDiagnostic("other", "Discovery")("discovery.refresh.staging-missing")
+                  return
+                }
+                yield* diagnosticPhase(
+                  fs.writeFileString(path.join(staging, ".opencode-version"), version),
+                  "discovery.version.write",
+                )
                 yield* Effect.uninterruptible(
                   Effect.gen(function* () {
                     const cached = yield* fs.exists(root).pipe(Effect.orDie)
-                    if (cached) yield* fs.rename(root, backup)
-                    yield* fs.rename(staging, root).pipe(
+                    if (cached) yield* diagnosticPhase(fs.rename(root, backup), "discovery.rename.backup")
+                    yield* diagnosticPhase(fs.rename(staging, root), "discovery.rename.publish").pipe(
                       Effect.catch((error) =>
                         Effect.gen(function* () {
-                          if (cached) yield* fs.rename(backup, root).pipe(Effect.ignore)
+                          if (cached)
+                            yield* diagnosticPhase(fs.rename(backup, root), "discovery.rollback").pipe(Effect.ignore)
                           return yield* Effect.fail(error)
                         }),
                       ),
@@ -119,6 +130,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                   }),
                 )
               }).pipe(
+                (effect) => diagnosticPhase(effect, "discovery.refresh"),
                 Effect.catch((error) => Effect.logError("failed to refresh skill", { skill: skill.name, error })),
                 Effect.ensuring(fs.remove(staging, { recursive: true, force: true }).pipe(Effect.ignore)),
               )

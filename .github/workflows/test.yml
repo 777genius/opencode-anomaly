@@ -100,7 +100,7 @@ jobs:
           $status = Join-Path $logs "opencode.status.txt"
           "started; exit=unavailable" | Set-Content $status
           $process = Start-Process -FilePath (Get-Command bun -ErrorAction Stop).Source `
-            -ArgumentList "test --timeout 30000 ./test/lib/unit-diagnostic.test.ts ./test/mcp/lifecycle.test.ts ./test/skill/discovery.test.ts" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
+            -ArgumentList "test --timeout 30000 ./test/lib/unit-diagnostic.test.ts ./test/mcp/lifecycle.test.ts ./test/skill/discovery.test.ts ./test/control-plane/workspace.test.ts ./test/project/instance-bootstrap.test.ts" -WorkingDirectory $PWD.Path -PassThru -NoNewWindow `
             -RedirectStandardOutput (Join-Path $logs "opencode.stdout.log") `
             -RedirectStandardError (Join-Path $logs "opencode.stderr.log")
           $null = $process.Handle
@@ -130,6 +130,13 @@ jobs:
           $logs = Join-Path $env:RUNNER_TEMP "windows-focused-r1085"
           New-Item -ItemType Directory -Force -Path $logs | Out-Null
           @("setup=$env:SETUP_OUTCOME", "opencode=$env:OPENCODE_OUTCOME") | Set-Content (Join-Path $logs "steps.status.txt")
+          # Bun's emitted suite headers are authoritative; argument order is not execution order.
+          $stderr = Join-Path $logs "opencode.stderr.log"
+          if (Test-Path $stderr) {
+            Select-String -Path $stderr -Pattern '^test[\\/].*\.test\.ts:$' |
+              Select-Object -First 5 | ForEach-Object { $_.Line } |
+              Set-Content (Join-Path $logs "actual-suite-order.txt")
+          }
           # Keep a bounded tail per stream; record original size if truncation is needed.
           foreach ($file in Get-ChildItem $logs -Filter "*.log") {
             if ($file.Length -le 16MB) { continue }

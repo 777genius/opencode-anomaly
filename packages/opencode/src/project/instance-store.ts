@@ -1,3 +1,4 @@
+import { diagnosticPhase } from "@/util/windows-unit-diagnostic"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { makeGlobalNode, Node } from "@opencode-ai/core/effect/app-node"
 import { GlobalBus } from "@/bus/global"
@@ -58,7 +59,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                   project: result.project,
                 })),
               )
-        yield* bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx))
+        yield* diagnosticPhase(bootstrap.run, "bootstrap.run").pipe(Effect.provideService(InstanceRef, ctx))
         return ctx
       }).pipe(Effect.withSpan("InstanceStore.boot"))
 
@@ -71,7 +72,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const completeLoad = (directory: string, input: LoadInput, entry: Entry) =>
       Effect.gen(function* () {
-        const exit = yield* Effect.exit(boot({ ...input, directory }))
+        const exit = yield* Effect.exit(diagnosticPhase(boot({ ...input, directory }), "instance.load", entry.deferred))
         if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
         yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
       })
@@ -93,7 +94,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
-      yield* Effect.promise(() => runDisposers(ctx.directory))
+      yield* diagnosticPhase(
+        Effect.promise(() => runDisposers(ctx.directory)),
+        "instance.disposers",
+      )
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
 
@@ -110,7 +114,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const existing = cache.get(directory)
-          if (existing) return yield* restore(Deferred.await(existing.deferred))
+          if (existing)
+            return yield* restore(
+              diagnosticPhase(Deferred.await(existing.deferred), "load-deferred.await", existing.deferred),
+            )
 
           const entry: Entry = { deferred: Deferred.makeUnsafe<InstanceContext>() }
           cache.set(directory, entry)
@@ -118,7 +125,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
             yield* Effect.logInfo("creating instance", { directory: directory })
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
-          return yield* restore(Deferred.await(entry.deferred))
+          return yield* restore(diagnosticPhase(Deferred.await(entry.deferred), "load-deferred.await", entry.deferred))
         }),
       ).pipe(Effect.withSpan("InstanceStore.load"))
     }
@@ -133,13 +140,15 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
             if (previous) {
-              yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
+              yield* diagnosticPhase(Deferred.await(previous.deferred), "load-deferred.await", previous.deferred).pipe(
+                Effect.ignore,
+              )
               yield* Effect.promise(() => runDisposers(directory))
               yield* emitDisposed({ directory, project: input.project?.id })
             }
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
-          return yield* restore(Deferred.await(entry.deferred))
+          return yield* restore(diagnosticPhase(Deferred.await(entry.deferred), "load-deferred.await", entry.deferred))
         }),
       ).pipe(Effect.withSpan("InstanceStore.reload"))
     }
@@ -148,7 +157,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const entry = cache.get(ctx.directory)
       if (!entry) return yield* disposeContext(ctx)
 
-      const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      const exit = yield* diagnosticPhase(Deferred.await(entry.deferred), "load-deferred.await", entry.deferred).pipe(
+        Effect.exit,
+      )
       if (Exit.isFailure(exit)) return yield* removeEntry(ctx.directory, entry).pipe(Effect.asVoid)
       if (exit.value !== ctx) return
       yield* disposeEntry(ctx.directory, entry, ctx).pipe(Effect.asVoid)
@@ -158,7 +169,9 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       const directory = FSUtil.resolve(input)
       const entry = cache.get(directory)
       if (!entry) return
-      const exit = yield* Deferred.await(entry.deferred).pipe(Effect.exit)
+      const exit = yield* diagnosticPhase(Deferred.await(entry.deferred), "load-deferred.await", entry.deferred).pipe(
+        Effect.exit,
+      )
       if (Exit.isFailure(exit)) return yield* removeEntry(directory, entry).pipe(Effect.asVoid)
       yield* disposeEntry(directory, entry, exit.value).pipe(Effect.asVoid)
     })
@@ -169,7 +182,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         [...cache.entries()],
         (item) =>
           Effect.gen(function* () {
-            const exit = yield* Deferred.await(item[1].deferred).pipe(Effect.exit)
+            const exit = yield* diagnosticPhase(
+              Deferred.await(item[1].deferred),
+              "load-deferred.await",
+              item[1].deferred,
+            ).pipe(Effect.exit)
             if (Exit.isFailure(exit)) {
               yield* Effect.logWarning("instance dispose failed", { key: item[0], cause: exit.cause })
               yield* removeEntry(item[0], item[1])
@@ -189,7 +206,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const provide = <A, E, R>(input: LoadInput, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
       load(input).pipe(Effect.flatMap((ctx) => effect.pipe(Effect.provideService(InstanceRef, ctx))))
 
-    yield* Effect.addFinalizer(() => disposeAll().pipe(Effect.ignore))
+    yield* Effect.addFinalizer(() => diagnosticPhase(disposeAll(), "instance-store.scope.close").pipe(Effect.ignore))
 
     return Service.of({
       load,

@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Scope } from "effect"
 import fs from "node:fs"
+import { diagnosticError, diagnosticObservation, diagnosticPhase } from "../../src/util/windows-unit-diagnostic"
 import {
   DiagnosticOwner,
   diagnosticBody,
@@ -27,6 +28,159 @@ function capture() {
 
 const diagnostic = unitDiagnosticEnabled ? test : test.skip
 
+test("error classification contains hostile getters and Proxy traps", () => {
+  for (const key of ["code", "cause", "reason", "_tag"]) {
+    expect(
+      diagnosticError(
+        Object.defineProperty({}, key, {
+          get() {
+            throw new Error("private payload")
+          },
+        }),
+      ),
+    ).toBe("unknown")
+  }
+  expect(
+    diagnosticError(
+      new Proxy(
+        {},
+        {
+          has() {
+            throw new Error("private payload")
+          },
+        },
+      ),
+    ),
+  ).toBe("unknown")
+  expect(
+    diagnosticError(
+      new Proxy(
+        { code: "EBUSY" },
+        {
+          get() {
+            throw new Error("private payload")
+          },
+        },
+      ),
+    ),
+  ).toBe("unknown")
+  const revoked = Proxy.revocable({}, {})
+  revoked.revoke()
+  expect(diagnosticError(revoked.proxy)).toBe("unknown")
+  for (const key of ["code", "_tag"]) {
+    const reads: string[] = []
+    expect(
+      diagnosticError(
+        Object.defineProperty({}, key, {
+          get() {
+            reads.push(key)
+            return reads.length === 1 ? (key === "code" ? "EBUSY" : "Busy") : "private payload"
+          },
+        }),
+      ),
+    ).toBe(key === "code" ? "EBUSY" : "Busy")
+    expect(reads).toEqual([key])
+  }
+  expect(diagnosticError({ cause: { reason: { code: "EPERM" } } })).toBe("EPERM")
+  expect(diagnosticError({ _tag: "NotFound" })).toBe("NotFound")
+  expect(diagnosticError({ code: "private payload" })).toBe("other")
+  expect(diagnosticError(null)).toBe("unknown")
+  const cycle: { cause?: unknown } = {}
+  cycle.cause = cycle
+  expect(diagnosticError(cycle)).toBe("other")
+})
+
+diagnostic("phase preserves original causes when error inspection throws", async () => {
+  using output = capture()
+  const error = Object.defineProperty({}, "code", {
+    get() {
+      throw new Error("private payload")
+    },
+  })
+  for (const cause of [Cause.fail(error), Cause.die(error)]) {
+    const exit = await Effect.runPromiseExit(diagnosticPhase(Effect.failCause(cause), "hostile"))
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(exit.cause).toBe(cause)
+  }
+  expect(output.records.map((record) => record.phase)).toEqual([
+    "hostile.start",
+    "hostile.failure",
+    "hostile.error.unknown",
+    "hostile.start",
+    "hostile.failure",
+    "hostile.error.unknown",
+  ])
+})
+
+diagnostic("phase preserves original cause when squash itself throws", async () => {
+  using output = capture()
+  const cause = Cause.fail("original")
+  // Force the squash boundary independently of Effect's error representation.
+  const squash = spyOn(Cause, "squash").mockImplementation(() => {
+    throw new Error("private payload")
+  })
+  try {
+    const exit = await Effect.runPromiseExit(diagnosticPhase(Effect.failCause(cause), "squash"))
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isFailure(exit)) expect(exit.cause).toBe(cause)
+    expect(squash).toHaveBeenCalledTimes(1)
+    expect(output.records.map((record) => record.phase)).toEqual([
+      "squash.start",
+      "squash.failure",
+      "squash.error.unknown",
+    ])
+  } finally {
+    squash.mockRestore()
+  }
+})
+
+diagnostic("Discovery snapshot emits fixed fallback for a hostile read error", () => {
+  const records: string[] = []
+  const writer = spyOn(fs, "writeSync").mockImplementation((...args) => {
+    records.push(String(args[1]))
+    return String(args[1]).length
+  })
+  try {
+    diagnosticObservation({
+      version: "read-error",
+      native: "read-error",
+      bun: "read-error",
+      downloads: 3,
+      nativeSize: null,
+      nativeMtimeMs: null,
+      bunSize: 0,
+      bunLastModified: 0,
+      errors: [
+        diagnosticError(
+          new Proxy(
+            {},
+            {
+              has() {
+                throw new Error("private payload")
+              },
+            },
+          ),
+        ),
+      ],
+    })
+    expect(records).toHaveLength(1)
+    expect(JSON.parse(records[0])).toEqual({
+      marker: "mutable-skill-v3",
+      version: "read-error",
+      native: "read-error",
+      bun: "read-error",
+      downloads: 3,
+      nativeSize: null,
+      nativeMtimeMs: null,
+      bunSize: 0,
+      bunLastModified: 0,
+      errors: ["unknown"],
+    })
+  } finally {
+    writer.mockRestore()
+  }
+})
+
 test("registration has zero arity and never forwards Bun's done callback as owner", async () => {
   using output = capture()
   const owners: Array<DiagnosticOwner | undefined> = []
@@ -38,7 +192,9 @@ test("registration has zero arity and never forwards Bun's done callback as owne
   expect(callback.length).toBe(0)
   // Use Bun's callback signature without a cast and simulate its supplied argument.
   const registered: (done: (err?: unknown) => void) => void | Promise<unknown> = callback
-  const result = registered((error) => { doneCalls.push(error) })
+  const result = registered((error) => {
+    doneCalls.push(error)
+  })
   expect(owners).toHaveLength(1)
   expect(await result).toBe(42)
   expect(doneCalls).toEqual([])
@@ -52,7 +208,8 @@ test("registration has zero arity and never forwards Bun's done callback as owne
   expect(owner.test).toBe("registration")
   expect(owner.id).toBeNumber()
   expect(output.records.map((record) => [record.phase, record.testid])).toEqual([
-    ["test.entry", owner.id], ["scope.settled", owner.id],
+    ["test.entry", owner.id],
+    ["scope.settled", owner.id],
   ])
 })
 
@@ -87,7 +244,12 @@ diagnostic("concurrent suspended nested fibers retain child and cleanup owners",
               const inherited = yield* DiagnosticOwner
               const mark = unitDiagnostic("run", undefined, inherited)
               mark("spawn", index + 100)
-              yield* Effect.addFinalizer(() => diagnosticBody(Effect.sync(() => mark("exited", index + 100)), "cleanup"))
+              yield* Effect.addFinalizer(() =>
+                diagnosticBody(
+                  Effect.sync(() => mark("exited", index + 100)),
+                  "cleanup",
+                ),
+              )
               return yield* diagnosticBody(Effect.succeed(name), "callback")
             }).pipe(Effect.scoped),
           ).pipe(Effect.forkScoped)
@@ -101,14 +263,25 @@ diagnostic("concurrent suspended nested fibers retain child and cleanup owners",
     expect(entry.testid).toBeNumber()
     const records = output.records.filter((record) => record.test === name)
     expect(records.map((record) => record.phase)).toEqual([
-      "test.entry", "body.entry", "spawn", "callback.entry", "callback.settled",
-      "cleanup.entry", "exited", "cleanup.settled", "body.settled", "scope.settled",
+      "test.entry",
+      "body.entry",
+      "spawn",
+      "callback.entry",
+      "callback.settled",
+      "cleanup.entry",
+      "exited",
+      "cleanup.settled",
+      "body.settled",
+      "scope.settled",
     ])
     expect(records.every((record) => record.testid === entry.testid)).toBe(true)
-    expect(output.records.filter((record) => record.childpid === index + 100).every((record) => record.test === name)).toBe(true)
+    expect(
+      output.records.filter((record) => record.childpid === index + 100).every((record) => record.test === name),
+    ).toBe(true)
   }
-  expect(output.records.find((record) => record.test === "owner-a")!.testid)
-    .not.toBe(output.records.find((record) => record.test === "owner-b")!.testid)
+  expect(output.records.find((record) => record.test === "owner-a")!.testid).not.toBe(
+    output.records.find((record) => record.test === "owner-b")!.testid,
+  )
 })
 
 diagnostic("leaked suspended cleanup outlives its test and keeps its owner while another test runs", async () => {
@@ -146,15 +319,25 @@ diagnostic("leaked suspended cleanup outlives its test and keeps its owner while
   const entry = output.records.find((record) => record.test === "departed" && record.phase === "test.entry")!
   const cleanup = output.records.filter((record) => record.phase.startsWith("cleanup") || record.childpid === 201)
   expect(cleanup.map((record) => record.phase)).toEqual([
-    "cleanup.start", "cleanup.entry", "stderr.drain.start", "stderr.drain.complete", "cleanup.settled",
+    "cleanup.start",
+    "cleanup.entry",
+    "stderr.drain.start",
+    "stderr.drain.complete",
+    "cleanup.settled",
   ])
   expect(cleanup.every((record) => record.test === "departed" && record.testid === entry.testid)).toBe(true)
-  expect(output.records.findIndex((record) => record.phase === "cleanup.start"))
-    .toBeGreaterThan(output.records.findIndex((record) => record.test === "current" && record.phase === "scope.settled"))
-  expect(output.records.findIndex((record) => record.phase === "cleanup.start"))
-    .toBeGreaterThan(output.records.findIndex((record) => record.test === "departed" && record.phase === "scope.settled"))
-  expect(output.records.filter((record) => record.phase.startsWith("unowned")).map((record) => [record.test, record.testid]))
-    .toEqual([["unattributed cleanup", null], ["unattributed cleanup", null]])
+  expect(output.records.findIndex((record) => record.phase === "cleanup.start")).toBeGreaterThan(
+    output.records.findIndex((record) => record.test === "current" && record.phase === "scope.settled"),
+  )
+  expect(output.records.findIndex((record) => record.phase === "cleanup.start")).toBeGreaterThan(
+    output.records.findIndex((record) => record.test === "departed" && record.phase === "scope.settled"),
+  )
+  expect(
+    output.records.filter((record) => record.phase.startsWith("unowned")).map((record) => [record.test, record.testid]),
+  ).toEqual([
+    ["unattributed cleanup", null],
+    ["unattributed cleanup", null],
+  ])
 })
 
 diagnostic("callback entry precedes synchronous invocation and synchronous throw settles once", async () => {
@@ -165,9 +348,9 @@ diagnostic("callback entry precedes synchronous invocation and synchronous throw
   await diagnosticRegistration("throwing", async (owner) => {
     try {
       diagnosticCallback(() => {
-      calls.push("invoked")
-      expect(output.records.at(-1)?.phase).toBe("callback.entry")
-      throw error
+        calls.push("invoked")
+        expect(output.records.at(-1)?.phase).toBe("callback.entry")
+        throw error
       }, owner)
     } catch (cause) {
       caught.push(cause)
@@ -177,7 +360,10 @@ diagnostic("callback entry precedes synchronous invocation and synchronous throw
   expect(caught).toHaveLength(1)
   expect(caught[0]).toBe(error)
   expect(output.records.map((record) => record.phase)).toEqual([
-    "test.entry", "callback.entry", "callback.settled", "scope.settled",
+    "test.entry",
+    "callback.entry",
+    "callback.settled",
+    "scope.settled",
   ])
 })
 
@@ -188,32 +374,47 @@ diagnostic("body preserves success, failure and interruption exits", async () =>
     const expected = await Effect.runPromiseExit(effect)
     expect(await Effect.runPromiseExit(diagnosticBody(effect))).toEqual(expected)
   }
-  await Effect.runPromise(Effect.gen(function* () {
-    const entered = yield* Deferred.make<void>()
-    const fiber = yield* diagnosticBody(
-      Effect.gen(function* () {
-        yield* Deferred.succeed(entered, undefined)
-        yield* Effect.never
-      }),
-    ).pipe(Effect.forkScoped)
-    yield* Deferred.await(entered)
-    yield* Fiber.interrupt(fiber)
-    const exit = yield* Fiber.await(fiber)
-    expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
-  }).pipe(Effect.scoped))
+  await Effect.runPromise(
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>()
+      const fiber = yield* diagnosticBody(
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined)
+          yield* Effect.never
+        }),
+      ).pipe(Effect.forkScoped)
+      yield* Deferred.await(entered)
+      yield* Fiber.interrupt(fiber)
+      const exit = yield* Fiber.await(fiber)
+      expect(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)).toBe(true)
+    }).pipe(Effect.scoped),
+  )
   expect(output.records.map((record) => record.phase)).toEqual([
-    "body.entry", "body.settled", "body.entry", "body.settled", "body.entry", "body.settled",
+    "body.entry",
+    "body.settled",
+    "body.entry",
+    "body.settled",
+    "body.entry",
+    "body.settled",
   ])
 })
-
-;(unitDiagnosticEnabled ? test.skip : test)("disabled wrappers preserve input identity and invoke callback once", () => {
-  const effect = Effect.succeed(42)
-  const run = () => Promise.resolve(42)
-  expect(diagnosticTest("disabled", run)).toBe(run)
-  expect(diagnosticContext(effect)).toBe(effect)
-  expect(diagnosticBody(effect)).toBe(effect)
-  expect(diagnosticDrain(effect, unitDiagnostic("run"), "stderr", 1)).toBe(effect)
-  const calls: number[] = []
-  expect(diagnosticCallback(() => { calls.push(1); return effect })).toBe(effect)
-  expect(calls).toEqual([1])
-})
+;(unitDiagnosticEnabled ? test.skip : test)(
+  "disabled wrappers preserve input identity and invoke callback once",
+  () => {
+    const effect = Effect.succeed(42)
+    const run = () => Promise.resolve(42)
+    expect(diagnosticTest("disabled", run)).toBe(run)
+    expect(diagnosticContext(effect)).toBe(effect)
+    expect(diagnosticPhase(effect, "disabled")).toBe(effect)
+    expect(diagnosticBody(effect)).toBe(effect)
+    expect(diagnosticDrain(effect, unitDiagnostic("run"), "stderr", 1)).toBe(effect)
+    const calls: number[] = []
+    expect(
+      diagnosticCallback(() => {
+        calls.push(1)
+        return effect
+      }),
+    ).toBe(effect)
+    expect(calls).toEqual([1])
+  },
+)

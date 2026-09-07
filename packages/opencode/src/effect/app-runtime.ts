@@ -1,3 +1,4 @@
+import { unitDiagnostic, unitDiagnosticEnabled } from "@/util/windows-unit-diagnostic"
 import { Layer, ManagedRuntime } from "effect"
 import { attach } from "./run-service"
 import * as Observability from "@opencode-ai/core/observability"
@@ -131,5 +132,20 @@ export const AppRuntime: Runtime = {
   runCallback(effect) {
     return rt.runCallback(wrap(effect))
   },
-  dispose: () => rt.dispose(),
+  dispose: () => {
+    if (!unitDiagnosticEnabled) return rt.dispose()
+    const mark = unitDiagnostic("other", "AppRuntime")
+    mark("globalAppRuntime.dispose.start")
+    try {
+      const promise = rt.dispose()
+      void promise.then(
+        () => mark("globalAppRuntime.dispose.success"),
+        () => mark("globalAppRuntime.dispose.failure"),
+      )
+      return promise
+    } catch (error) {
+      mark("globalAppRuntime.dispose.failure")
+      throw error
+    }
+  },
 }

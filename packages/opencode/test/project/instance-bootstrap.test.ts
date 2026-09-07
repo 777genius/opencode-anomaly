@@ -1,3 +1,4 @@
+import { diagnosticPhase } from "../../src/util/windows-unit-diagnostic"
 import { afterEach, expect } from "bun:test"
 import { existsSync } from "node:fs"
 import path from "node:path"
@@ -58,7 +59,7 @@ const bootstrapFixture = Effect.gen(function* () {
     ),
   )
   return { directory: dir, marker }
-})
+}).pipe((effect) => diagnosticPhase(effect, "bootstrap.fixture"))
 
 function waitDisposed(directory: string) {
   return waitGlobalBusEvent({

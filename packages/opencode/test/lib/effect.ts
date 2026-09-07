@@ -1,4 +1,11 @@
-import { DiagnosticOwner, diagnosticBody, diagnosticContext, diagnosticRegistration, unitDiagnostic } from "./unit-diagnostic"
+import { diagnosticPhase } from "../../src/util/windows-unit-diagnostic"
+import {
+  DiagnosticOwner,
+  diagnosticBody,
+  diagnosticContext,
+  diagnosticRegistration,
+  unitDiagnostic,
+} from "./unit-diagnostic"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -34,11 +41,19 @@ function instanceArgs<E, R>(
 
 const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof value === "function" ? value() : value))
 
-type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, owner?: DiagnosticOwner) => Promise<A>
+type Runner = <A, E, R, E2>(
+  value: Body<A, E, R | Scope.Scope>,
+  layer: Layer.Layer<R, E2>,
+  owner?: DiagnosticOwner,
+) => Promise<A>
 
 const isolatedRun: Runner = (value, layer, owner) =>
   Effect.gen(function* () {
-    const exit = yield* diagnosticBody(body(value)).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
+    const exit = yield* diagnosticPhase(diagnosticBody(body(value)).pipe(Effect.scoped), "test.scoped").pipe(
+      Effect.provide(layer),
+      (effect) => diagnosticPhase(effect, "test.layer"),
+      Effect.exit,
+    )
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
         yield* Effect.logError(err)
@@ -72,22 +87,46 @@ const sharedRun: Runner = (value, layer, owner) =>
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
+    test(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, testLayer, owner)),
+      opts,
+    )
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
+    test.only(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, testLayer, owner)),
+      opts,
+    )
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
+    test.skip(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, testLayer, owner)),
+      opts,
+    )
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
+    test(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)),
+      opts,
+    )
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
+    test.only(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)),
+      opts,
+    )
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
+    test.skip(
+      name,
+      diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)),
+      opts,
+    )
 
   const instance = <A, E2, E3 = never>(
     name: string,
@@ -98,7 +137,9 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
+      diagnosticRegistration(name, (owner) =>
+        run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner),
+      ),
       args.testOptions,
     )
   }
@@ -112,7 +153,9 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
+      diagnosticRegistration(name, (owner) =>
+        run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner),
+      ),
       args.testOptions,
     )
   }
@@ -126,7 +169,9 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
+      diagnosticRegistration(name, (owner) =>
+        run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner),
+      ),
       args.testOptions,
     )
   }

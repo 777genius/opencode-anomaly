@@ -1,3 +1,4 @@
+import { diagnosticPhase, unitDiagnostic } from "../../src/util/windows-unit-diagnostic"
 import { $ } from "bun"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import * as fs from "fs/promises"
@@ -46,7 +47,15 @@ export async function reloadTestInstance(input: { directory: string }) {
 }
 
 export async function disposeAllInstances() {
-  await InstanceRuntime.disposeAllInstances()
+  const mark = unitDiagnostic("other", "fixture")
+  mark("globalAppRuntime.disposeAll.start")
+  try {
+    await InstanceRuntime.disposeAllInstances()
+    mark("globalAppRuntime.disposeAll.success")
+  } catch (error) {
+    mark("globalAppRuntime.disposeAll.failure")
+    throw error
+  }
 }
 
 // Strip null bytes from paths (defensive fix for CI environment issues)
@@ -82,40 +91,50 @@ type TmpDirOptions<T> = {
   dispose?: (dir: string) => Promise<T>
 }
 export async function tmpdir<T>(options?: TmpDirOptions<T>) {
-  const dirpath = sanitizePath(path.join(os.tmpdir(), "opencode-test-" + Math.random().toString(36).slice(2)))
-  await fs.mkdir(dirpath, { recursive: true })
-  if (options?.git) {
-    await $`git init`.cwd(dirpath).quiet()
-    await $`git config core.fsmonitor false`.cwd(dirpath).quiet()
-    await $`git config commit.gpgsign false`.cwd(dirpath).quiet()
-    await $`git config user.email "test@opencode.test"`.cwd(dirpath).quiet()
-    await $`git config user.name "Test"`.cwd(dirpath).quiet()
-    await $`git commit --allow-empty -m "root commit ${dirpath}"`.cwd(dirpath).quiet()
+  const mark = unitDiagnostic("other", "fixture")
+  mark("fixture.create.start")
+  try {
+    const dirpath = sanitizePath(path.join(os.tmpdir(), "opencode-test-" + Math.random().toString(36).slice(2)))
+    await fs.mkdir(dirpath, { recursive: true })
+    if (options?.git) {
+      await $`git init`.cwd(dirpath).quiet()
+      await $`git config core.fsmonitor false`.cwd(dirpath).quiet()
+      await $`git config commit.gpgsign false`.cwd(dirpath).quiet()
+      await $`git config user.email "test@opencode.test"`.cwd(dirpath).quiet()
+      await $`git config user.name "Test"`.cwd(dirpath).quiet()
+      await $`git commit --allow-empty -m "root commit ${dirpath}"`.cwd(dirpath).quiet()
+    }
+    if (options?.config) {
+      await Bun.write(
+        path.join(dirpath, "opencode.json"),
+        JSON.stringify({
+          $schema: "https://opencode.ai/config.json",
+          ...options.config,
+        }),
+      )
+    }
+    const realpath = sanitizePath(await fs.realpath(dirpath))
+    const extra = await options?.init?.(realpath)
+    const result = {
+      [Symbol.asyncDispose]: async () => {
+        mark("fixture.scope.cleanup.start")
+        try {
+          await options?.dispose?.(realpath)
+        } finally {
+          if (options?.git) await stop(realpath).catch(() => undefined)
+          await clean(realpath).catch(() => undefined)
+          mark("fixture.scope.cleanup.settled")
+        }
+      },
+      path: realpath,
+      extra: extra as T,
+    }
+    mark("fixture.create.success")
+    return result
+  } catch (error) {
+    mark("fixture.create.failure")
+    throw error
   }
-  if (options?.config) {
-    await Bun.write(
-      path.join(dirpath, "opencode.json"),
-      JSON.stringify({
-        $schema: "https://opencode.ai/config.json",
-        ...options.config,
-      }),
-    )
-  }
-  const realpath = sanitizePath(await fs.realpath(dirpath))
-  const extra = await options?.init?.(realpath)
-  const result = {
-    [Symbol.asyncDispose]: async () => {
-      try {
-        await options?.dispose?.(realpath)
-      } finally {
-        if (options?.git) await stop(realpath).catch(() => undefined)
-        await clean(realpath).catch(() => undefined)
-      }
-    },
-    path: realpath,
-    extra: extra as T,
-  }
-  return result
 }
 
 /** Effectful scoped tmpdir. Cleaned up when the scope closes. Make sure these stay in sync */
@@ -131,10 +150,13 @@ export function tmpdirScoped<E = never, R = never>(options?: {
     const dir = sanitizePath(yield* Effect.promise(() => fs.realpath(dirpath)))
 
     yield* Effect.addFinalizer(() =>
-      Effect.promise(async () => {
-        if (options?.git) await stop(dir).catch(() => undefined)
-        await clean(dir).catch(() => undefined)
-      }),
+      diagnosticPhase(
+        Effect.promise(async () => {
+          if (options?.git) await stop(dir).catch(() => undefined)
+          await clean(dir).catch(() => undefined)
+        }),
+        "fixture.scope.cleanup",
+      ),
     )
 
     const git = (...args: string[]) =>
@@ -162,7 +184,7 @@ export function tmpdirScoped<E = never, R = never>(options?: {
     if (options?.init) yield* options.init(dir)
 
     return dir
-  })
+  }).pipe((effect) => diagnosticPhase(effect, "fixture.create"))
 }
 
 export const provideInstance =
