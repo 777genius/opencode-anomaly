@@ -1,4 +1,4 @@
-import { writeSync } from "node:fs"
+import fs from "node:fs"
 import { Context, Effect } from "effect"
 
 export const unitDiagnosticEnabled = process.platform === "win32" && process.env.OPENCODE_WINDOWS_UNIT_DIAGNOSTICS === "1"
@@ -29,7 +29,7 @@ export function unitDiagnostic(
     if (!unitDiagnosticEnabled || budget.records >= 20000) return
     budget.records++
     try {
-      writeSync(2, JSON.stringify({
+      fs.writeSync(2, JSON.stringify({
         marker: "windows-unit", id, testid: owner?.id ?? null,
         file: (owner?.file ?? file ?? "unattributed").slice(0, 240),
         test: (owner?.test ?? "unattributed cleanup").slice(0, 240),
