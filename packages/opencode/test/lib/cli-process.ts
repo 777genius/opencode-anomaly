@@ -6,7 +6,7 @@ import {
   diagnosticContext,
   diagnosticDrain,
   diagnosticExit,
-  diagnosticTest,
+  diagnosticRegistration,
   diagnosticText,
   unitDiagnostic,
 } from "./unit-diagnostic"
@@ -619,7 +619,7 @@ export const cliIt = {
   ) =>
     (process.platform === "win32" ? test : test.concurrent)(
       name,
-      diagnosticTest(name, (owner: DiagnosticOwner | undefined = undefined) => Effect.runPromise(diagnosticContext(Effect.scoped(diagnosticBody(withCliFixture(body))), owner))),
+      diagnosticRegistration(name, (owner) => Effect.runPromise(diagnosticContext(Effect.scoped(diagnosticBody(withCliFixture(body))), owner))),
       opts,
     ),
 }

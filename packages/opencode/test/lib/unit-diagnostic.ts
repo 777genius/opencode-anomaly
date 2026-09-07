@@ -59,6 +59,13 @@ export function diagnosticTest<A>(name: string, run: (owner?: DiagnosticOwner) =
   }
 }
 
+// Bun may supply a done callback. Keep that argument outside the explicit owner boundary,
+// including when diagnosticTest preserves the original callback's disabled identity.
+export function diagnosticRegistration<A>(name: string, run: (owner?: DiagnosticOwner) => Promise<A>) {
+  const callback = diagnosticTest(name, run)
+  return () => callback()
+}
+
 export function diagnosticBody<A, E, R>(effect: Effect.Effect<A, E, R>, phase = "body") {
   if (!unitDiagnosticEnabled) return effect
   return Effect.gen(function* () {

@@ -7,6 +7,7 @@ import {
   diagnosticCallback,
   diagnosticContext,
   diagnosticDrain,
+  diagnosticRegistration,
   diagnosticTest,
   unitDiagnostic,
   unitDiagnosticEnabled,
@@ -26,13 +27,55 @@ function capture() {
 
 const diagnostic = unitDiagnosticEnabled ? test : test.skip
 
+test("registration has zero arity and never forwards Bun's done callback as owner", async () => {
+  using output = capture()
+  const owners: Array<DiagnosticOwner | undefined> = []
+  const doneCalls: unknown[] = []
+  const callback = diagnosticRegistration("registration", (owner) => {
+    owners.push(owner)
+    return Promise.resolve(42)
+  })
+  expect(callback.length).toBe(0)
+  // Use Bun's callback signature without a cast and simulate its supplied argument.
+  const registered: (done: (err?: unknown) => void) => void | Promise<unknown> = callback
+  const result = registered((error) => { doneCalls.push(error) })
+  expect(owners).toHaveLength(1)
+  expect(await result).toBe(42)
+  expect(doneCalls).toEqual([])
+  if (!unitDiagnosticEnabled) {
+    expect(owners).toEqual([undefined])
+    expect(output.records).toEqual([])
+    return
+  }
+  expect(owners[0]?.test).toBe("registration")
+  expect(owners[0]?.id).toBeNumber()
+  expect(output.records.map((record) => [record.phase, record.testid])).toEqual([
+    ["test.entry", owners[0]?.id], ["scope.settled", owners[0]?.id],
+  ])
+})
+
+test("registration preserves rejection identity and invokes once", async () => {
+  using output = capture()
+  const error = new Error("registration failure")
+  const calls: number[] = []
+  const callback = diagnosticRegistration("rejecting", () => {
+    calls.push(1)
+    return Promise.reject(error)
+  })
+  await expect(callback()).rejects.toBe(error)
+  expect(calls).toEqual([1])
+  expect(output.records.map((record) => record.phase)).toEqual(
+    unitDiagnosticEnabled ? ["test.entry", "scope.settled"] : [],
+  )
+})
+
 diagnostic("concurrent suspended nested fibers retain child and cleanup owners", async () => {
   using output = capture()
   const ready = await Effect.runPromise(Deferred.make<void>())
   const resume = await Effect.runPromise(Deferred.make<void>())
   await Promise.all(
     ["owner-a", "owner-b"].map((name, index) =>
-      diagnosticTest(name, (owner) =>
+      diagnosticRegistration(name, (owner) =>
         Effect.gen(function* () {
           yield* Deferred.succeed(index === 0 ? ready : resume, undefined)
           yield* Deferred.await(index === 0 ? resume : ready)
@@ -71,7 +114,7 @@ diagnostic("leaked suspended cleanup outlives its test and keeps its owner while
   const scope = await Effect.runPromise(Scope.make())
   const entered = await Effect.runPromise(Deferred.make<void>())
   const release = await Effect.runPromise(Deferred.make<void>())
-  await diagnosticTest("departed", (owner) =>
+  await diagnosticRegistration("departed", (owner) =>
     Effect.gen(function* () {
       yield* Effect.addFinalizer(() =>
         Effect.gen(function* () {
@@ -87,7 +130,7 @@ diagnostic("leaked suspended cleanup outlives its test and keeps its owner while
     }).pipe(Effect.provideService(Scope.Scope, scope), (effect) => diagnosticContext(effect, owner), Effect.runPromise),
   )()
   const closing: Promise<void>[] = []
-  await diagnosticTest("current", (owner) =>
+  await diagnosticRegistration("current", (owner) =>
     Effect.gen(function* () {
       closing.push(Effect.runPromise(diagnosticContext(Scope.close(scope, Exit.void), owner)))
       yield* Deferred.await(entered)
@@ -117,7 +160,7 @@ diagnostic("callback entry precedes synchronous invocation and synchronous throw
   const error = new Error("callback defect")
   const calls: string[] = []
   const caught: unknown[] = []
-  await diagnosticTest("throwing", async (owner) => {
+  await diagnosticRegistration("throwing", async (owner) => {
     try {
       diagnosticCallback(() => {
       calls.push("invoked")
