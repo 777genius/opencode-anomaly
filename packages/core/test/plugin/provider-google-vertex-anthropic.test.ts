@@ -10,14 +10,28 @@ import { GoogleVertexAnthropicPlugin, GoogleVertexPlugin } from "@opencode-ai/co
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
+import { vertexAnthropicPhase, vertexAnthropicPhases, vertexAnthropicPreimport } from "../lib/vertex-anthropic-phase"
 
-const it = testEffect(PluginTestLayer)
+// One controlled comparison process; this awaited import is outside test registration.
+if (vertexAnthropicPreimport) {
+  vertexAnthropicPhase("import.entry")
+  try {
+    await import("@ai-sdk/google-vertex/anthropic")
+    vertexAnthropicPhase("import.ready")
+  } finally {
+    vertexAnthropicPhase("import.settled")
+  }
+}
+
+const it = testEffect(PluginTestLayer, vertexAnthropicPhases ? vertexAnthropicPhase : undefined)
 
 const addPlugin = Effect.fn(function* (definition: typeof GoogleVertexAnthropicPlugin | typeof GoogleVertexPlugin) {
+  vertexAnthropicPhase("plugin.entry")
   const plugin = yield* PluginV2.Service
   const aisdk = yield* AISDK.Service
   const host = yield* PluginHost.make(plugin)
   yield* definition.effect(host)
+  vertexAnthropicPhase("plugin.ready")
 })
 
 function withEnv<A, E, R>(vars: Record<string, string | undefined>, effect: () => Effect.Effect<A, E, R>) {
@@ -33,10 +47,12 @@ function withEnv<A, E, R>(vars: Record<string, string | undefined>, effect: () =
     effect,
     (previous) =>
       Effect.sync(() => {
+        vertexAnthropicPhase("environment.restore.entry")
         Object.entries(previous).forEach(([key, value]) => {
           if (value === undefined) delete process.env[key]
           else process.env[key] = value
         })
+        vertexAnthropicPhase("environment.restored")
       }),
   )
 }
@@ -68,12 +84,16 @@ describe("GoogleVertexAnthropicPlugin", () => {
             }),
           )
           yield* addPlugin(GoogleVertexAnthropicPlugin)
+          vertexAnthropicPhase("assertion.entry")
           expect(
             (yield* catalog.provider.get(ProviderV2.ID.make("google-vertex-anthropic")))?.request.body.project,
           ).toBe("cloud-project")
+          vertexAnthropicPhase("assertion.ready")
+          vertexAnthropicPhase("assertion.entry")
           expect(
             (yield* catalog.provider.get(ProviderV2.ID.make("google-vertex-anthropic")))?.request.body.location,
           ).toBe("cloud-location")
+          vertexAnthropicPhase("assertion.ready")
         }),
     ),
   )
@@ -90,12 +110,16 @@ describe("GoogleVertexAnthropicPlugin", () => {
           }),
         )
         yield* addPlugin(GoogleVertexAnthropicPlugin)
+        vertexAnthropicPhase("assertion.entry")
         expect((yield* catalog.provider.get(ProviderV2.ID.make("google-vertex-anthropic")))?.request.body.project).toBe(
           "configured-project",
         )
+        vertexAnthropicPhase("assertion.ready")
+        vertexAnthropicPhase("assertion.entry")
         expect(
           (yield* catalog.provider.get(ProviderV2.ID.make("google-vertex-anthropic")))?.request.body.location,
         ).toBe("configured-location")
+        vertexAnthropicPhase("assertion.ready")
       }),
     ),
   )
@@ -115,6 +139,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
           const plugin = yield* PluginV2.Service
           const aisdk = yield* AISDK.Service
           yield* addPlugin(GoogleVertexAnthropicPlugin)
+          vertexAnthropicPhase("runSDK.entry")
           const result = yield* aisdk.runSDK({
             model: ModelV2.Info.make({
               ...ModelV2.Info.empty(
@@ -126,9 +151,12 @@ describe("GoogleVertexAnthropicPlugin", () => {
             package: "@ai-sdk/google-vertex/anthropic",
             options: { name: "google-vertex-anthropic" },
           })
+          vertexAnthropicPhase("runSDK.ready")
+          vertexAnthropicPhase("assertion.entry")
           expect(result.sdk.languageModel("claude-sonnet-4-5").config.baseURL).toBe(
             "https://aiplatform.googleapis.com/v1/projects/gcp-project/locations/global/publishers/anthropic/models",
           )
+          vertexAnthropicPhase("assertion.ready")
         }),
     ),
   )
@@ -141,6 +169,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
           const plugin = yield* PluginV2.Service
           const aisdk = yield* AISDK.Service
           yield* addPlugin(GoogleVertexAnthropicPlugin)
+          vertexAnthropicPhase("runSDK.entry")
           const result = yield* aisdk.runSDK({
             model: ModelV2.Info.make({
               ...ModelV2.Info.empty(
@@ -152,9 +181,12 @@ describe("GoogleVertexAnthropicPlugin", () => {
             package: "@ai-sdk/google-vertex/anthropic",
             options: { name: "google-vertex-anthropic" },
           })
+          vertexAnthropicPhase("runSDK.ready")
+          vertexAnthropicPhase("assertion.entry")
           expect(result.sdk.languageModel("claude-sonnet-4-5").config.baseURL).toBe(
             "https://cloud-location-aiplatform.googleapis.com/v1/projects/project/locations/cloud-location/publishers/anthropic/models",
           )
+          vertexAnthropicPhase("assertion.ready")
         }),
     ),
   )
@@ -164,6 +196,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
       const plugin = yield* PluginV2.Service
       const aisdk = yield* AISDK.Service
       yield* addPlugin(GoogleVertexAnthropicPlugin)
+      vertexAnthropicPhase("runSDK.entry")
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("google-vertex"), ModelV2.ID.make("claude-sonnet-4-5")),
@@ -172,9 +205,12 @@ describe("GoogleVertexAnthropicPlugin", () => {
         package: "@ai-sdk/google-vertex/anthropic",
         options: { name: "google-vertex", project: "project", location: "eu" },
       })
+      vertexAnthropicPhase("runSDK.ready")
+      vertexAnthropicPhase("assertion.entry")
       expect(result.sdk.languageModel("claude-sonnet-4-5").config.baseURL).toBe(
         "https://aiplatform.eu.rep.googleapis.com/v1/projects/project/locations/eu/publishers/anthropic/models",
       )
+      vertexAnthropicPhase("assertion.ready")
     }),
   )
 
@@ -183,6 +219,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
       const plugin = yield* PluginV2.Service
       const aisdk = yield* AISDK.Service
       yield* addPlugin(GoogleVertexAnthropicPlugin)
+      vertexAnthropicPhase("runSDK.entry")
       const result = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("google-vertex"), ModelV2.ID.make("claude-sonnet-4-5")),
@@ -191,7 +228,10 @@ describe("GoogleVertexAnthropicPlugin", () => {
         package: "@ai-sdk/google-vertex/anthropic",
         options: { name: "google-vertex", project: "project", location: "eu", baseURL: "https://proxy.example/v1" },
       })
+      vertexAnthropicPhase("runSDK.ready")
+      vertexAnthropicPhase("assertion.entry")
       expect(result.sdk.languageModel("claude-sonnet-4-5").config.baseURL).toBe("https://proxy.example/v1")
+      vertexAnthropicPhase("assertion.ready")
     }),
   )
 
@@ -201,6 +241,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
       const aisdk = yield* AISDK.Service
       yield* addPlugin(GoogleVertexPlugin)
       yield* addPlugin(GoogleVertexAnthropicPlugin)
+      vertexAnthropicPhase("runSDK.entry")
       const sdkResult = yield* aisdk.runSDK({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("google-vertex"), ModelV2.ID.make(" claude-sonnet-4-5 ")),
@@ -209,6 +250,7 @@ describe("GoogleVertexAnthropicPlugin", () => {
         package: "@ai-sdk/google-vertex/anthropic",
         options: { name: "google-vertex", project: "project", location: "us" },
       })
+      vertexAnthropicPhase("runSDK.ready")
       const languageResult = yield* aisdk.runLanguage({
         model: ModelV2.Info.make({
           ...ModelV2.Info.empty(ProviderV2.ID.make("google-vertex"), ModelV2.ID.make(" claude-sonnet-4-5 ")),
@@ -218,10 +260,14 @@ describe("GoogleVertexAnthropicPlugin", () => {
         options: {},
       })
       const language = languageResult.language as unknown as { config: { baseURL: string }; modelId: string }
+      vertexAnthropicPhase("assertion.entry")
       expect(language.config.baseURL).toBe(
         "https://aiplatform.us.rep.googleapis.com/v1/projects/project/locations/us/publishers/anthropic/models",
       )
+      vertexAnthropicPhase("assertion.ready")
+      vertexAnthropicPhase("assertion.entry")
       expect(language.modelId).toBe("claude-sonnet-4-5")
+      vertexAnthropicPhase("assertion.ready")
     }),
   )
 
@@ -239,7 +285,9 @@ describe("GoogleVertexAnthropicPlugin", () => {
         sdk: { languageModel: selector(calls) },
         options: {},
       })
+      vertexAnthropicPhase("assertion.entry")
       expect(calls).toEqual(["languageModel:claude-sonnet-4-5"])
+      vertexAnthropicPhase("assertion.ready")
     }),
   )
 
@@ -257,8 +305,12 @@ describe("GoogleVertexAnthropicPlugin", () => {
         sdk: { languageModel: selector(calls) },
         options: {},
       })
+      vertexAnthropicPhase("assertion.entry")
       expect(calls).toEqual([])
+      vertexAnthropicPhase("assertion.ready")
+      vertexAnthropicPhase("assertion.entry")
       expect(result.language).toBeUndefined()
+      vertexAnthropicPhase("assertion.ready")
     }),
   )
 })
