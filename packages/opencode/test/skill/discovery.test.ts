@@ -5,7 +5,7 @@ import { Effect } from "effect"
 import { Discovery } from "../../src/skill/discovery"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
-import { rm } from "fs/promises"
+import { readFile, rm, stat } from "fs/promises"
 import path from "path"
 import { testEffect } from "../lib/effect"
 
@@ -174,7 +174,27 @@ describe("Discovery.pull", () => {
       mutableVersion = "3"
       mutableContent = "# New"
       mutableFiles = ["SKILL.md"]
-      yield* discovery.pull(url)
+      const third = yield* discovery.pull(url)
+      // Keep both readers visible until Windows evidence distinguishes a failed swap from a stale oracle.
+      const observation = yield* Effect.promise(async () => {
+        const file = Bun.file(path.join(second[0], "SKILL.md"))
+        const reads = await Promise.allSettled([
+          readFile(path.join(second[0], ".opencode-version"), "utf8"),
+          readFile(path.join(second[0], "SKILL.md"), "utf8"),
+          stat(path.join(second[0], "SKILL.md")),
+          file.text(),
+        ])
+        return {
+          version: mutableVersion,
+          downloads: mutableDownloadCount,
+          directories: third,
+          reads: reads.map((result) => result.status === "fulfilled"
+            ? { status: result.status, value: result.value }
+            : { status: result.status, error: String(result.reason) }),
+          bun: { size: file.size, lastModified: file.lastModified },
+        }
+      })
+      yield* Effect.logInfo("mutable skill v3 observation", observation)
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "SKILL.md")).text())).toBe("# New")
       expect(yield* Effect.promise(() => Bun.file(path.join(second[0], "old.md")).exists())).toBe(false)
       expect(mutableDownloadCount).toBe(3)
