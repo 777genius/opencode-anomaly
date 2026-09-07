@@ -47,10 +47,12 @@ test("registration has zero arity and never forwards Bun's done callback as owne
     expect(output.records).toEqual([])
     return
   }
-  expect(owners[0]?.test).toBe("registration")
-  expect(owners[0]?.id).toBeNumber()
+  const owner = owners[0]
+  if (!owner) throw new Error("enabled registration did not retain its owner")
+  expect(owner.test).toBe("registration")
+  expect(owner.id).toBeNumber()
   expect(output.records.map((record) => [record.phase, record.testid])).toEqual([
-    ["test.entry", owners[0]?.id], ["scope.settled", owners[0]?.id],
+    ["test.entry", owner.id], ["scope.settled", owner.id],
   ])
 })
 
