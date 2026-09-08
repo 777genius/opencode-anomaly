@@ -197,6 +197,7 @@ jobs:
         run: bun --cwd packages/app test:e2e:local
         env:
           CI: true
+          PLAYWRIGHT_BUILT_APP: ${{ runner.os == 'Windows' && '1' || '0' }}
         timeout-minutes: 30
 
       - name: Upload Playwright artifacts
