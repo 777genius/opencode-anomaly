@@ -34,34 +34,32 @@ import { ProviderError } from "./error"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
-function wrapSSE(res: Response, ms: number, ctl: AbortController) {
+export function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
 
   const reader = res.body.getReader()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let cancelled = false
   const body = new ReadableStream<Uint8Array>({
     async pull(ctrl) {
       const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
-        const id = setTimeout(() => {
+        timer = setTimeout(() => {
           const err = new ProviderError.ResponseStreamError("SSE read timed out")
-          ctl.abort(err)
-          void reader.cancel(err)
+          // Select the stream failure before abort/cancel can settle the pending read.
           reject(err)
+          ctl.abort(err)
+          // Cancellation is cleanup here: its rejection must not escape or replace the timeout.
+          void reader.cancel(err).catch(() => {})
         }, ms)
 
-        reader.read().then(
-          (part) => {
-            clearTimeout(id)
-            resolve(part)
-          },
-          (err) => {
-            clearTimeout(id)
-            reject(err)
-          },
-        )
+        reader.read().then(resolve, reject)
+      }).finally(() => {
+        clearTimeout(timer)
       })
 
+      if (cancelled) return
       if (part.done) {
         ctrl.close()
         return
@@ -70,7 +68,10 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
       ctrl.enqueue(part.value)
     },
     async cancel(reason) {
+      cancelled = true
+      clearTimeout(timer)
       ctl.abort(reason)
+      // Unlike timeout cleanup, explicit cancellation reports failure to its caller.
       await reader.cancel(reason)
     },
   })

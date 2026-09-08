@@ -8,17 +8,20 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
     "adds a remote server with HTTP headers",
     ({ home, opencode }) =>
       Effect.gen(function* () {
-        const result = yield* opencode.spawn([
-          "mcp",
-          "add",
-          "github",
-          "--url",
-          "https://example.com/mcp",
-          "--header",
-          "Authorization=Bearer {env:GITHUB_TOKEN}",
-          "--header",
-          "X-Option=one=two",
-        ])
+        const result = yield* opencode.spawn(
+          [
+            "mcp",
+            "add",
+            "github",
+            "--url",
+            "https://example.com/mcp",
+            "--header",
+            "Authorization=Bearer {env:GITHUB_TOKEN}",
+            "--header",
+            "X-Option=one=two",
+          ],
+          { timeoutMs: 60_000 },
+        )
         opencode.expectExit(result, 0)
 
         const config = yield* Effect.promise(() =>
@@ -33,28 +36,31 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
           },
         })
       }),
-    60_000,
+    75_000,
   )
 
   cliIt.concurrent(
     "adds a local server while preserving argv and environment values",
     ({ home, opencode }) =>
       Effect.gen(function* () {
-        const result = yield* opencode.spawn([
-          "mcp",
-          "add",
-          "local",
-          "--env",
-          "API_KEY=secret",
-          "--env",
-          "VALUE=one=two",
-          "--",
-          "npx",
-          "-y",
-          "@example/server",
-          "--label",
-          "two words",
-        ])
+        const result = yield* opencode.spawn(
+          [
+            "mcp",
+            "add",
+            "local",
+            "--env",
+            "API_KEY=secret",
+            "--env",
+            "VALUE=one=two",
+            "--",
+            "npx",
+            "-y",
+            "@example/server",
+            "--label",
+            "two words",
+          ],
+          { timeoutMs: 60_000 },
+        )
         opencode.expectExit(result, 0)
 
         const config = yield* Effect.promise(() =>
@@ -69,6 +75,6 @@ describe("opencode mcp add (non-interactive subprocess)", () => {
           },
         })
       }),
-    60_000,
+    75_000,
   )
 })

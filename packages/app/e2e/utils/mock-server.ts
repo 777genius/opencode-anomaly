@@ -48,13 +48,13 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     "/session": config.sessions,
   }
 
-  await page.route("**/*", async (route) => {
+  const targetPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
+  const server = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${targetPort}`
+  const app = process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? "3000"}`
+  const appPort = new URL(app).port
+
+  await page.route(mockServerRoutePattern(server, app), async (route) => {
     const url = new URL(route.request().url())
-    const targetPort = process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"
-    const appPort = new URL(
-      process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? "3000"}`,
-    ).port
-    if (url.port !== targetPort && url.port !== appPort) return route.fallback()
 
     const path = url.pathname
     if (path === "/global/event" || path === "/event" || path === "/api/event") {
@@ -312,6 +312,41 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     if (url.port === targetPort && targetPort !== appPort) return json(route, {})
     return route.fallback()
   })
+}
+
+export function mockServerRoutePattern(server: string, app: string) {
+  const backend = new URL(server).origin
+  const frontend = new URL(app).origin
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  // Match pathname boundaries before allowing queries; source/worker imports must
+  // bypass Playwright interception itself, not fall back inside the handler.
+  const paths = [
+    ...[...emptyList, ...emptyObject].map(escape),
+    "/(?:path|agent|permission|event)",
+    "/global/(?:event|health)",
+    "/experimental/capabilities",
+    "/provider(?:/auth)?",
+    "/auth/[^/?#]+",
+    "/instance/dispose",
+    "/vcs(?:/status|/diff)?",
+    "/file(?:/content)?",
+    "/find/file",
+    "/project(?:/[^/?#]+)?",
+    "/question(?:/[^/?#]+/(?:reply|reject))?",
+    "/session(?:/[^/?#]+(?:/message(?:/[^/?#]+)?|/todo|/children|/diff|/permissions/[^/?#]+)?)?",
+    "/api/(?:event|health|reference|agent|command|path)",
+    "/api/mcp(?:/resource)?",
+    "/api/integration/[^/?#]+(?:/connect/key)?",
+    "/api/project(?:/[^?#]*)?",
+    "/api/(?:permission|question)/request",
+    "/api/vcs(?:/status|/diff)?",
+    "/api/pty/(?:shells|[^/?#]+/connect-token)",
+    "/api/session(?:/[^/?#]+(?:/message|/shell|/archive|/rename|/interrupt|/revert/(?:clear|commit)|/question/[^/?#]+/(?:reply|reject)|/permission/[^/?#]+/reply)?)?",
+  ]
+  const api = `${escape(frontend)}(?:${paths.join("|")})(?:[?#].*)?`
+  // Keep all requests to a separate backend in dispatch, including unknown ones.
+  // A shared origin also serves the app document and modules, so restrict it to API paths.
+  return new RegExp(`^(?:${backend === frontend ? api : `${escape(backend)}/.*|${api}`})$`)
 }
 
 function location(config: MockServerConfig) {

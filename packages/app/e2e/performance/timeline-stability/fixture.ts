@@ -105,6 +105,7 @@ export async function setupTimeline(
     ...(input.seedHistory ? historyMessages(18) : []),
     ...(input.messages ?? [userMessage(), assistantMessage()]),
   ])
+  const readinessMessageID = timelineReadinessMessageID(messages)
   const active = messages.findLast((message) => message.info.role === "assistant")
   const initialStatus = decodeStatus(
     active?.info.role === "assistant" && active.info.time.completed === undefined ? { type: "busy" } : { type: "idle" },
@@ -162,6 +163,9 @@ export async function setupTimeline(
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await transport.waitForConnection()
   await expectSessionTitle(page, title)
+  const row = page.locator(`[data-message-id="${readinessMessageID}"]`).last()
+  await expect(row).toHaveCount(1)
+  await expect(row).toBeVisible()
   if (input.cpuRate && input.cpuRate > 1) {
     const devtools = await page.context().newCDPSession(page)
     await devtools.send("Emulation.setCPUThrottlingRate", { rate: input.cpuRate })
@@ -202,6 +206,12 @@ export async function setupTimeline(
       await expect(part).toBeVisible()
     },
   }
+}
+
+export function timelineReadinessMessageID(messages: readonly TimelineMessage[]) {
+  const message = messages.findLast((item) => item.info.role === "user")
+  if (!message) throw new Error("Timeline fixture requires a user message")
+  return message.info.id
 }
 
 function describeEvent(event: EventPayload) {

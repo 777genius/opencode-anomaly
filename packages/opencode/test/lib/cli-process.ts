@@ -1,3 +1,15 @@
+import {
+  diagnosticAcp,
+  DiagnosticOwner,
+  diagnosticBody,
+  diagnosticCallback,
+  diagnosticContext,
+  diagnosticDrain,
+  diagnosticExit,
+  diagnosticRegistration,
+  diagnosticText,
+  unitDiagnostic,
+} from "./unit-diagnostic"
 // Subprocess test harness for the opencode CLI. Spawns the real binary against
 // a TestLLMServer running in-process at a random port, with full env isolation.
 //
@@ -22,13 +34,14 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
-import { Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
+import { Clock, Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Stream } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import { ChildProcess } from "effect/unstable/process"
 import path from "node:path"
 import { TestLLMServer } from "./llm-server"
 import { testProviderConfig } from "./test-provider"
 import { it } from "./effect"
+import { trackAcpStartup } from "./acp-startup"
 
 const opencodeRoot = path.resolve(import.meta.dir, "../../")
 const cliEntry = path.join(opencodeRoot, "src/index.ts")
@@ -49,11 +62,17 @@ function fromBunStream(name: string, get: () => ReadableStream<Uint8Array>) {
 // chunk, push to a tail buffer, swallow stream errors (the child closing the
 // pipe is normal). `log: true` surfaces a real protocol error to logs so a
 // regression doesn't silently disappear.
-function forkStderrDrain(stream: ReadableStream<Uint8Array>, into: string[]) {
+function forkStderrDrain(
+  stream: ReadableStream<Uint8Array>,
+  into: string[],
+  mark: ReturnType<typeof unitDiagnostic>,
+  pid: number,
+) {
   return Effect.forkScoped(
     fromBunStream("stderr", () => stream).pipe(
       Stream.decodeText(),
       Stream.runForEach((chunk) => Effect.sync(() => into.push(chunk))),
+      (effect) => diagnosticDrain(effect, mark, "stderr", pid),
       Effect.ignore({ log: true }),
     ),
   )
@@ -140,6 +159,10 @@ export type AcpOpts = SpawnOpts & {
 }
 
 export type AcpHandle = {
+  // Opt-in waits: acp() itself returns before readiness so callers can close
+  // stdin immediately. Source startup is bounded separately from RPC/EOF.
+  readonly ready: Effect.Effect<void, Error>
+  readonly exitAfterStartup: Effect.Effect<number, Error>
   // Writes a single JSON-RPC message to the child's stdin as one ndjson line.
   readonly send: (msg: object) => Effect.Effect<void>
   // Resolves with the next parsed JSON-RPC line from the child's stdout.
@@ -150,6 +173,7 @@ export type AcpHandle = {
   // calls this, so tests only need it when asserting exit behavior.
   readonly close: () => void
   readonly exited: Promise<number>
+  readonly diagnostics: () => string
 }
 
 export type OpencodeCli = {
@@ -205,6 +229,9 @@ export function withCliFixture<A, E>(
     const env = isolatedEnv(home, configJson)
 
     const spawn = Effect.fn("opencode.spawn")(function* (args: string[], opts?: SpawnOpts) {
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic(args[0] === "run" ? "run" : "other", undefined, owner)
+      mark("app-process.run.start")
       const start = Date.now()
       const timeoutMs = opts?.timeoutMs ?? 30_000
       // stdin: "ignore" so the child doesn't see a piped stdin and block
@@ -240,6 +267,7 @@ export function withCliFixture<A, E>(
           } satisfies AppProcess.RunResult),
         ),
       )
+      mark("app-process.run.settled")
       return {
         exitCode: result.exitCode,
         stdout: normalizeLines(result.stdout.toString()),
@@ -279,29 +307,44 @@ export function withCliFixture<A, E>(
     }
 
     const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("run", undefined, owner)
+      mark("spawn.request")
       const start = Date.now()
       const options = runOpts(opts)
       const proc = yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
+        Effect.sync(() => {
+          const child = Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...runArgs(message, opts)], {
             cwd: home,
             env: { ...process.env, ...env, ...options?.env },
             stdin: "ignore",
             stdout: "pipe",
             stderr: "pipe",
-          }),
-        ),
+          })
+          mark("spawn", child.pid)
+          diagnosticExit(child.exited, mark, child.pid)
+          return child
+        }),
         (child) =>
           Effect.promise(() => {
+            mark("kill.request", child.pid)
             child.kill()
+            mark("exit.wait", child.pid)
             return child.exited
           }).pipe(Effect.ignore),
       )
+      mark("stdout.drain.start", proc.pid)
       const stdout = new Response(proc.stdout).text()
+      diagnosticText(stdout, mark, "stdout", proc.pid)
+      mark("stderr.drain.start", proc.pid)
       const stderr = new Response(proc.stderr).text()
+      diagnosticText(stderr, mark, "stderr", proc.pid)
 
       return {
-        interrupt: () => proc.kill("SIGINT"),
+        interrupt: () => {
+          mark("kill.sigint.request", proc.pid)
+          return proc.kill("SIGINT")
+        },
         result: Effect.promise(async () => ({
           exitCode: await proc.exited,
           stdout: normalizeLines(await stdout),
@@ -312,6 +355,9 @@ export function withCliFixture<A, E>(
     })
 
     const serve = Effect.fn("opencode.serve")(function* (opts?: ServeOpts) {
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("serve", undefined, owner)
+      mark("spawn.request")
       const argv = ["serve"]
       // Default port 0 — let the OS pick a free port, parse the actual one
       // off stdout. Hard-coded ports flake under parallel tests.
@@ -323,17 +369,22 @@ export function withCliFixture<A, E>(
       // scope close. Wrapped in Effect.ignore so a flaky kill doesn't surface
       // as a finalizer error during test teardown.
       const proc = yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+        Effect.sync(() => {
+          const child = Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
             cwd: home,
             env: { ...process.env, ...env, ...opts?.env },
             stdout: "pipe",
             stderr: "pipe",
-          }),
-        ),
+          })
+          mark("spawn", child.pid)
+          diagnosticExit(child.exited, mark, child.pid)
+          return child
+        }),
         (p) =>
           Effect.promise(() => {
+            mark("kill.request", p.pid)
             p.kill()
+            mark("exit.wait", p.pid)
             return p.exited
           }).pipe(Effect.ignore),
       )
@@ -341,7 +392,7 @@ export function withCliFixture<A, E>(
       // Tail buffer so timeout failures can include stderr context. The fork
       // also keeps the OS pipe buffer from filling and wedging the child.
       const stderrChunks: string[] = []
-      yield* forkStderrDrain(proc.stderr, stderrChunks)
+      yield* forkStderrDrain(proc.stderr, stderrChunks, mark, proc.pid)
 
       // Watch stdout line-by-line for the listening sentinel. Format
       // (see src/cli/cmd/serve.ts):
@@ -356,6 +407,7 @@ export function withCliFixture<A, E>(
             const m = line.match(readyRe)
             return m ? Deferred.succeed(readyDeferred, { url: m[1], hostname: m[2], port: Number(m[3]) }) : Effect.void
           }),
+          (effect) => diagnosticDrain(effect, mark, "stdout", proc.pid),
           Effect.ignore({ log: true }),
         ),
       )
@@ -379,6 +431,7 @@ export function withCliFixture<A, E>(
         hostname: match.hostname,
         port: match.port,
         kill: () => {
+          mark("kill.request", proc.pid)
           proc.kill()
         },
         exited: proc.exited as Promise<number>,
@@ -386,6 +439,10 @@ export function withCliFixture<A, E>(
     })
 
     const acp = Effect.fn("opencode.acp")(function* (opts?: AcpOpts) {
+      const owner = yield* DiagnosticOwner
+      const mark = unitDiagnostic("acp", undefined, owner)
+      mark("spawn.request")
+      const started = yield* Clock.currentTimeMillis
       const argv = ["acp"]
       if (opts?.cwd) argv.push("--cwd", opts.cwd)
       if (opts?.extraArgs) argv.push(...opts.extraArgs)
@@ -394,36 +451,61 @@ export function withCliFixture<A, E>(
       // on stdin EOF) and falls back to SIGTERM if it doesn't exit promptly.
       // Either way we await proc.exited so the test scope doesn't leak.
       const proc = yield* Effect.acquireRelease(
-        Effect.sync(() =>
-          Bun.spawn(["bun", "run", "--conditions=browser", cliEntry, ...argv], {
+        Effect.sync(() => {
+          const child = Bun.spawn([process.execPath, "run", "--conditions=browser", cliEntry, ...argv], {
             cwd: opts?.cwd ?? home,
-            env: { ...process.env, ...env, ...opts?.env },
+            env: { ...process.env, ...env, ...opts?.env, OPENCODE_ACP_PROFILE: "1" },
             stdin: "pipe",
             stdout: "pipe",
             stderr: "pipe",
-          }),
-        ),
+          })
+          mark("spawn", child.pid)
+          diagnosticExit(child.exited, mark, child.pid)
+          return child
+        }),
         (p) =>
           // Graceful shutdown: close stdin (ACP exits on EOF), give it a
           // window to exit, then SIGTERM. The Effect.timeoutOrElse expresses
           // exactly that race without raw setTimeout or Promise.race.
           Effect.gen(function* () {
-            yield* Effect.sync(() => p.stdin.end())
+            yield* Effect.sync(() => {
+              mark("stdin.close.request", p.pid)
+              p.stdin.end()
+              mark("exit.wait", p.pid)
+            })
             yield* Effect.promise(() => p.exited).pipe(
               Effect.timeoutOrElse({
                 duration: Duration.seconds(2),
                 orElse: () =>
                   Effect.sync(() => {
+                    mark("kill.request", p.pid)
                     p.kill()
+                    mark("exit.wait", p.pid)
                   }),
               }),
             )
+            mark("exit.wait", p.pid)
             yield* Effect.promise(() => p.exited)
           }).pipe(Effect.ignore),
       )
 
-      const stderrChunks: string[] = []
-      yield* forkStderrDrain(proc.stderr, stderrChunks)
+      const startup = yield* trackAcpStartup({
+        started,
+        exited: Effect.tryPromise({ try: () => proc.exited, catch: (cause) => new Error(String(cause)) }),
+        exitCode: () => proc.exitCode,
+      })
+      const observeProfile = diagnosticAcp(mark, proc.pid)
+      yield* Effect.forkScoped(
+        fromBunStream("stderr", () => proc.stderr).pipe(
+          Stream.decodeText(),
+          Stream.runForEach((chunk) => {
+            observeProfile(chunk)
+            return startup.observe(chunk)
+          }),
+          (effect) => diagnosticDrain(effect, mark, "stderr", proc.pid),
+          Effect.ignore({ log: true }),
+        ),
+      )
 
       // Each ndjson line becomes one queue entry. JSON.parse failures are
       // surfaced as the raw string so a malformed protocol message doesn't
@@ -443,6 +525,7 @@ export function withCliFixture<A, E>(
             }
             return Queue.offer(responses, parsed)
           }),
+          (effect) => diagnosticDrain(effect, mark, "stdout", proc.pid),
           Effect.ignore({ log: true }),
         ),
       )
@@ -459,14 +542,21 @@ export function withCliFixture<A, E>(
           }),
         receive: Queue.take(responses),
         // proc.stdin.end() is idempotent in Bun; no try/catch needed.
-        close: () => proc.stdin.end(),
+        close: () => {
+          mark("stdin.close.request", proc.pid)
+          return proc.stdin.end()
+        },
         exited: proc.exited as Promise<number>,
+        ready: startup.ready,
+        exitAfterStartup: startup.exitAfterStartup,
+        diagnostics: startup.diagnostics,
       } satisfies AcpHandle
     })
 
     const opencode: OpencodeCli = { run, startRun, serve, acp, spawn, expectExit, parseJsonEvents }
 
-    return yield* fn({ llm, home, opencode })
+    const owner = yield* DiagnosticOwner
+    return yield* diagnosticCallback(() => fn({ llm, home, opencode }), owner)
     // FetchHttpClient is provided so test bodies can `yield* HttpClient.HttpClient`
     // and hit endpoints on `opencode.serve()` without rolling their own fetch.
   }).pipe(
@@ -529,7 +619,7 @@ export const cliIt = {
   ) =>
     (process.platform === "win32" ? test : test.concurrent)(
       name,
-      () => Effect.runPromise(Effect.scoped(withCliFixture(body))),
+      diagnosticRegistration(name, (owner) => Effect.runPromise(diagnosticContext(Effect.scoped(diagnosticBody(withCliFixture(body))), owner))),
       opts,
     ),
 }

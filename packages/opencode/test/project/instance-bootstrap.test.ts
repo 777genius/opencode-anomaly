@@ -1,7 +1,10 @@
-import { afterEach, expect } from "bun:test"
+import { afterEach, beforeEach, expect, spyOn } from "bun:test"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { Npm } from "@opencode-ai/core/npm"
+import { NpmTest } from "../fake/npm"
+import { AppRuntime } from "../../src/effect/app-runtime"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Cause, Effect, Exit, Fiber } from "effect"
@@ -15,6 +18,7 @@ import { waitGlobalBusEvent } from "../server/global-bus"
 const it = testEffect(
   LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
     [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+    [Npm.node, NpmTest.noop],
   ]),
 )
 
@@ -26,8 +30,29 @@ const it = testEffect(
 //
 // The boundaries below are transport-agnostic and stay.
 
+let install: ReturnType<typeof spyOn> | undefined
+
+beforeEach(async () => {
+  // CLI bootstrap uses the process AppRuntime, whose Config already captured this
+  // service. Replacing only the explicit test layer cannot isolate that boundary.
+  const npm = await AppRuntime.runPromise(Npm.Service)
+  // Extract the method before Promise resolution can assimilate Layer.mock's proxy `then`.
+  const noop = await Effect.runPromise(
+    Npm.Service.pipe(
+      Effect.map((service) => service.install),
+      Effect.provide(NpmTest.noop),
+    ),
+  )
+  install = spyOn(npm, "install").mockImplementation(noop)
+})
+
 afterEach(async () => {
-  await disposeAllInstances()
+  try {
+    await disposeAllInstances()
+  } finally {
+    install?.mockRestore()
+    install = undefined
+  }
 })
 
 const bootstrapFixture = Effect.gen(function* () {
@@ -72,7 +97,13 @@ it.live("InstanceStore.provide runs InstanceBootstrap before effect", () =>
     const tmp = yield* bootstrapFixture
     const store = yield* InstanceStore.Service
 
-    yield* store.provide({ directory: tmp.directory }, Effect.succeed("ok"))
+    yield* store.provide(
+      { directory: tmp.directory },
+      Effect.sync(() => {
+        expect(existsSync(tmp.marker)).toBe(true)
+        return "ok"
+      }),
+    )
 
     expect(existsSync(tmp.marker)).toBe(true)
   }),
@@ -82,7 +113,13 @@ it.live("CLI bootstrap runs InstanceBootstrap before callback", () =>
   Effect.gen(function* () {
     const tmp = yield* bootstrapFixture
 
-    yield* Effect.promise(() => cliBootstrap(tmp.directory, async () => "ok"))
+    yield* Effect.promise(() =>
+      cliBootstrap(tmp.directory, async () => {
+        expect(existsSync(tmp.marker)).toBe(true)
+        return "ok"
+      }),
+    )
+    expect(install).toHaveBeenCalled()
 
     expect(existsSync(tmp.marker)).toBe(true)
   }),

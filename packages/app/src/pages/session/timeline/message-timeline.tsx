@@ -348,17 +348,32 @@ export function MessageTimeline(props: {
   const timelineRowByKey = projection.rowByKey
   const timelineRows = projection.rows
 
-  let prependAnchor: { key: string; offset: number } | undefined
+  let prependAnchor: { key: string; offset: number; root: HTMLDivElement } | undefined
   let prependAnchorFrame: number | undefined
+  let prependRestore: (() => void) | undefined
   let prependLoading = false
-  const clearPrependAnchor = () => {
-    prependLoading = false
-    prependAnchor = undefined
+  let prependGeneration = 0
+  let prependScheduled: object | undefined
+  let prependFlushing: object | undefined
+  let iosPrependOffset = false
+  let prependScrollTop: number | undefined
+  let publishPrependOffset: ((root: HTMLDivElement) => void) | undefined
+  let deferPrependOffset: (() => boolean) | undefined
+  const clearPrependAnchor = (keepPending = false) => {
+    prependGeneration += 1
+    prependScheduled = undefined
+    prependFlushing = undefined
+    prependRestore = undefined
+    if (!keepPending) {
+      prependLoading = false
+      prependAnchor = undefined
+    }
     if (prependAnchorFrame === undefined) return
     cancelAnimationFrame(prependAnchorFrame)
     prependAnchorFrame = undefined
   }
   const capturePrependAnchor = () => {
+    clearPrependAnchor()
     prependLoading = true
     updatePrependAnchor()
   }
@@ -372,7 +387,71 @@ export function MessageTimeline(props: {
       .sort((a, b) => a.rect.top - b.rect.top)[0]
     if (!anchor) return
     if (!anchor.element.dataset.timelineKey) return
-    prependAnchor = { key: anchor.element.dataset.timelineKey, offset: anchor.rect.top - view.top }
+    prependAnchor = { key: anchor.element.dataset.timelineKey, offset: anchor.rect.top - view.top, root }
+    prependScrollTop = root.scrollTop
+  }
+  const correctPrependAnchor = (
+    anchor: NonNullable<typeof prependAnchor>,
+    generation: number,
+    complete: (result: boolean | "deferred" | undefined) => void = () => {},
+  ) => {
+    const root = anchor.root
+    const publish = publishPrependOffset
+    const deferred = deferPrependOffset
+    const valid = () =>
+      generation === prependGeneration &&
+      prependAnchor === anchor &&
+      listRoot() === root &&
+      root.isConnected &&
+      sessionKey() === ownerSessionKey &&
+      !!publish &&
+      publishPrependOffset === publish &&
+      deferPrependOffset === deferred
+    if (!valid()) return complete(undefined)
+    if (deferred?.() || prependFlushing) return complete("deferred")
+    if (!iosPrependOffset) return complete(measure())
+    const flushing = {}
+    prependFlushing = flushing
+    // Eligibility can reopen through viewport bounds alone. Deliver actual offset
+    // first, then let core's write and Solid publication finish before measuring.
+    publish!(root)
+    queueMicrotask(() => {
+      if (prependFlushing !== flushing) return
+      prependFlushing = undefined
+      if (!valid()) return
+      complete(measure())
+    })
+
+    function measure(): boolean | "deferred" | undefined {
+      if (!valid()) return
+      if (deferred?.()) return "deferred"
+      const element = root.querySelector<HTMLElement>(`[data-timeline-key="${CSS.escape(anchor.key)}"]`)
+      if (!element) return
+      const delta = element.getBoundingClientRect().top - root.getBoundingClientRect().top - anchor.offset
+      if (!valid()) return
+      if (deferred?.()) return "deferred"
+      if (Math.abs(delta) <= 0.5) return true
+      root.scrollTop += delta
+      prependScrollTop = root.scrollTop
+      // Feed the actual residual write through core's offset observer now, before another
+      // resize can use its previous offset/adjustments. Do not start a scrollToOffset reconcile.
+      publish!(root)
+      return false
+    }
+  }
+  const schedulePrependAnchor = () => {
+    const anchor = prependAnchor
+    if (!anchor || prependScheduled || prependFlushing) return
+    const generation = prependGeneration
+    const scheduled = {}
+    prependScheduled = scheduled
+    // Solid publishes wrapper styles and the sizer in this reactive flush. This also
+    // runs after connected rAF/ResizeObserver measurements, before their update's IO geometry.
+    queueMicrotask(() => {
+      if (prependScheduled !== scheduled) return
+      prependScheduled = undefined
+      correctPrependAnchor(anchor, generation)
+    })
   }
   const restorePrependAnchor = (done: boolean) => {
     if (done) prependLoading = false
@@ -382,29 +461,32 @@ export function MessageTimeline(props: {
     const root = listRoot()
     if (!root || !prependAnchor) return
     if (prependAnchorFrame !== undefined) cancelAnimationFrame(prependAnchorFrame)
+    schedulePrependAnchor()
+    const generation = prependGeneration
     let frames = 0
     let stable = 0
     const apply = () => {
       prependAnchorFrame = undefined
       const anchor = prependAnchor
-      if (!anchor) return
-      const element = root.querySelector<HTMLElement>(`[data-timeline-key="${CSS.escape(anchor.key)}"]`)
-      const delta = element
-        ? element.getBoundingClientRect().top - root.getBoundingClientRect().top - anchor.offset
-        : undefined
-      if (delta !== undefined && Math.abs(delta) > 0.5) {
-        root.scrollTop += delta
-        stable = 0
-      } else {
-        stable += 1
-      }
-      frames += 1
-      if (stable >= 30 || frames >= 180) {
-        if (!prependLoading) prependAnchor = undefined
-        return
-      }
-      prependAnchorFrame = requestAnimationFrame(apply)
+      if (!anchor || generation !== prependGeneration || listRoot() !== root || sessionKey() !== ownerSessionKey) return
+      correctPrependAnchor(anchor, generation, (corrected) => {
+        if (prependRestore !== apply) return
+        // Gesture time belongs to core, not to the bounded residual stabilization budget.
+        if (corrected === "deferred") {
+          stable = 0
+          prependAnchorFrame = requestAnimationFrame(apply)
+          return
+        }
+        stable = corrected === true ? stable + 1 : 0
+        frames += 1
+        if (stable >= 30 || frames >= 180) {
+          if (!prependLoading) prependAnchor = undefined
+          return
+        }
+        prependAnchorFrame = requestAnimationFrame(apply)
+      })
     }
+    prependRestore = apply
     prependAnchorFrame = requestAnimationFrame(apply)
   }
 
@@ -418,7 +500,81 @@ export function MessageTimeline(props: {
       return timelineRows().length
     },
     getScrollElement: () => listRoot() ?? null,
-    observeElementOffset: observeElementOffsetReconnectAware,
+    observeElementOffset: (instance, callback) => {
+      const root = instance.scrollElement
+      const targetWindow = instance.targetWindow
+      const ios =
+        typeof navigator !== "undefined" &&
+        (/iP(hone|od|ad)/.test(navigator.userAgent) ||
+          (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 0))
+      iosPrependOffset = ios
+      let active = true
+      let touching = false
+      let grace = false
+      let timer: number | undefined
+      const deferred = () =>
+        ios &&
+        (touching ||
+          grace ||
+          instance.isScrolling ||
+          !root ||
+          root.scrollTop < 0 ||
+          root.scrollTop > root.scrollHeight - root.clientHeight ||
+          (instance.scrollOffset ?? 0) < 0 ||
+          (instance.scrollOffset ?? 0) > root.scrollHeight - root.clientHeight)
+      deferPrependOffset = deferred
+      const publish = (root: HTMLDivElement) => {
+        if (instance.scrollElement !== root) return
+        callback(root.scrollTop, instance.isScrolling)
+        // The first delivery consumes core's previous intended-write rounding hint.
+        // A small residual must also become the actual offset, not that previous hint.
+        if (instance.scrollOffset !== root.scrollTop) callback(root.scrollTop, instance.isScrolling)
+      }
+      publishPrependOffset = publish
+      const cleanup = observeElementOffsetReconnectAware(instance, (offset, scrolling) => {
+        callback(offset, scrolling)
+        // Core flushes its deferred delta inside the callback. Read DOM only after
+        // that write and the resulting Solid publication have completed.
+        if (!deferred()) schedulePrependAnchor()
+      })
+      const start = () => {
+        touching = true
+        grace = false
+        if (timer !== undefined) targetWindow?.clearTimeout(timer)
+        timer = undefined
+      }
+      const end = () => {
+        touching = false
+        grace = true
+        // Our listener runs after core's, so this timer follows its 150ms grace
+        // timer. Never race that timer with a residual or reset its accumulator.
+        if (!targetWindow) return
+        if (timer !== undefined) targetWindow.clearTimeout(timer)
+        timer = targetWindow.setTimeout(() => {
+          timer = undefined
+          grace = false
+          if (!root || deferred()) return
+          publish(root)
+          schedulePrependAnchor()
+        }, 150)
+      }
+      // Core installs its touch listeners after observeElementOffset returns.
+      // Install ours after that stack so its grace timer is always registered first.
+      queueMicrotask(() => {
+        if (!active || !ios) return
+        root?.addEventListener("touchstart", start, { passive: true })
+        root?.addEventListener("touchend", end, { passive: true })
+      })
+      return () => {
+        active = false
+        if (timer !== undefined) targetWindow?.clearTimeout(timer)
+        root?.removeEventListener("touchstart", start)
+        root?.removeEventListener("touchend", end)
+        if (deferPrependOffset === deferred) deferPrependOffset = undefined
+        if (publishPrependOffset === publish) publishPrependOffset = undefined
+        cleanup?.()
+      }
+    },
     initialOffset: () => (props.shouldAnchorBottom() ? Number.MAX_SAFE_INTEGER : 0),
     initialMeasurementsCache: initialMeasurements,
     estimateSize: () => timelineFallbackItemSize,
@@ -426,6 +582,10 @@ export function MessageTimeline(props: {
       // Expose the computed range before core writes an anchor correction so the browser does not clamp it to the old height.
       if (virtualContent) virtualContent.style.height = `${instance.getTotalSize()}px`
       elementScroll(offset, options, instance)
+      if (prependAnchor && instance.scrollElement === prependAnchor.root) {
+        prependScrollTop = prependAnchor.root.scrollTop
+        schedulePrependAnchor()
+      }
     },
     get getItemKey() {
       const rows = timelineRows()
@@ -486,6 +646,7 @@ export function MessageTimeline(props: {
       })
     }
     resizeItem(index, size)
+    schedulePrependAnchor()
     if (root && props.shouldAnchorBottom()) anchorResizedBottom()
   }
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item) => {
@@ -497,6 +658,11 @@ export function MessageTimeline(props: {
     () => new Map(virtualizer.getVirtualItems().map((item) => [item.key, item] as const)),
   )
   const virtualRowKeys = createMemo(() => virtualizer.getVirtualItems().map((item) => item.key as string))
+  createEffect(() => {
+    virtualItemByKey()
+    virtualizer.getTotalSize()
+    schedulePrependAnchor()
+  })
   createEffect(() => {
     props.setRevealMessage?.((id) => {
       const index = messageRowIndex().get(id)
@@ -533,6 +699,7 @@ export function MessageTimeline(props: {
     const key = sessionKey()
     timelineRows().length
     if (measuredSessionKey !== key) {
+      clearPrependAnchor()
       measuredSessionKey = key
       virtualizer.measure()
     }
@@ -568,12 +735,13 @@ export function MessageTimeline(props: {
 
   const bindListRoot = (root: HTMLDivElement) => {
     if (root === listRoot()) return
+    clearPrependAnchor()
     setListRoot(root)
     props.setScrollRef(root)
   }
 
   const handleListWheel = (event: WheelEvent & { currentTarget: HTMLDivElement }) => {
-    if (!prependLoading) clearPrependAnchor()
+    clearPrependAnchor(prependLoading)
     const root = event.currentTarget
     const delta = normalizeWheelDelta({
       deltaY: event.deltaY,
@@ -585,7 +753,7 @@ export function MessageTimeline(props: {
   }
 
   const handleListTouchStart = (event: TouchEvent) => {
-    if (!prependLoading) clearPrependAnchor()
+    clearPrependAnchor(prependLoading)
     touchGesture = event.touches[0]?.clientY
   }
 
@@ -611,7 +779,7 @@ export function MessageTimeline(props: {
   }
 
   const handleListPointerDown = (event: PointerEvent & { currentTarget: HTMLDivElement }) => {
-    if (!prependLoading) clearPrependAnchor()
+    clearPrependAnchor(prependLoading)
     props.onMarkScrollGesture(event.target)
   }
 
@@ -625,12 +793,12 @@ export function MessageTimeline(props: {
     if (!key) return
     if (!isScrollKeyTarget(event.target, key)) return
     if (scrollKeyOwner(event.currentTarget, event.target, key) !== event.currentTarget) return
-    if (!prependLoading) clearPrependAnchor()
+    clearPrependAnchor(prependLoading)
     props.onMarkScrollGesture(event.currentTarget)
   }
 
   const handleListScroll = (event: Event & { currentTarget: HTMLDivElement }) => {
-    if (prependLoading) updatePrependAnchor()
+    if (prependLoading && event.currentTarget.scrollTop !== prependScrollTop) updatePrependAnchor()
     props.onScheduleScrollState(event.currentTarget)
     props.onHistoryScroll()
     if (!props.hasScrollGesture()) return

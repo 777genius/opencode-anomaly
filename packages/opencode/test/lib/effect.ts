@@ -1,3 +1,4 @@
+import { DiagnosticOwner, diagnosticBody, diagnosticContext, diagnosticRegistration, unitDiagnostic } from "./unit-diagnostic"
 import { test, type TestOptions } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { Cause, Duration, Effect, Exit, Layer } from "effect"
@@ -33,55 +34,60 @@ function instanceArgs<E, R>(
 
 const body = <A, E, R>(value: Body<A, E, R>) => Effect.suspend(() => (typeof value === "function" ? value() : value))
 
-type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>) => Promise<A>
+type Runner = <A, E, R, E2>(value: Body<A, E, R | Scope.Scope>, layer: Layer.Layer<R, E2>, owner?: DiagnosticOwner) => Promise<A>
 
-const isolatedRun: Runner = (value, layer) =>
+const isolatedRun: Runner = (value, layer, owner) =>
   Effect.gen(function* () {
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
+    const exit = yield* diagnosticBody(body(value)).pipe(Effect.scoped, Effect.provide(layer), Effect.exit)
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
         yield* Effect.logError(err)
       }
     }
     return yield* exit
-  }).pipe(Effect.runPromise)
+  }).pipe((effect) => diagnosticContext(effect, owner), Effect.runPromise)
 
 // Builds the test layer through the shared process-wide memoMap so cached
 // services (Bus, Session, …) match Server.Default's instances. Use for tests
 // that publish to an in-process HTTP server and need pub/sub identity with
 // the server's handlers.
-const sharedRun: Runner = (value, layer) =>
+const sharedRun: Runner = (value, layer, owner) =>
   Effect.gen(function* () {
+    const mark = unitDiagnostic("test", undefined, owner)
+    mark("shared-layer.build.start")
     const scope = yield* Scope.make()
     const ctx = yield* Layer.buildWithMemoMap(layer, memoMap, scope)
-    const exit = yield* body(value).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+    mark("shared-layer.build.settled")
+    const exit = yield* diagnosticBody(body(value)).pipe(Effect.scoped, Effect.provide(ctx), Effect.exit)
+    mark("shared-layer.close.start")
     yield* Scope.close(scope, Exit.void)
+    mark("shared-layer.close.settled")
     if (Exit.isFailure(exit)) {
       for (const err of Cause.prettyErrors(exit.cause)) {
         yield* Effect.logError(err)
       }
     }
     return yield* exit
-  }).pipe(Effect.runPromise)
+  }).pipe((effect) => diagnosticContext(effect, owner), Effect.runPromise)
 
 const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, run: Runner = isolatedRun) => {
   const effect = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, testLayer), opts)
+    test(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
 
   effect.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, testLayer), opts)
+    test.only(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
 
   effect.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, testLayer), opts)
+    test.skip(name, diagnosticRegistration(name, (owner) => run(value, testLayer, owner)), opts)
 
   const live = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test(name, () => run(value, liveLayer), opts)
+    test(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
 
   live.only = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.only(name, () => run(value, liveLayer), opts)
+    test.only(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
 
   live.skip = <A, E2>(name: string, value: Body<A, E2, R | Scope.Scope>, opts?: number | TestOptions) =>
-    test.skip(name, () => run(value, liveLayer), opts)
+    test.skip(name, diagnosticRegistration(name, (owner) => run(value, liveLayer, owner)), opts)
 
   const instance = <A, E2, E3 = never>(
     name: string,
@@ -92,7 +98,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
       args.testOptions,
     )
   }
@@ -106,7 +112,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.only(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
       args.testOptions,
     )
   }
@@ -120,7 +126,7 @@ const make = <R, E>(testLayer: Layer.Layer<R, E>, liveLayer: Layer.Layer<R, E>, 
     const args = instanceArgs(options, opts)
     return test.skip(
       name,
-      () => run(body(value).pipe(withTmpdirInstance(args.instanceOptions)), liveLayer),
+      diagnosticRegistration(name, (owner) => run(diagnosticBody(body(value), "callback").pipe(withTmpdirInstance(args.instanceOptions)), liveLayer, owner)),
       args.testOptions,
     )
   }

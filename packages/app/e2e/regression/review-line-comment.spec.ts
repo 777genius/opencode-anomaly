@@ -50,14 +50,12 @@ test("shows a comment button when a line number is hovered", async ({ page }) =>
   await expectAppVisible(lineNumber)
 
   const comment = review.getByRole("button", { name: "Comment", exact: true })
-  await expect(async () => {
-    await lineNumber.hover()
-    await expect(lineNumber).toHaveAttribute("data-hovered", "")
-    await expect(comment).toHaveCount(1)
-    await expect(comment).toHaveCSS("pointer-events", "auto")
-    await comment.focus()
-    await expect(comment).toBeFocused()
-  }).toPass({ timeout: 10_000 })
+  await lineNumber.hover()
+  await expect(lineNumber).toHaveAttribute("data-hovered", "")
+  await expect(comment).toHaveCount(1)
+  await expect(comment).toHaveCSS("pointer-events", "auto")
+  await comment.focus()
+  await expect(comment).toBeFocused()
   await comment.press("Enter")
   await expect(review.getByRole("textbox")).toBeVisible()
   await expect(review.locator('[data-slot="line-comment-editor-label"]')).toHaveText("Commenting on line 1")
@@ -154,16 +152,26 @@ async function openReview(page: Page) {
       response.request().method() === "GET" && response.ok() && new URL(response.url()).pathname === "/api/vcs/diff",
   )
   await changes.click()
-  expect((await (await diffResponse).json()).data).toHaveLength(1)
+  expect((await diffResponse).ok()).toBe(true)
   await expect(page.getByRole("tab", { selected: true })).toHaveAccessibleName(/Files Changed/)
 
   const review = page.locator('[data-component="session-review"]')
   await expectAppVisible(review)
   const file = review.locator('[data-file="src/review.ts"]')
+  await expect(review.locator('[data-slot="accordion-item"]')).toHaveCount(1)
+  await expect(file).toHaveCount(1)
   await expectAppVisible(file)
+  await expect(file.locator('[data-slot="diff-changes-additions"]')).toHaveText("+1")
+  await expect(file.locator('[data-slot="diff-changes-deletions"]')).toHaveText("-1")
   const trigger = file.getByRole("button", { expanded: false })
   await expect(trigger).toHaveCount(1)
   await trigger.click()
   await expect(file.getByRole("button", { expanded: true })).toBeVisible()
   await expect(file.getByText("export const value = 'after'", { exact: true })).toBeVisible()
+  await expect(file.locator("[data-line]")).toHaveText([
+    "export const first = 1",
+    "export const value = 'before'",
+    "export const value = 'after'",
+    "export const last = 3",
+  ])
 }

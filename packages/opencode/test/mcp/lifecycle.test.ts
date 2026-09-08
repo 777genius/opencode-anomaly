@@ -1,6 +1,7 @@
 import path from "node:path"
 import { pathToFileURL } from "node:url"
-import { expect } from "bun:test"
+import { expect, spyOn } from "bun:test"
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import {
@@ -499,6 +500,39 @@ it.instance("local stdio timeout terminates the real server process", () =>
     const test = yield* TestInstance
     const pidFile = path.join(test.directory, "mcp.pid")
     const mcp = yield* MCP.Service
+    const closes: Array<{ pid: number | null; settled: boolean; terminated: boolean; error?: unknown }> = []
+    const close = StdioClientTransport.prototype.close
+    yield* Effect.acquireRelease(
+      Effect.sync(() =>
+        spyOn(StdioClientTransport.prototype, "close").mockImplementation(function (this: StdioClientTransport) {
+          // The parent knows the PID even if timeout cleanup beats fixture startup.
+          const observed = { pid: this.pid, settled: false, terminated: false, error: undefined as unknown }
+          closes.push(observed)
+          const promise = close.call(this)
+          void promise.then(
+            () => {
+              observed.settled = true
+            },
+            (error) => {
+              observed.error = error
+            },
+          )
+          return promise
+        }),
+      ),
+      (observer) => Effect.sync(() => {
+        observer.mockRestore()
+        // Emergency cleanup runs only after assertions, never as proof of termination.
+        for (const observed of closes) {
+          if (observed.pid === null || observed.terminated) continue
+          try {
+            process.kill(observed.pid, "SIGKILL")
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
+          }
+        }
+      }),
+    )
     const result = yield* mcp.add("hanging-stdio", {
       type: "local",
       command: [process.execPath, stdioFixture, "--hang"],
@@ -506,25 +540,30 @@ it.instance("local stdio timeout terminates the real server process", () =>
       timeout: 100,
     })
 
-    expect(statusName(result.status, "hanging-stdio")).toBe("failed")
-    const pid = yield* pollWithTimeout(
-      Effect.promise(async () => {
-        const file = Bun.file(pidFile)
-        return (await file.exists()) ? Number(await file.text()) : undefined
-      }),
-      "stdio fixture did not publish its pid",
-    )
+    const status = "status" in result.status ? result.status : result.status["hanging-stdio"]
+    yield* Effect.logInfo("stdio timeout lifecycle", { reason: status, closes })
+    expect(status).toEqual({ status: "failed", error: "Operation timed out after 100ms" })
+    expect(closes).toHaveLength(1)
+    const observed = closes[0]
+    expect(observed.settled).toBe(true)
+    expect(observed.error).toBeUndefined()
+    expect(observed.pid).toBeInteger()
+    expect(observed.pid).toBeGreaterThan(0)
+    const pid = observed.pid!
     yield* pollWithTimeout(
       Effect.sync(() => {
         try {
           process.kill(pid, 0)
           return undefined
-        } catch {
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error
           return true
         }
       }),
-      "stdio fixture process was not terminated",
+      `stdio fixture process ${pid} was not terminated after timeout close`,
     )
+    observed.terminated = true
+    yield* Effect.logInfo("stdio timeout process terminated", { pid, reason: status })
   }),
 )
 

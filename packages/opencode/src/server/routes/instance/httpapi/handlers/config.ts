@@ -5,19 +5,25 @@ import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import { markInstanceForDisposal } from "../lifecycle"
+import { HostedApprovalCoordinator } from "@/hosted-approval/coordinator"
 
 export const configHandlers = HttpApiBuilder.group(InstanceHttpApi, "config", (handlers) =>
   Effect.gen(function* () {
     const providerSvc = yield* Provider.Service
     const configSvc = yield* Config.Service
+    const hostedApproval = yield* HostedApprovalCoordinator.Service
 
     const get = Effect.fn("ConfigHttpApi.get")(function* () {
       return yield* configSvc.get()
     })
 
     const update = Effect.fn("ConfigHttpApi.update")(function* (ctx) {
-      yield* configSvc.update(ctx.payload)
-      yield* markInstanceForDisposal(yield* InstanceState.context)
+      yield* hostedApproval.withConfigMutation(
+        Effect.gen(function* () {
+          yield* configSvc.update(ctx.payload)
+          yield* markInstanceForDisposal(yield* InstanceState.context)
+        }),
+      )
       return ctx.payload
     })
 

@@ -68,7 +68,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
                     permissions: [{ action: "bash", resource: "git *", effect: "allow" }],
                   },
                   reviewer: {
-                    model: "openrouter/openai/gpt-5",
+                    model: "openrouter/openrouter/free",
                     description: "Review changes",
                     mode: "subagent",
                     permissions: [
@@ -117,7 +117,7 @@ describe("ConfigAgentPlugin.Plugin", () => {
         description: "Review changes",
         mode: "subagent",
         hidden: true,
-        model: { providerID: "openrouter", id: "openai/gpt-5", variant: "high" },
+        model: { providerID: "openrouter", id: "openrouter/free", variant: "high" },
       })
       expect(reviewer.permissions).toEqual([
         { action: "bash", resource: "*", effect: "ask" },

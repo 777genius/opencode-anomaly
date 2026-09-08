@@ -8,7 +8,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Global } from "@opencode-ai/core/global"
 import { Repository } from "@opencode-ai/core/repository"
 import { RepositoryCache } from "@opencode-ai/core/repository-cache"
-import { branch, git, gitRemote } from "./fixture/git"
+import { git, gitRemote } from "./fixture/git"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
@@ -67,24 +67,25 @@ describe("RepositoryCache", () => {
   )
 
   it.live("keeps branch checkouts isolated from branchless refreshes", () =>
-    withRemote((fixture) =>
-      Effect.gen(function* () {
-        yield* Effect.promise(() => branch(fixture.source, "feature", "two\n"))
-        const cache = yield* RepositoryCache.Service
+    withRemote(
+      (fixture) =>
+        Effect.gen(function* () {
+          const cache = yield* RepositoryCache.Service
 
-        const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
-        expect(featured.branch).toBe("feature")
-        expect(featured.localPath.endsWith("repo@feature")).toBe(true)
-        expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
+          const featured = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+          expect(featured.branch).toBe("feature")
+          expect(featured.localPath.endsWith("repo@feature")).toBe(true)
+          expect(yield* read(path.join(featured.localPath, "README.md"))).toBe("two\n")
 
-        const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
-        expect(refreshed.localPath).not.toBe(featured.localPath)
-        expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
+          const refreshed = yield* cache.ensure({ reference: fixture.reference, refresh: true })
+          expect(refreshed.localPath).not.toBe(featured.localPath)
+          expect(yield* read(path.join(refreshed.localPath, "README.md"))).toBe("one\n")
 
-        const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
-        expect(cached.status).toBe("cached")
-        expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
-      }).pipe(Effect.provide(cacheLayer(fixture.root))),
+          const cached = yield* cache.ensure({ reference: fixture.reference, branch: "feature" })
+          expect(cached.status).toBe("cached")
+          expect(yield* read(path.join(cached.localPath, "README.md"))).toBe("two\n")
+        }).pipe(Effect.provide(cacheLayer(fixture.root))),
+      { feature: { name: "feature", content: "two\n" } },
     ),
   )
 
@@ -128,11 +129,14 @@ function cacheLayer(root: string) {
   ])
 }
 
-function withRemote<A, E, R>(body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>) {
+function withRemote<A, E, R>(
+  body: (fixture: Awaited<ReturnType<typeof gitRemote>>) => Effect.Effect<A, E, R>,
+  input?: Parameters<typeof gitRemote>[1],
+) {
   return Effect.acquireUseRelease(
     Effect.promise(async () => {
       const root = await tmpdir()
-      return { root, fixture: await gitRemote(root.path) }
+      return { root, fixture: await gitRemote(root.path, input) }
     }),
     (input) => body(input.fixture),
     (input) => Effect.promise(() => input.root[Symbol.asyncDispose]()),

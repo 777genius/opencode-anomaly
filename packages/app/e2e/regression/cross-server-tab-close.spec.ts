@@ -1,9 +1,10 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { currentSession } from "../utils/mock-server"
+import { fixtureOrigins, fixtureRoutePattern } from "../utils/fixture-origin"
 
-const serverA = "http://127.0.0.1:4096"
-const serverB = "http://127.0.0.1:4097"
+const serverA = fixtureOrigins.canonical
+const serverB = fixtureOrigins.remote
 const sessionA = session("ses_server_a", "C:/server-a", "Server A session")
 const sessionB = session("ses_server_b", "/home/server-b", "Server B session")
 
@@ -11,18 +12,18 @@ test("closing the active server's last tab opens the remaining server tab", asyn
   const requests: string[] = []
   await mockServers(page, requests)
   await page.addInitScript(
-    ({ serverB, sessionA, sessionB }) => {
+    ({ serverA, serverB, sessionA, sessionB }) => {
       localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
       localStorage.setItem("opencode.global.dat:server", JSON.stringify({ list: [serverB] }))
       localStorage.setItem(
         "opencode.window.browser.dat:tabs",
         JSON.stringify([
-          { type: "session", server: "http://127.0.0.1:4096", sessionId: sessionA },
+          { type: "session", server: serverA, sessionId: sessionA },
           { type: "session", server: serverB, sessionId: sessionB },
         ]),
       )
     },
-    { serverB, sessionA: sessionA.id, sessionB: sessionB.id },
+    { serverA, serverB, sessionA: sessionA.id, sessionB: sessionB.id },
   )
 
   const hrefA = `/server/${base64Encode(serverA)}/session/${sessionA.id}`
@@ -78,7 +79,8 @@ function session(id: string, directory: string, title: string) {
 }
 
 async function mockServers(page: Page, requests: string[]) {
-  await page.route("**/*", async (route) => {
+  await page.route(fixtureRoutePattern(serverA, serverB), async (route) => {
+    if (!["fetch", "xhr", "eventsource"].includes(route.request().resourceType())) return route.fallback()
     const url = new URL(route.request().url())
     if (url.origin !== serverA && url.origin !== serverB) return route.fallback()
     requests.push(url.toString())

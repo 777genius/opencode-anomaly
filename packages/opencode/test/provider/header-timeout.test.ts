@@ -64,19 +64,119 @@ it.live("chunkTimeout raises a response stream error when SSE body stalls", () =
             messages: [{ role: "user", content: "hello" }],
           })
 
-          const error = yield* Effect.promise(async () => {
+          const errors = yield* Effect.promise(async () => {
+            const errors: unknown[] = []
             try {
               for await (const part of result.fullStream) {
-                if (part.type === "error") return part.error
+                if (part.type === "error") errors.push(part.error)
               }
             } catch (error) {
-              return error
+              errors.push(error)
             }
+            return errors
           })
-          expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+          expect(errors).toHaveLength(1)
+          expect(errors[0]).toBeInstanceOf(ProviderError.ResponseStreamError)
+          expect(errors[0]).toHaveProperty("message", "SSE read timed out")
         }),
       { config: providerConfig(server.url, { chunkTimeout: 50 }) },
     )
+  }),
+)
+
+it.live("SSE timeout preserves its cause when abort errors the upstream reader", () =>
+  Effect.promise(async () => {
+    const ctl = new AbortController()
+    const upstream = new Error("upstream aborted")
+    const source = new ReadableStream<Uint8Array>({
+      start(ctrl) {
+        ctl.signal.addEventListener("abort", () => ctrl.error(upstream), { once: true })
+      },
+    })
+    const reader = Provider.wrapSSE(
+      new Response(source, { headers: { "content-type": "text/event-stream" } }),
+      10,
+      ctl,
+    ).body!.getReader()
+
+    const error = await reader.read().catch((error) => error)
+    expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+    expect(error.message).toBe("SSE read timed out")
+    expect(ctl.signal.reason).toBe(error)
+    expect(await reader.read().catch((error) => error)).toBe(error)
+  }),
+)
+
+it.live("SSE timeout handles rejecting cancellation without replacing the stream error", () =>
+  Effect.promise(async () => {
+    const ctl = new AbortController()
+    const reasons: unknown[] = []
+    const source = new ReadableStream<Uint8Array>({
+      cancel(reason) {
+        reasons.push(reason)
+        return Promise.reject(new Error("cleanup failed"))
+      },
+    })
+    const reader = Provider.wrapSSE(
+      new Response(source, { headers: { "content-type": "text/event-stream" } }),
+      10,
+      ctl,
+    ).body!.getReader()
+
+    const error = await reader.read().catch((error) => error)
+    expect(error).toBeInstanceOf(ProviderError.ResponseStreamError)
+    expect(reasons).toEqual([error])
+    expect(ctl.signal.reason).toBe(error)
+    expect(await reader.read().catch((error) => error)).toBe(error)
+  }),
+)
+
+it.live("SSE explicit cancellation preserves cancellation failure during a pending read", () =>
+  Effect.promise(async () => {
+    const ctl = new AbortController()
+    const reason = new Error("consumer stopped")
+    const failure = new Error("cancel failed")
+    const started = Promise.withResolvers<void>()
+    const source = new ReadableStream<Uint8Array>({
+      pull() {
+        started.resolve()
+      },
+      cancel(value) {
+        expect(value).toBe(reason)
+        return Promise.reject(failure)
+      },
+    })
+    const reader = Provider.wrapSSE(
+      new Response(source, { headers: { "content-type": "text/event-stream" } }),
+      1_000,
+      ctl,
+    ).body!.getReader()
+    const pending = reader.read()
+    await started.promise
+
+    expect(await reader.cancel(reason).catch((error) => error)).toBe(failure)
+    expect(await pending).toEqual({ done: true, value: undefined })
+    expect(ctl.signal.reason).toBe(reason)
+  }),
+)
+
+it.live("SSE forwards upstream read failure without turning it into a timeout", () =>
+  Effect.promise(async () => {
+    const ctl = new AbortController()
+    const failure = new Error("upstream failed")
+    const source = new ReadableStream<Uint8Array>({
+      pull(ctrl) {
+        ctrl.error(failure)
+      },
+    })
+    const reader = Provider.wrapSSE(
+      new Response(source, { headers: { "content-type": "text/event-stream" } }),
+      1_000,
+      ctl,
+    ).body!.getReader()
+
+    expect(await reader.read().catch((error) => error)).toBe(failure)
+    expect(ctl.signal.aborted).toBe(false)
   }),
 )
 

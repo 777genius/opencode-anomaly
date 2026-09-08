@@ -1,2 +1,5 @@
 packages/core/migration/**/snapshot.json linguist-generated
 packages/core/src/database/migration.gen.ts linguist-generated
+
+# Preserve exact bytes of the hash-pinned canonical schema on every platform.
+packages/opencode/src/hosted-approval/hosted-producer-provenance-v2.schema.json -text
