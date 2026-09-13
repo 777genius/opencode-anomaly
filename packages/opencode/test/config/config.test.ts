@@ -2232,3 +2232,19 @@ test("parseManagedPlist handles empty config", async () => {
   )
   expect(config.$schema).toBe("https://opencode.ai/config.json")
 })
+
+it.instance("serializes concurrent updates to the same config file", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    const config = yield* Config.Service
+    yield* Effect.all(
+      [config.update({ model: "test/model" }), config.update({ username: "test-user" })],
+      { concurrency: "unbounded" },
+    )
+
+    expect(yield* FSUtil.use.readJson(path.join(test.directory, "config.json"))).toMatchObject({
+      model: "test/model",
+      username: "test-user",
+    })
+  }),
+)

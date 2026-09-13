@@ -18,7 +18,7 @@ import { isRecord } from "@/util/record"
 import type { ConsoleState } from "@opencode-ai/core/v1/config/console-state"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { InstanceState } from "@/effect/instance-state"
-import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema } from "effect"
+import { Context, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Semaphore } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { EffectFlock } from "@opencode-ai/core/util/effect-flock"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -182,6 +182,15 @@ const layer = Layer.effect(
     const env = yield* Env.Service
     const npmSvc = yield* Npm.Service
     const http = yield* HttpClient.HttpClient
+
+    const writeLocks = new Map<string, Semaphore.Semaphore>()
+    const writeLock = (file: string) => {
+      const hit = writeLocks.get(file)
+      if (hit) return hit
+      const next = Semaphore.makeUnsafe(1)
+      writeLocks.set(file, next)
+      return next
+    }
 
     const readConfigFile = (filepath: string) => fs.readFileStringSafe(filepath).pipe(Effect.orDie)
 
@@ -638,15 +647,19 @@ const layer = Layer.effect(
     const update = Effect.fn("Config.update")(function* (config: Info) {
       const dir = yield* InstanceState.directory
       const file = path.join(dir, "config.json")
-      const existing = yield* loadFile(file)
-      const text = yield* readConfigFile(file)
-      const original = text ? ConfigParse.jsonc(text, file) : writable(existing)
-      yield* fs
-        .writeFileString(
-          file,
-          JSON.stringify(mergeDeep(isRecord(original) ? original : writable(existing), writable(config)), null, 2),
-        )
-        .pipe(Effect.orDie)
+      return yield* writeLock(file).withPermit(
+        Effect.gen(function* () {
+          const existing = yield* loadFile(file)
+          const text = yield* readConfigFile(file)
+          const original = text ? ConfigParse.jsonc(text, file) : writable(existing)
+          yield* fs
+            .writeFileString(
+              file,
+              JSON.stringify(mergeDeep(isRecord(original) ? original : writable(existing), writable(config)), null, 2),
+            )
+            .pipe(Effect.orDie)
+        }),
+      )
     })
 
     const invalidate = Effect.fn("Config.invalidate")(function* () {
@@ -655,28 +668,32 @@ const layer = Layer.effect(
 
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
       const file = globalConfigFile()
-      const before = (yield* readConfigFile(file)) ?? "{}"
-      const patch = writableGlobal(config)
+      return yield* writeLock(file).withPermit(
+        Effect.gen(function* () {
+          const before = (yield* readConfigFile(file)) ?? "{}"
+          const patch = writableGlobal(config)
 
-      let next: Info
-      let changed: boolean
-      if (!file.endsWith(".jsonc")) {
-        const existing = ConfigParse.jsonc(before, file)
-        ConfigParse.schema(ConfigV1.Info, ConfigV2Compat.lower(normalizeLoadedConfig(existing), file).value, file)
-        const merged = mergeDeep(isRecord(existing) ? existing : {}, patch)
-        const serialized = JSON.stringify(merged, null, 2)
-        next = yield* decodeConfig(merged, file)
-        changed = serialized !== before
-        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
-      } else {
-        const updated = patchJsonc(before, patch)
-        next = yield* decodeConfig(ConfigParse.jsonc(updated, file), file)
-        changed = updated !== before
-        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
-      }
+          let next: Info
+          let changed: boolean
+          if (!file.endsWith(".jsonc")) {
+            const existing = ConfigParse.jsonc(before, file)
+            ConfigParse.schema(ConfigV1.Info, ConfigV2Compat.lower(normalizeLoadedConfig(existing), file).value, file)
+            const merged = mergeDeep(isRecord(existing) ? existing : {}, patch)
+            const serialized = JSON.stringify(merged, null, 2)
+            next = yield* decodeConfig(merged, file)
+            changed = serialized !== before
+            if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
+          } else {
+            const updated = patchJsonc(before, patch)
+            next = yield* decodeConfig(ConfigParse.jsonc(updated, file), file)
+            changed = updated !== before
+            if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
+          }
 
-      if (changed) yield* invalidate()
-      return { info: next, changed }
+          if (changed) yield* invalidate()
+          return { info: next, changed }
+        }),
+      )
     })
 
     return Service.of({

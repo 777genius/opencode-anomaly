@@ -8,6 +8,9 @@ const projectID = "proj_terminal_composer_focus"
 const sessionID = "ses_terminal_composer_focus"
 const ptyID = "pty_terminal_composer_focus"
 const newPtyID = "pty_terminal_composer_focus_new"
+// Hold the real JS module in Vite dev and preview, excluding maps and WASM.
+const ghosttyModule = (url: URL) =>
+  /^(?:\/node_modules\/\.vite\/deps\/ghostty-web|\/assets\/ghostty-web-[A-Za-z0-9_-]+)\.js$/.test(url.pathname)
 
 test.use({ viewport: { width: 1440, height: 900 } })
 
@@ -82,15 +85,24 @@ test("routes typing to the composer unless the open terminal is focused", async 
 
   const composer = page.locator('[data-component="prompt-input"]')
   const terminal = page.locator('[data-component="terminal"]')
+  await expect(composer).toBeVisible()
+  await expect(composer).toHaveAttribute("contenteditable", "true")
+  await expect(composer).toHaveText("")
+  await page.keyboard.type("p")
+  await expect(composer).toBeFocused()
+  await expect(composer).toHaveText("p")
+  await page.keyboard.press("Backspace")
+  await expect(composer).toHaveText("")
   await page.keyboard.press("Control+Backquote")
   await expect(terminal).toBeVisible()
+  await expect(terminal.locator("textarea")).toHaveCount(1)
   await expect.poll(() => terminal.evaluate((element) => element.contains(document.activeElement))).toBe(true)
 
   await page.keyboard.type("x")
   await expect(composer).toHaveText("")
 
-  await page.waitForTimeout(300)
   await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+  await expect.poll(() => terminal.evaluate((element) => element.contains(document.activeElement))).toBe(false)
   await page.keyboard.type("a")
 
   await expect(composer).toBeFocused()
@@ -109,7 +121,7 @@ test("keeps composer focus when a cached terminal finishes mounting", async ({ p
       body: JSON.stringify({ location: ptyLocation(), data: ptyInfo(ptyID, "Terminal 1") }),
     })
   })
-  await page.route(/ghostty-web/, async (route) => {
+  await page.route(ghosttyModule, async (route) => {
     ghostty.resolve()
     await release.promise
     await route.continue()
@@ -136,7 +148,7 @@ test("keeps composer focus when a cached terminal finishes mounting", async ({ p
 test("keeps newer composer focus while an explicit terminal open finishes", async ({ page }) => {
   const ghostty = Promise.withResolvers<void>()
   const release = Promise.withResolvers<void>()
-  await page.route(/ghostty-web/, async (route) => {
+  await page.route(ghosttyModule, async (route) => {
     ghostty.resolve()
     await release.promise
     await route.continue()
