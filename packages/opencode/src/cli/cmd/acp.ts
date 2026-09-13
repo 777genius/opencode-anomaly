@@ -5,6 +5,7 @@ import { ServerAuth } from "@/server/auth"
 import { createOpencodeClient } from "@opencode-ai/sdk/v2"
 import { withNetworkOptions, resolveNetworkOptions } from "../network"
 import { ACPProfile } from "@/acp/profile"
+import { waitForStdinEnd } from "../acp-stdin"
 
 export const AcpCommand = effectCmd({
   command: "acp",
@@ -44,10 +45,17 @@ export const AcpCommand = effectCmd({
     })
     const output = new ReadableStream<Uint8Array>({
       start(controller) {
+        if (process.stdin.readableEnded) {
+          controller.close()
+          return
+        }
         process.stdin.on("data", (chunk: Buffer) => {
           controller.enqueue(new Uint8Array(chunk))
         })
-        process.stdin.on("end", () => controller.close())
+        process.stdin.on("end", () => {
+          ACPProfile.mark("cli.acp.stdin.end")
+          controller.close()
+        })
         process.stdin.on("error", (err) => controller.error(err))
       },
     })
@@ -61,13 +69,9 @@ export const AcpCommand = effectCmd({
     }, stream)
 
     yield* Effect.logInfo("setup connection")
+    ACPProfile.mark("cli.acp.stdin.wait", { ended: process.stdin.readableEnded })
     process.stdin.resume()
-    yield* Effect.promise(
-      () =>
-        new Promise<void>((resolve, reject) => {
-          process.stdin.on("end", () => resolve())
-          process.stdin.on("error", reject)
-        }),
-    )
+    yield* waitForStdinEnd(process.stdin)
+    ACPProfile.mark("cli.acp.stdin.complete")
   }),
 })

@@ -1,6 +1,6 @@
 import { expect } from "bun:test"
 import type { InitializeResponse, NewSessionResponse, SessionConfigOption } from "@agentclientprotocol/sdk"
-import { Effect } from "effect"
+import { Duration, Effect } from "effect"
 import type { CliFixture } from "../../lib/cli-process"
 import { testProviderConfig } from "../../lib/test-provider"
 import {
@@ -11,9 +11,16 @@ import {
   type AcpClient,
 } from "./acp-test-client"
 
-export function createAcpClient(input: Pick<CliFixture, "opencode">, env?: Record<string, string>) {
+export function createAcpClient(input: { opencode: Pick<CliFixture["opencode"], "acp"> }, env?: Record<string, string>) {
   return Effect.gen(function* () {
-    return createJsonRpcAcpClient(yield* input.opencode.acp(env ? { env } : undefined))
+    const acp = yield* input.opencode.acp(env ? { env } : undefined)
+    yield* acp.ready
+    const client = createJsonRpcAcpClient(acp)
+    return {
+      ...client,
+      request: <T>(method: string, params?: unknown) =>
+        client.request<T>(method, params).pipe(Effect.timeout(Duration.seconds(15))),
+    }
   })
 }
 

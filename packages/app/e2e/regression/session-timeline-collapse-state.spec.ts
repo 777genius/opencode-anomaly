@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
 import { mockOpenCodeServer } from "../utils/mock-server"
+import { installSseTransport } from "../utils/sse-transport"
 import { expectAppVisible, expectSessionTitle } from "../utils/waits"
 
 const directory = "C:/OpenCode/TimelineStateRegression"
@@ -193,7 +194,6 @@ test.describe("regression: session timeline local row state", () => {
   })
 
   test("keeps a sticky edit header aligned with a multi-hunk diff", async ({ page }) => {
-    const events: EventPayload[] = []
     const lines = Array.from({ length: 1_000 }, (_, index) => `export const value${index} = ${index}\n`).join("")
     const after = [100, 300, 500, 700, 900].reduce(
       (result, index) =>
@@ -208,44 +208,68 @@ test.describe("regression: session timeline local row state", () => {
           ...editPart.state.metadata,
           filediff: {
             file: "src/regression.ts",
-            additions: 1,
-            deletions: 1,
+            additions: 5,
+            deletions: 5,
             before: lines,
             after,
           },
         },
       },
     }
-    await mockServer(page, events, [userMessage, { ...assistantMessage, parts: [part] }])
+    const transport = await installSseTransport<EventPayload>(page, {
+      server: `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`,
+    })
+    await mockOpenCodeServer(page, {
+      directory,
+      project: project(),
+      provider: provider(),
+      sessions: [session()],
+      pageMessages: () => ({ items: [userMessage, { ...assistantMessage, parts: [part] }] }),
+    })
     await configurePage(page)
 
     await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+    await transport.waitForConnection()
     await expectSessionTitle(page, title)
 
-    const wrapper = page.locator(`[data-timeline-part-id="${editPartID}"]`).first()
-    const trigger = wrapper.locator('[data-slot="collapsible-trigger"]').first()
-    const diff = wrapper.locator('[data-component="edit-content"]').first()
+    const wrapper = page.locator(`[data-timeline-part-id="${editPartID}"]`)
+    const diff = wrapper.locator('[data-component="edit-content"]')
     await expectAppVisible(diff)
+    // The diff worker renders lines asynchronously inside the file's shadow root.
+    await expect.poll(() => diff.locator("[data-line]").count()).toBeGreaterThan(0)
     await expect.poll(() => wrapper.evaluate((element) => element.getBoundingClientRect().height)).toBeGreaterThan(500)
-    const samples = await wrapper.evaluate(async (element) => {
-      const root = element.closest<HTMLElement>(".scroll-view__viewport")!
-      element.scrollIntoView({ block: "start" })
-      const result = []
-      for (const offset of [0, 120, 240, 360, 480]) {
-        root.scrollBy(0, offset - (result.at(-1)?.offset ?? 0))
-        await new Promise(requestAnimationFrame)
-        const trigger = element.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!
-        const diff = element.querySelector<HTMLElement>('[data-component="edit-content"]')!
-        result.push({
-          offset,
-          trigger: trigger.getBoundingClientRect().y,
-          diff: diff.getBoundingClientRect().y,
-          bottom: element.getBoundingClientRect().bottom,
-        })
-      }
-      return result
+    const start = await wrapper.evaluate((element) => {
+      element.scrollIntoView({ block: "start", behavior: "instant" })
+      return element.closest<HTMLElement>(".scroll-view__viewport")!.scrollTop
     })
+    const samples = []
+    for (const offset of [0, 120, 240, 360, 480]) {
+      await wrapper.evaluate((element, top) => {
+        element.closest<HTMLElement>(".scroll-view__viewport")!.scrollTo({ top, behavior: "instant" })
+      }, start + offset)
+      await expect
+        .poll(() =>
+          wrapper.evaluate(
+            (element, top) => Math.abs(element.closest<HTMLElement>(".scroll-view__viewport")!.scrollTop - top),
+            start + offset,
+          ),
+        )
+        .toBeLessThan(1)
+      samples.push(
+        await wrapper.evaluate((element) => {
+          const trigger = element.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!
+          const diff = element.querySelector<HTMLElement>('[data-component="edit-content"]')!
+          return {
+            scrollTop: element.closest<HTMLElement>(".scroll-view__viewport")!.scrollTop,
+            trigger: trigger.getBoundingClientRect().y,
+            diff: diff.getBoundingClientRect().y,
+            bottom: element.getBoundingClientRect().bottom,
+          }
+        }),
+      )
+    }
 
+    expect(samples.at(-1)!.scrollTop - samples[0]!.scrollTop).toBeGreaterThan(479)
     expect(samples[0]!.trigger).toBeLessThan(samples[0]!.diff)
     expect(samples.every((sample) => Math.abs(sample.trigger - samples[0]!.trigger) <= 1)).toBe(true)
     expect(samples.every((sample) => sample.trigger < sample.bottom)).toBe(true)

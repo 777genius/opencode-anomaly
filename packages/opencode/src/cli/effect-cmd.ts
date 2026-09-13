@@ -3,6 +3,7 @@ import { Effect, Schema } from "effect"
 import type { AppServices } from "@/effect/app-runtime"
 import type { InstanceStore } from "@/project/instance-store"
 import { cmd, type WithDoubleDash } from "./cmd/cmd"
+import { ACPProfile } from "@/acp/profile"
 
 /**
  * User-visible command failure. Throw via `fail("...")` from an effectCmd handler
@@ -73,7 +74,10 @@ export const effectCmd = <Args, A>(opts: EffectCmdOpts<Args, A>) =>
     describe: opts.describe,
     builder: opts.builder as never,
     async handler(rawArgs) {
+      const profile = opts.command === "acp" ? ACPProfile : undefined
+      profile?.mark("cli.acp.runtime.start", { uptimeMs: Math.round(process.uptime() * 1000) })
       const { AppRuntime } = await import("@/effect/app-runtime")
+      profile?.mark("cli.acp.runtime.ready")
       // yargs typing wraps Args in ArgumentsCamelCase<WithDoubleDash<...>>; cast at the boundary.
       const args = rawArgs as unknown as WithDoubleDash<Args>
       const useInstance = typeof opts.instance === "function" ? opts.instance(args) : opts.instance !== false
@@ -84,13 +88,17 @@ export const effectCmd = <Args, A>(opts: EffectCmdOpts<Args, A>) =>
       const { InstanceStore } = await import("@/project/instance-store")
       const { InstanceRef } = await import("@/effect/instance-ref")
       const directory = opts.directory?.(args) ?? process.cwd()
+      profile?.mark("cli.acp.instance.load.start")
       const { store, ctx } = await AppRuntime.runPromise(
         InstanceStore.Service.use((store) => store.load({ directory }).pipe(Effect.map((ctx) => ({ store, ctx })))),
       )
+      profile?.mark("cli.acp.instance.load.complete")
       try {
         await AppRuntime.runPromise(opts.handler(args).pipe(Effect.provideService(InstanceRef, ctx)))
       } finally {
+        profile?.mark("cli.acp.instance.dispose.start")
         await AppRuntime.runPromise(store.dispose(ctx))
+        profile?.mark("cli.acp.instance.dispose.complete")
       }
     },
   })
