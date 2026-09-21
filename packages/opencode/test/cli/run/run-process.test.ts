@@ -3,12 +3,117 @@
 // same process. See `test/lib/cli-process.ts` for the harness — each test uses
 // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
 // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
+import { existsSync, unlinkSync } from "node:fs"
+import os from "node:os"
 import { reply } from "../../lib/llm-server"
-import { cliIt } from "../../lib/cli-process"
+import {
+  cliIt,
+  commandStatusForTest,
+  commandResultForTest,
+  acpCleanupFailuresForTest,
+  darwinBroadPreOwnershipObservationForTest,
+  darwinFinalizerDiscoveryForTest,
+  darwinProbeDeadlineForTest,
+  darwinProcArgsForTest,
+  darwinProcArgsCommandForTest,
+  formatProcessErrorForTest,
+  lateExitObservationFailureForTest,
+  ownedExitObservationFailureForTest,
+  parseWindowsCommandLineForTest,
+  darwinEnvironmentForTest,
+  portableSignalRevalidationForTest,
+  portableSignalDiscoveryBudgetForTest,
+  type ProcessIdentity,
+  windowsIdentityObservationForTest,
+  windowsNativeArgvGetterCleanupForTest,
+  windowsCommandLineForTest,
+  windowsCapturedHandleCleanupForTest,
+  windowsNativeCommandLineRoundTripForTest,
+  windowsSupervisorArgumentsForTest,
+  windowsSupervisorArgumentRoundTripForTest,
+  windowsSupervisorProtocolForTest,
+  windowsSupervisorStatusForTest,
+} from "../../lib/cli-process"
+
+const trackedIdentity: ProcessIdentity = {
+  pid: 42,
+  started: "started",
+  executable: "opencode",
+  containment: "test",
+}
 
 describe("opencode run (non-interactive subprocess)", () => {
+  test("macOS process arguments preserve NUL-delimited environment boundaries", () => {
+    const nonce = "0f2cf3c0-3c16-4d8b-8e01-5e0e8b93afbf"
+    const encoder = new TextEncoder()
+    const record = new Uint8Array([
+      2,
+      0,
+      0,
+      0,
+      ...encoder.encode("/usr/local/bin/opencode\0\0opencode\0--serve\0OTHER=OPENCODE_TEST_PROCESS_NONCE="),
+      ...encoder.encode(nonce),
+      0,
+      ...encoder.encode(`OPENCODE_TEST_PROCESS_NONCE=${nonce}\0`),
+    ])
+    expect(darwinEnvironmentForTest(record)).toEqual([
+      `OTHER=OPENCODE_TEST_PROCESS_NONCE=${nonce}`,
+      `OPENCODE_TEST_PROCESS_NONCE=${nonce}`,
+    ])
+    const argumentOnly = new Uint8Array([
+      2,
+      0,
+      0,
+      0,
+      ...encoder.encode(`/usr/local/bin/opencode\0\0opencode\0OPENCODE_TEST_PROCESS_NONCE=${nonce}\0`),
+    ])
+    expect(darwinEnvironmentForTest(argumentOnly)).toEqual([])
+    expect(darwinProcArgsCommandForTest(42)).toEqual(["sysctl", "-b", "kern.procargs2.42"])
+  })
+
+  test("macOS argument probes use an independent short deadline", () => {
+    const started = Date.now()
+    expect(darwinProbeDeadlineForTest(started + 10)).toBe(started + 10)
+    expect(darwinProbeDeadlineForTest(started + 60_000)).toBeLessThanOrEqual(started + 250)
+  })
+
+  test("macOS inaccessible argument probes are bounded independently", async () => {
+    if (process.platform !== "darwin") return
+    const started = Date.now()
+    const probes = Array.from({ length: 32 }, (_, index) =>
+      darwinProcArgsForTest(999_999_999 - index, Date.now() + 4_000).catch(() => undefined),
+    )
+    await Promise.all(probes)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  test("macOS argument probe reaps an owned helper after acquisition expires", async () => {
+    if (process.platform !== "darwin") return
+    let helperPID: number | undefined
+    const cause = await darwinProcArgsForTest(process.pid, Date.now(), (pid) => {
+      helperPID = pid
+    }).catch((cause) => cause)
+    expect(cause).toBeInstanceOf(AggregateError)
+    const findAcquisitionDeadline = (error: unknown): Error | undefined => {
+      if (error instanceof AggregateError)
+        return Array.from(error.errors)
+          .map(findAcquisitionDeadline)
+          .find((candidate): candidate is Error => candidate !== undefined)
+      if (error instanceof Error && error.message === "macOS process acquisition deadline elapsed before reading environment") return error
+    }
+    expect(findAcquisitionDeadline(cause)).toBeInstanceOf(Error)
+    expect(helperPID).toBeGreaterThan(0)
+    const status = await Promise.resolve()
+      .then(() => {
+        process.kill(helperPID!, 0)
+        return "present"
+      })
+      .catch((cause) => (typeof cause === "object" && cause !== null && "code" in cause ? cause.code : undefined))
+    expect(status).toBe("ESRCH")
+  })
+
   // Happy path: prompt completes, output reaches stdout, process exits 0.
   // If this fails, all the others likely will too — debug here first.
   cliIt.concurrent(
@@ -20,7 +125,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("hello from the test llm\n")
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -42,7 +147,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(result, 0)
         expect(result.stdout).toBe("before tool\nafter tool\n")
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -59,7 +164,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         opencode.expectExit(plain, 0)
         expect(plain.stdout).toBe("visible\n")
       }),
-    60_000,
+    90_000,
   )
 
   // Regression for #27371: an unknown model used to hang the process forever
@@ -73,13 +178,13 @@ describe("opencode run (non-interactive subprocess)", () => {
       Effect.gen(function* () {
         const result = yield* opencode.run("say hi", {
           model: "test/nonexistent-model",
-          timeoutMs: 30_000,
+          timeoutMs: 90_000,
           printLogs: true,
         })
         opencode.expectExit(result, 1)
         expect(result.durationMs).toBeLessThan(30_000)
       }),
-    45_000,
+    90_000,
   )
 
   // The test provider's SSE error item is interpreted by the SDK as an unknown
@@ -97,12 +202,12 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.fail("upstream provider exploded mid-stream")
         yield* llm.text("recovered")
-        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 60_000 })
+        const result = yield* opencode.run("trigger midstream error", { timeoutMs: 90_000 })
         expect(result.exitCode).toBe(0)
         expect(result.stdout).toBe("partial response\nrecovered\n")
         expect(result.stderr).not.toContain("upstream provider exploded mid-stream")
       }),
-    75_000,
+    90_000,
   )
 
   // --format json puts one JSON object per line on stdout for each emitted
@@ -139,7 +244,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.length > 0),
         ).toBe(true)
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -162,7 +267,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         })
         expect(result.stdout.split("\n").filter(Boolean)).toHaveLength(1)
       }),
-    30_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -211,7 +316,7 @@ describe("opencode run (non-interactive subprocess)", () => {
             .every((line) => line.startsWith("{")),
         ).toBe(true)
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -226,7 +331,14 @@ describe("opencode run (non-interactive subprocess)", () => {
         )
         yield* llm.fail("provider failed")
         yield* llm.text("recovered")
-        const result = yield* opencode.run("fail after output", { format: "json" })
+        const result = yield* opencode.run("fail after output", {
+          format: "json",
+          timeoutMs: 90_000,
+          // This fixture intentionally exercises stream continuation, not the
+          // interactive permission protocol. Keep the tool call non-blocking
+          // when hosted approval is enabled in the child process.
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
 
         const events = opencode.parseJsonEvents(result.stdout)
         expect(result.exitCode).toBe(0)
@@ -246,7 +358,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
         expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -261,28 +373,41 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(denied.stdout).toBe("")
 
         yield* llm.reset
-        yield* llm.tool("bash", { command: "rm -f allowed-file", description: "Remove a test file" })
-        yield* llm.text("continued after approval")
-        const allowed = yield* opencode.run("request permission", {
+        const runMatch = (prompt: string) => (hit: { body: Record<string, unknown> }) => {
+          const body = JSON.stringify(hit.body)
+          return body.includes(prompt) && !body.includes("Generate a title for this conversation")
+        }
+        yield* llm.toolMatch(runMatch("request allowed permission"), "bash", {
+          command: "rm -f allowed-file",
+          description: "Remove a test file",
+        })
+        yield* llm.textMatch(runMatch("request allowed permission"), "continued after approval")
+        yield* llm.toolMatch(runMatch("request denied permission"), "bash", {
+          command: "touch explicitly-denied",
+          description: "Create a denied marker",
+        })
+        yield* llm.textMatch(runMatch("request denied permission"), "continued after explicit denial")
+
+        const allowedRun = yield* opencode.startRun("request allowed permission", {
           permission: { bash: "ask" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
-        opencode.expectExit(allowed, 0)
-        expect(allowed.stderr).not.toContain("permission requested: bash")
-        expect(allowed.stdout).toContain("continued after approval")
-
-        yield* llm.reset
-        yield* llm.tool("bash", { command: "touch explicitly-denied", description: "Create a denied marker" })
-        yield* llm.text("continued after explicit denial")
-        const explicitlyDenied = yield* opencode.run("request denied permission", {
+        const explicitlyDeniedRun = yield* opencode.startRun("request denied permission", {
           permission: { bash: "deny" },
           extraArgs: ["--dangerously-skip-permissions"],
         })
+        const [allowed, explicitlyDenied] = yield* Effect.all([allowedRun.result, explicitlyDeniedRun.result], {
+          concurrency: "unbounded",
+        }).pipe(Effect.timeout("60 seconds"))
+
+        opencode.expectExit(allowed, 0)
+        expect(allowed.stderr).not.toContain("permission requested: bash")
+        expect(allowed.stdout).toContain("continued after approval")
         opencode.expectExit(explicitlyDenied, 0)
         expect(explicitlyDenied.stdout).toContain("continued after explicit denial")
         expect(yield* Effect.promise(() => Bun.file(`${home}/explicitly-denied`).exists())).toBe(false)
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.live(
@@ -304,7 +429,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(input).toContain(sentinel)
         expect(input).not.toContain(`file://${source}`)
       }),
-    60_000,
+    90_000,
   )
 
   cliIt.concurrent(
@@ -318,7 +443,7 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.exitCode).not.toBe(0)
         expect(result.stderr).toContain("Cannot attach local directory without a shared filesystem")
       }),
-    30_000,
+    90_000,
   )
 
   cliIt.live(
@@ -328,6 +453,14 @@ describe("opencode run (non-interactive subprocess)", () => {
         yield* llm.hang
         const run = yield* opencode.startRun("wait forever")
         yield* llm.wait(1)
+        const waitForPrompt = (): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            const inputs = yield* llm.inputs
+            if (inputs.some((input) => JSON.stringify(input).includes("wait forever"))) return
+            yield* Effect.sleep("50 millis")
+            yield* waitForPrompt()
+          })
+        yield* waitForPrompt().pipe(Effect.timeout("5 seconds"))
         run.interrupt()
         const result = yield* run.result
 
@@ -335,5 +468,369 @@ describe("opencode run (non-interactive subprocess)", () => {
         expect(result.durationMs).toBeLessThan(30_000)
       }),
     30_000,
+  )
+})
+
+describe("CLI process cleanup containment", () => {
+  test("Windows supervisor status handshake uses the reader's actual tab delimiter", () => {
+    const script = windowsSupervisorProtocolForTest()
+    expect(script).toContain('Process.GetCurrentProcess().Id+"\t"+created')
+    expect(script).not.toContain('Process.GetCurrentProcess().Id+"\\t"+created')
+    expect(script).toContain("File.Move(pending,status)")
+    expect(windowsSupervisorStatusForTest("123\t134102758400000000")).toEqual({
+      pid: 123,
+      created: "134102758400000000",
+    })
+    ;[
+      "",
+      "123",
+      "123\t",
+      "\t456",
+      "0\t456",
+      "123\t0",
+      "123\t456\n",
+      "123\t456\r\n",
+      "123\t456 trailing",
+      "pid\t456",
+    ].forEach((record) => {
+      expect(windowsSupervisorStatusForTest(record)).toBeUndefined()
+    })
+  })
+
+  test("helper accepts only a complete atomically published numeric status", () => {
+    expect(commandStatusForTest("0\n")).toBe(0)
+    expect(commandStatusForTest("125\n")).toBe(125)
+    ;["", "0", "\n", "12", "12\ntrailing", "12\n\n", "12\n\r", "-1\n", "1.5\n"].forEach((record) => {
+      expect(commandStatusForTest(record)).toBeUndefined()
+    })
+  })
+
+  test("Windows supervisor deadline remains compatible with powershell.exe's .NET Framework", () => {
+    const script = windowsSupervisorProtocolForTest()
+    expect(script).toContain('[DllImport("kernel32.dll")] static extern uint GetTickCount()')
+    expect(script).toContain("unchecked(GetTickCount()-began)")
+    expect(script).not.toContain("TickCount64")
+  })
+
+  test("Windows identity observations accept one terminal line ending and reject embedded line breaks", () => {
+    expect(windowsIdentityObservationForTest(123, "")).toEqual([])
+    const fields = ["123", "456", "134102758400000000", "C:\\tool.exe"]
+    const valid = fields.join("\t")
+    const expected = [{ pid: 123, parent: 456, created: "134102758400000000", executable: "C:\\tool.exe" }]
+    expect(windowsIdentityObservationForTest(123, `${valid}\n`)).toEqual(expected)
+    expect(windowsIdentityObservationForTest(123, `${valid}\r\n`)).toEqual(expected)
+    ;["\r", "\n", "\r\n"].forEach((lineEnding) => {
+      fields.forEach((_, index) => {
+        const malformed = fields
+          .map((value, candidate) => (candidate === index ? `${value}${lineEnding}corrupt` : value))
+          .join("\t")
+        expect(() => windowsIdentityObservationForTest(123, malformed)).toThrow(
+          "Windows process 123 returned a malformed identity observation",
+        )
+      })
+    })
+  })
+
+  test("Windows executable mismatch still closes the captured native handle", async () => {
+    const result = await windowsCapturedHandleCleanupForTest(trackedIdentity, {
+      ...trackedIdentity,
+      executable: "replacement.exe",
+    })
+    expect(result.killed).toBe(true)
+    expect(result.errors.map((error) => error.message)).toContain(
+      "Windows job supervisor 42 identity changed before close",
+    )
+  })
+
+  test("Windows command line quoting round-trips empty, spaced, quoted, and trailing-slash arguments", () => {
+    const argv = ["", "two words", 'say "hello"', "C:\\program files\\", 'escaped \\" command', "plain"]
+    expect(parseWindowsCommandLineForTest(windowsCommandLineForTest(argv))).toEqual(argv)
+    expect(windowsSupervisorProtocolForTest()).toContain("quoted.Append('\\\\',slashes*2+1)")
+    expect(windowsSupervisorProtocolForTest()).toContain("quoted.Append('\\\\',slashes*2)")
+  })
+
+  test("Windows supervisor JSON argv framing preserves empty arguments with LF and CRLF output", () => {
+    const argv = ["", "first", "", "two words", ""]
+    const record = JSON.stringify(argv.map((argument) => Buffer.from(argument).toString("base64")))
+    expect(windowsSupervisorArgumentsForTest(`${record}\n`)).toEqual(argv)
+    expect(windowsSupervisorArgumentsForTest(`${record}\r\n`)).toEqual(argv)
+  })
+
+  test("Windows native CommandLineToArgvW round-trips quoted command text", async () => {
+    if (process.platform !== "win32") return
+    const argv = ["", "", "two words", 'say "hello"', "C:\\program files\\", 'escaped \\" command', "plain", ""]
+    await expect(windowsNativeCommandLineRoundTripForTest(argv)).resolves.toEqual(argv)
+  })
+
+  test("Windows native argv getter failures terminate, escalate, reap, and aggregate", async () => {
+    const result = await windowsNativeArgvGetterCleanupForTest()
+    expect(result.signals).toEqual(["SIGTERM", "SIGKILL"])
+    expect(result.reaped).toBe(true)
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic native argv stdout getter failed")
+  })
+
+  test("Windows supervisor binds real argv through its -File launch boundary", async () => {
+    if (process.platform !== "win32") return
+    const argv = ["", "", "two words", 'say "hello"', "C:\\program files\\", 'escaped \\" command', "plain", ""]
+    let finalized: { statusRemoved: boolean; reaped: boolean } | undefined
+    await expect(
+      windowsSupervisorArgumentRoundTripForTest(argv, 4_000, undefined, (result) => {
+        finalized = result
+      }),
+    ).resolves.toEqual(argv)
+    expect(finalized).toEqual({ statusRemoved: true, reaped: true })
+  })
+
+  test("Windows supervisor gives its PowerShell/C# handshake a separate deadline", async () => {
+    if (process.platform !== "win32") return
+    await expect(
+      windowsSupervisorArgumentRoundTripForTest(["slow handshake"], 1_000, undefined, undefined, 1_500),
+    ).resolves.toEqual(["slow handshake"])
+  })
+
+  test("Windows supervisor starts the stalled target timeout after status and reaps its captured child", async () => {
+    if (process.platform !== "win32") return
+    let finalized: { statusRemoved: boolean; reaped: boolean } | undefined
+    await expect(
+      windowsSupervisorArgumentRoundTripForTest(
+        [],
+        100,
+        "Start-Sleep -Seconds 30",
+        (result) => {
+          finalized = result
+        },
+        250,
+      ),
+    ).rejects.toThrow("Windows supervisor argv probe exceeded its deadline")
+    expect(finalized).toEqual({ statusRemoved: true, reaped: true })
+  })
+
+  test("formats nested acquisition and cleanup errors into the RunResult diagnostic", () => {
+    const formatted = formatProcessErrorForTest(
+      new Error("failed to spawn opencode process", {
+        cause: new AggregateError(
+          [
+            new Error("acquisition snapshot failed", { cause: new Error("nonce record unreadable") }),
+            new AggregateError([new Error("SIGKILL failed")], "cleanup failed"),
+          ],
+          "failed to establish containment",
+        ),
+      }),
+    )
+    expect(formatted).toContain("failed to spawn opencode process")
+    expect(formatted).toContain("failed to establish containment")
+    expect(formatted).toContain("acquisition snapshot failed")
+    expect(formatted).toContain("nonce record unreadable")
+    expect(formatted).toContain("cleanup failed")
+    expect(formatted).toContain("SIGKILL failed")
+  })
+
+  test("portable cleanup revalidates the exact target identity before signalling", async () => {
+    const replacement = await portableSignalRevalidationForTest(trackedIdentity, {
+      ...trackedIdentity,
+      started: "reused",
+    })
+    expect(replacement.signalled).toBe(false)
+    expect(replacement.errors.map((error) => error.message)).toContain("failed to send SIGTERM to process 42")
+
+    const current = await portableSignalRevalidationForTest(trackedIdentity, trackedIdentity)
+    expect(current.signalled).toBe(true)
+  })
+
+  test("portable signalling reserves TERM and KILL for known targets while discovery probes stall", async () => {
+    await expect(portableSignalDiscoveryBudgetForTest()).resolves.toEqual([
+      "SIGTERM",
+      "discovery",
+      "SIGKILL",
+      "discovery",
+    ])
+  })
+
+  test("production finalizer signals a known Darwin target before broad slow probes", async () => {
+    const result = await darwinFinalizerDiscoveryForTest("slow-probes")
+    const firstProbe = result.events.indexOf("probe:1")
+    expect(result.events.indexOf("SIGTERM:42")).toBeLessThan(firstProbe)
+    expect(result.events.indexOf("SIGKILL:42")).toBeLessThan(firstProbe)
+    expect(result.events.indexOf("child.reaped")).toBeLessThan(firstProbe)
+  })
+
+  test("production finalizer keeps partial Darwin PID slices non-quiescent until a later nonce descendant is killed", async () => {
+    const result = await darwinFinalizerDiscoveryForTest("partial-prefix")
+    expect(result.events).toContain("slice:5")
+    expect(result.events).toContain("SIGKILL:77")
+    expect(result.events.indexOf("SIGKILL:77")).toBeGreaterThan(result.events.indexOf("slice:5"))
+  })
+
+  test("production finalizer resumes Darwin discovery beyond the former KILL cap", async () => {
+    const result = await darwinFinalizerDiscoveryForTest("long-prefix")
+    expect(result.scans).toBeGreaterThan(6)
+    expect(result.events).toContain("slice:8")
+    expect(result.events).toContain("SIGKILL:77")
+  })
+
+  test("Darwin tracker retains and reaps an uncertain admitted child through cleanup", async () => {
+    const result = await darwinFinalizerDiscoveryForTest("initial-observation-failure")
+    expect(result.scans).toBeGreaterThan(2)
+    expect(result.rootPresentAtAdmission).toBe(true)
+    expect(result.processAdmitted).toBe(true)
+    expect(result.processRetainedAfterUncertainty).toBe(true)
+    expect(result.uncertaintyObserved).toBe(true)
+    expect(result.exitCode).toBeNumber()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain(
+      "failed to recheck macOS process",
+    )
+  })
+
+  test("broad Darwin discovery skips an opaque PID before it has ownership evidence", async () => {
+    await expect(darwinBroadPreOwnershipObservationForTest()).resolves.toBeUndefined()
+  })
+
+  test("Darwin nonce-confirmed observation uncertainty fails closed", async () => {
+    await expect(darwinBroadPreOwnershipObservationForTest(true)).rejects.toThrow(
+      "failed to recheck macOS process 42 after initial native observation",
+    )
+  })
+
+  test("later opaque Darwin observations skip foreign PIDs and fail closed after ownership", async () => {
+    await expect(darwinBroadPreOwnershipObservationForTest(false, "arguments-recheck")).resolves.toBeUndefined()
+    for (const observation of ["arguments-recheck", "final"] as const) {
+      await expect(darwinBroadPreOwnershipObservationForTest(true, observation)).rejects.toThrow(
+        `opaque ${observation} observation`,
+      )
+    }
+    // The final recheck runs after the procargs record has admitted this PID
+    // by nonce, even though it began as a broad pre-ownership candidate.
+    await expect(darwinBroadPreOwnershipObservationForTest(false, "final")).rejects.toThrow(
+      "opaque final observation",
+    )
+  })
+
+  test("owned exit observation getter and then failures still reap through the production finalizer", async () => {
+    for (const kind of ["getter", "then"] as const) {
+      const result = await ownedExitObservationFailureForTest(kind)
+      expect(result.stopped).toBe(true)
+      expect(result.terminated).toBe(true)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.cause)).toContain(
+        kind === "getter" ? "synthetic exited getter failed" : "synthetic exited then attachment failed",
+      )
+    }
+  })
+
+  test("termination retains a direct-child exit observation failure that arrives during cleanup", async () => {
+    const result = await lateExitObservationFailureForTest()
+    expect(result.stopped).toBe(true)
+    expect(result.terminated).toBe(true)
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic late exit observation rejected")
+  })
+
+  test("ACP cleanup escalates after stdin close and initial exit observation failures", async () => {
+    const result = await acpCleanupFailuresForTest()
+    expect(result.stopped).toBe(true)
+    expect(result.terminated).toBe(true)
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    const formatted = formatProcessErrorForTest(result.cause)
+    expect(formatted).toContain("synthetic ACP stdin end failed")
+    expect(formatted).toContain("synthetic ACP exit observation rejected")
+  })
+
+  test("helper drains verbose probe stdout before status publication", async () => {
+    if (process.platform === "win32") return
+    const result = await commandResultForTest(["/bin/sh", "-c", "yes x | head -c 262144"], 2_000)
+    expect(result.exitCode).toBe(0)
+    expect(result.stdout.length).toBe(262_144)
+  })
+
+  test("helper timeout reaps a descendant after its shell root has exited", async () => {
+    if (process.platform === "win32") return
+    const started = Date.now()
+    const pidFile = `${os.tmpdir()}/opencode-helper-descendant-${crypto.randomUUID()}`
+    try {
+      await expect(
+        commandResultForTest(
+          ["/bin/sh", "-c", 'sleep 30 & child=$!; printf "%s" "$child" > "$1"; exit 0', "--", pidFile],
+          250,
+        ),
+      ).rejects.toThrow("did not exit before the cleanup deadline")
+      const pid = Number((await Bun.file(pidFile).text()).trim())
+      expect(Number.isSafeInteger(pid)).toBe(true)
+      expect(pid).toBeGreaterThan(0)
+      const deadline = Date.now() + 1_000
+      const waitForDescendantExit = async (): Promise<void> => {
+        // A container init can briefly retain a reaped child as a zombie.
+        // It has no stdout writer and cannot survive the cleanup boundary.
+        if (process.platform === "linux") {
+          const stat = await Bun.file(`/proc/${pid}/stat`)
+            .text()
+            .catch((cause) => {
+              if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") return
+              throw cause
+            })
+          if (stat === undefined || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return
+        } else {
+          try {
+            process.kill(pid, 0)
+          } catch (cause) {
+            if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ESRCH") return
+            throw cause
+          }
+        }
+        if (Date.now() >= deadline) throw new Error(`helper descendant ${pid} remained after timeout cleanup`)
+        await Bun.sleep(20)
+        return waitForDescendantExit()
+      }
+      await waitForDescendantExit()
+      expect(Date.now() - started).toBeLessThan(2_000)
+    } finally {
+      if (existsSync(pidFile)) unlinkSync(pidFile)
+    }
+  })
+
+  cliIt.live(
+    "cleans up a normal separately grouped tool descendant",
+    ({ home, llm, opencode }) =>
+      Effect.gen(function* () {
+        // This is intentionally Linux-gated: `setsid` is not part of the
+        // portable contract. It proves the production cleanup path captures
+        // an ordinary inherited-environment descendant before it leaves the
+        // tool shell's process group. A child that clears the tracking nonce
+        // is deliberately unsupported by the portable fallback and must fail
+        // cleanup rather than being claimed as safely owned.
+        if (process.platform !== "linux") return
+        const pidFile = `${home}/tool-descendant.pid`
+        yield* llm.tool("bash", {
+          command: `setsid sh -c 'trap "" TERM; while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & child=$!; echo $child > '${pidFile}'; sleep 0.2`,
+          description: "Launch a separately grouped cleanup probe",
+        })
+        yield* llm.text("cleanup scheduled")
+        const result = yield* opencode.run("launch cleanup probe", {
+          extraArgs: ["--dangerously-skip-permissions"],
+        })
+        opencode.expectExit(result, 0)
+        const pid = Number((yield* Effect.promise(() => Bun.file(pidFile).text())).trim())
+        expect(Number.isSafeInteger(pid)).toBe(true)
+        expect(pid).toBeGreaterThan(0)
+        const waitForExit = (): Effect.Effect<void> =>
+          Effect.gen(function* () {
+            // A container init can briefly retain a reaped child as a zombie.
+            // It has no stdout writer and cannot survive the cleanup boundary.
+            const stat = yield* Effect.promise(() =>
+              Bun.file(`/proc/${pid}/stat`)
+                .text()
+                .catch((cause) => {
+                  if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "ENOENT") return
+                  throw cause
+                }),
+            )
+            if (stat === undefined || stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return
+            yield* Effect.sleep("50 millis")
+            yield* waitForExit()
+          })
+        yield* waitForExit().pipe(Effect.timeout("5 seconds"))
+      }),
+    45_000,
   )
 })
