@@ -3260,6 +3260,52 @@ type PortableFilesystem = {
   readonly unlink: (file: string) => void
 }
 
+const portableGateControllerScript = `leader=$$; controller_nonce="$8"; (
+  # A shell assignment in this fork is not visible in Linux /proc until
+  # an exec. The controller owns the eventual group KILL, so publish
+  # its PID only after exec has installed its distinct kernel env.
+  exec env OPENCODE_TEST_PROCESS_NONCE="$controller_nonce" /bin/sh -c '
+    leader=$1
+    abort=$2
+    pending=$3
+    ready=$4
+    admission=$5
+    acknowledgement=$6
+    completion=$7
+    pause=$8
+    controller_status=$9
+    controller_descendant=\${10}
+    publication_delay=\${11}
+    startup_failure=\${12}
+    controller_pending="$controller_status.pending"
+    [ "$startup_failure" = "true" ] && exit 125
+    if [ -n "$controller_descendant" ]; then
+      # This is a separate shell rather than sleep. It ignores TERM after
+      # the controller exits, so group KILL proves containment.
+      /bin/sh -c "trap \\\"\\\" TERM; while :; do sleep 1; done" &
+      printf "%s:%s" "$$" "$!" > "$controller_descendant"
+    fi
+    [ -n "$publication_delay" ] && sleep "$publication_delay"
+    printf "controller:%s:%s" "$OPENCODE_TEST_PROCESS_NONCE" "$$" > "$controller_pending" && mv -f "$controller_pending" "$controller_status"
+    trap "" TERM
+    expected_admission="admitted:$OPENCODE_TEST_PROCESS_NONCE:$$"
+    while [ ! -e "$admission" ] && [ ! -e "$abort" ]; do sleep 0.01; done
+    [ -e "$abort" ] && exit 125
+    [ "$(cat "$admission")" = "$expected_admission" ] || exit 125
+    printf "ready:%s" "$$" > "$pending" && mv -f "$pending" "$ready"
+    while [ ! -e "$abort" ]; do sleep 0.01; done
+    printf "ack" > "$acknowledgement"
+    kill -TERM -"$leader" 2>/dev/null || :
+    sleep 0.5
+    # This only records that KILL is about to be issued. The parent
+    # must still verify controller exit and group drain before it can
+    # treat the kill as finished.
+    printf "kill-issued" > "$completion"
+    while [ -n "$pause" ] && [ -e "$pause" ]; do sleep 0.01; done
+    kill -KILL -"$leader" 2>/dev/null || { printf "failed" > "$completion"; exit 1; }
+  ' controller "$leader" "$4" "$1" "$2" "$5" "$6" "$7" "$9" "\${10}" "\${11}" "\${12}" "\${13}"
+) >/dev/null 2>&1 & controller=$!; while [ ! -e "$3" ] && [ ! -e "$4" ]; do kill -0 "$controller" 2>/dev/null || exit 125; sleep 0.01; done; [ -e "$4" ] && exit 125; rm "$3"; shift 13; exec "$@"`
+
 type PortableObserve = (
   pid: number,
   nonce: string,
@@ -3309,6 +3355,7 @@ type SpawnTrackedTestOptions = {
   readonly portableControllerDescendant?: string
   readonly portableControllerPublicationDelayMs?: number
   readonly portableControllerStartupFailure?: boolean
+  readonly portableAdmissionDirectorySync?: (descriptor: number) => void
   readonly portableExitObservationFailure?: boolean
   readonly onPortableControllerCapture?: (controller: ProcessSnapshot) => void
   readonly onPortableControllerRecovered?: (controller: ProcessSnapshot) => void
@@ -3588,53 +3635,7 @@ async function spawnTracked(
         // Once abort is observed, the controller remains in the verified
         // group after the leader exits. It keeps that numeric group from
         // being recycled, then always kills it after a bounded TERM grace.
-        `leader=$$; controller_nonce="$8"; (
-          # A shell assignment in this fork is not visible in Linux /proc until
-          # an exec. The controller owns the eventual group KILL, so publish
-          # its PID only after exec has installed its distinct kernel env.
-          exec env OPENCODE_TEST_PROCESS_NONCE="$controller_nonce" /bin/sh -c '
-            leader=$1
-            abort=$2
-            pending=$3
-            ready=$4
-            admission=$5
-            acknowledgement=$6
-            completion=$7
-            pause=$8
-            controller_status=$9
-            controller_descendant=\${10}
-            publication_delay=\${11}
-            startup_failure=\${12}
-            controller_pending="$controller_status.pending"
-            [ "$startup_failure" = "true" ] && exit 125
-            if [ -n "$controller_descendant" ]; then
-              # This is deliberately a separate shell rather than sleep: it
-              # ignores TERM after the controller exits, so the controller's
-              # group KILL remains the only way to prove containment. Escape
-              # its empty trap action for this enclosing single-quoted script.
-              /bin/sh -c "trap \\\"\\\" TERM; while :; do sleep 1; done" &
-              printf "%s:%s" "$$" "$!" > "$controller_descendant"
-            fi
-            [ -n "$publication_delay" ] && sleep "$publication_delay"
-            printf "controller:%s:%s" "$OPENCODE_TEST_PROCESS_NONCE" "$$" > "$controller_pending" && mv -f "$controller_pending" "$controller_status"
-            trap "" TERM
-            expected_admission="admitted:$OPENCODE_TEST_PROCESS_NONCE:$$"
-            while [ ! -e "$admission" ] && [ ! -e "$abort" ]; do sleep 0.01; done
-            [ -e "$abort" ] && exit 125
-            [ "$(cat "$admission")" = "$expected_admission" ] || exit 125
-            printf "ready:%s" "$$" > "$pending" && mv -f "$pending" "$ready"
-            while [ ! -e "$abort" ]; do sleep 0.01; done
-            printf "ack" > "$acknowledgement"
-            kill -TERM -"$leader" 2>/dev/null || :
-            sleep 0.5
-            # This only records that KILL is about to be issued. The parent
-            # must still verify controller exit and group drain before it can
-            # treat the kill as finished.
-            printf "kill-issued" > "$completion"
-            while [ -n "$pause" ] && [ -e "$pause" ]; do sleep 0.01; done
-            kill -KILL -"$leader" 2>/dev/null || { printf "failed" > "$completion"; exit 1; }
-          ' controller "$leader" "$4" "$1" "$2" "$5" "$6" "$7" "$9" "\${10}" "\${11}" "\${12}" "\${13}"
-        ) >/dev/null 2>&1 & controller=$!; while [ ! -e "$3" ] && [ ! -e "$4" ]; do kill -0 "$controller" 2>/dev/null || exit 125; sleep 0.01; done; [ -e "$4" ] && exit 125; rm "$3"; shift 13; exec "$@"`,
+        portableGateControllerScript,
         "--",
         pendingReady,
         ready,
@@ -3728,6 +3729,12 @@ async function spawnTracked(
           closeSync(descriptor)
         }
         renameSync(pendingAdmission, admission)
+        const directoryDescriptor = openSync(path.dirname(admission), constants.O_RDONLY)
+        try {
+          ;(test?.portableAdmissionDirectorySync ?? fsyncSync)(directoryDescriptor)
+        } finally {
+          closeSync(directoryDescriptor)
+        }
         return captured
       } catch (cause) {
         if (!retryFailures && !isMissingProcess(cause)) throw cause
@@ -4116,6 +4123,38 @@ export async function portableDelayedControllerHandshakeForTest() {
       targetExecuted,
       targetExecutedBeforeAdmission,
     }
+  } finally {
+    if (existsSync(marker)) unlinkSync(marker)
+  }
+}
+
+export function portableControllerScriptSyntaxForTest() {
+  return Bun.spawnSync(["/bin/sh", "-n", "-c", portableGateControllerScript]).exitCode
+}
+
+export async function portableAdmissionDirectorySyncFailureForTest() {
+  const marker = path.join(os.tmpdir(), `opencode-admission-sync-target-${crypto.randomUUID()}`)
+  let exited: Promise<number> | undefined
+  try {
+    const cause = await spawnTracked(
+      [process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed")`],
+      { stdout: "pipe", stderr: "pipe" },
+      {
+        forcePortable: true,
+        portableAdmissionDirectorySync: () => {
+          throw new Error("synthetic admission directory sync failed")
+        },
+        onPortableGateSpawn: (child) => {
+          exited = child.exited
+          void exited.catch(() => {})
+        },
+      },
+    ).catch((cause) => cause)
+    const reaped = await Promise.resolve(exited).then(
+      () => true,
+      () => true,
+    )
+    return { failed: cause instanceof Error, reaped, targetExecuted: existsSync(marker) }
   } finally {
     if (existsSync(marker)) unlinkSync(marker)
   }

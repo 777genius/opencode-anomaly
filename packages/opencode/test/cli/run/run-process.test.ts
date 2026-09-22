@@ -34,6 +34,8 @@ import {
   portableInitialIdentityRetryForTest,
   portableControllerVisibilityRetryForTest,
   portableDelayedControllerHandshakeForTest,
+  portableControllerScriptSyntaxForTest,
+  portableAdmissionDirectorySyncFailureForTest,
   portableControllerStartupFailureForTest,
   portableLinuxControllerEnvironmentForTest,
   portableShortLivedProcessForTest,
@@ -843,6 +845,20 @@ describe("CLI process cleanup containment", () => {
     // This is recorded before cleanup's independent TERM grace begins.
     expect(result.admissionDurationMs).toBeGreaterThanOrEqual(75)
     expect(result.admissionDurationMs).toBeLessThan(2_000)
+  })
+
+  test("portable controller script parses as the exact production template", () => {
+    if (process.platform === "win32") return
+    expect(portableControllerScriptSyntaxForTest()).toBe(0)
+  })
+
+  test("portable admission fails closed when its containing directory cannot sync", async () => {
+    if (process.platform === "win32") return
+    await expect(portableAdmissionDirectorySyncFailureForTest()).resolves.toEqual({
+      failed: true,
+      reaped: true,
+      targetExecuted: false,
+    })
   })
 
   test("portable controller startup failure reaps the owned gate without accepting a missing controller", async () => {
