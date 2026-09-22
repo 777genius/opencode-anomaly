@@ -12,7 +12,9 @@ import {
   cliIt,
   commandStatusForTest,
   commandResultForTest,
+  commandCleanupReserveForTest,
   acpCleanupFailuresForTest,
+  acpWindowsDrainReserveForTest,
   darwinBroadPreOwnershipObservationForTest,
   darwinFinalizerDiscoveryForTest,
   darwinProbeDeadlineForTest,
@@ -25,16 +27,44 @@ import {
   darwinEnvironmentForTest,
   portableSignalRevalidationForTest,
   portableSignalDiscoveryBudgetForTest,
+  portableCleanupReserveForTest,
+  portableLaunchReconciliationForTest,
+  portableGateEscalationForTest,
+  portableFilesystemFailureForTest,
+  portableInitialIdentityRetryForTest,
+  portableLinuxControllerEnvironmentForTest,
+  portableShortLivedProcessForTest,
+  portableReadinessPartialPublicationForTest,
+  portableReconciliationFailureCleanupForTest,
+  portableOpaqueExecCleanupForTest,
+  portableControllerCompletionForTest,
+  portableCompletionBeforeKillFallbackForTest,
+  portableAbortWriteFailureForTest,
+  portablePreTrackerControllerFailureForTest,
+  portablePreControllerCaptureFailureForTest,
+  portableControllerRecoveryFailureForTest,
+  portableControllerDescendantPersistentRecoveryForTest,
+  portableControllerAuthorityForTest,
+  portablePersistentControllerRecoveryForTest,
+  portableLateControllerRecoveryForTest,
+  portableFailedReconciliationCleanupHandoffForTest,
+  portableTrackerHandoffCleanupForTest,
   type ProcessIdentity,
   windowsIdentityObservationForTest,
+  windowsJobCleanupPhasesForTest,
   windowsNativeArgvGetterCleanupForTest,
   windowsCommandLineForTest,
   windowsCapturedHandleCleanupForTest,
   windowsNativeCommandLineRoundTripForTest,
   windowsSupervisorArgumentsForTest,
   windowsSupervisorArgumentRoundTripForTest,
+  windowsSupervisorDrainLifecycleForTest,
+  windowsSupervisorCompletionForTest,
   windowsSupervisorProtocolForTest,
   windowsSupervisorStatusForTest,
+  linuxCgroupDiscoveryDeadlineForTest,
+  abortedCgroupMembershipDeadlineForTest,
+  linuxProcDiscoveryDeadlineForTest,
 } from "../../lib/cli-process"
 
 const trackedIdentity: ProcessIdentity = {
@@ -474,13 +504,17 @@ describe("opencode run (non-interactive subprocess)", () => {
 describe("CLI process cleanup containment", () => {
   test("Windows supervisor status handshake uses the reader's actual tab delimiter", () => {
     const script = windowsSupervisorProtocolForTest()
-    expect(script).toContain('Process.GetCurrentProcess().Id+"\t"+created')
+    const job = "3d2bb1c6-655a-4c55-ae29-a20439c11672"
+    expect(script).toContain('Process.GetCurrentProcess().Id+"\t"+created+"\t"+jobName')
     expect(script).not.toContain('Process.GetCurrentProcess().Id+"\\t"+created')
     expect(script).toContain("File.Move(pending,status)")
-    expect(windowsSupervisorStatusForTest("123\t134102758400000000")).toEqual({
+    expect(windowsSupervisorStatusForTest(`123\t134102758400000000\t${job}`)).toEqual({
       pid: 123,
       created: "134102758400000000",
+      job,
     })
+    expect(windowsSupervisorCompletionForTest(`${job}\t0`, job)).toBe(true)
+    expect(windowsSupervisorCompletionForTest(`${job}\t1`, job)).toBe(false)
     ;[
       "",
       "123",
@@ -488,9 +522,9 @@ describe("CLI process cleanup containment", () => {
       "\t456",
       "0\t456",
       "123\t0",
-      "123\t456\n",
-      "123\t456\r\n",
-      "123\t456 trailing",
+      "123\t456\tbad-job",
+      `123\t456\t${job}\n`,
+      `123\t456\t${job} trailing`,
       "pid\t456",
     ].forEach((record) => {
       expect(windowsSupervisorStatusForTest(record)).toBeUndefined()
@@ -510,6 +544,62 @@ describe("CLI process cleanup containment", () => {
     expect(script).toContain('[DllImport("kernel32.dll")] static extern uint GetTickCount()')
     expect(script).toContain("unchecked(GetTickCount()-began)")
     expect(script).not.toContain("TickCount64")
+    expect(script).toContain('TerminateJobObject(job,125)')
+    expect(script).toContain('QueryInformationJobObject(job,1,out accounting')
+    expect(script).toContain('jobName+"\t"+"0"')
+  })
+
+  test("Windows cleanup preserves the supervisor for a late Job Object drain acknowledgement", async () => {
+    const result = await windowsSupervisorDrainLifecycleForTest(600)
+    expect(result.state).toBe("exited")
+    expect(result.acknowledged).toBe(true)
+    expect(result.events).toEqual(["abort", "job-drained"])
+    expect(result.errors).toEqual([])
+  })
+
+  test("Windows cleanup gives a fixed drain phase and a separate fallback phase", () => {
+    expect(windowsJobCleanupPhasesForTest(8_000, 0)).toEqual({
+      drainDeadline: 4_000,
+      inspectionDeadline: 4_500,
+      reapDeadline: 7_500,
+      fallbackDeadline: 8_000,
+    })
+  })
+
+  test("Windows ACP cleanup reserves a nonzero Job Object drain acknowledgement phase", async () => {
+    const drainBudget = await acpWindowsDrainReserveForTest()
+    expect(drainBudget).toBeGreaterThanOrEqual(3_500)
+    expect(drainBudget).toBeLessThanOrEqual(4_100)
+  })
+
+  test("Windows cleanup fails closed when a fixed-deadline drain acknowledgement is late", async () => {
+    const result = await windowsSupervisorDrainLifecycleForTest(4_001, 8_000)
+    expect(result.state).toBe("terminated")
+    expect(result.acknowledged).toBe(false)
+    expect(result.events).toEqual(["abort", "inspected", "terminated"])
+    expect(result.errors.map((error) => error.message)).toContain(
+      "Windows Job Object for process 42 did not acknowledge descendant drain before the reserved cleanup window elapsed",
+    )
+  })
+
+  test("Windows cleanup fails closed and terminates an unacknowledging Job Object supervisor", async () => {
+    const result = await windowsSupervisorDrainLifecycleForTest(undefined, 8_000)
+    expect(result.state).toBe("terminated")
+    expect(result.acknowledged).toBe(false)
+    expect(result.events).toEqual(["abort", "inspected", "terminated"])
+    expect(result.errors.map((error) => error.message)).toContain(
+      "Windows Job Object for process 42 did not acknowledge descendant drain before the reserved cleanup window elapsed",
+    )
+  })
+
+  test("Windows supervisor disappearance cannot certify a surviving Job Object member", async () => {
+    const result = await windowsSupervisorDrainLifecycleForTest(undefined, 8_000, true)
+    expect(result.state).toBe("terminated")
+    expect(result.acknowledged).toBe(false)
+    expect(result.events).toEqual(["abort", "inspected", "terminated"])
+    expect(result.errors.map((error) => error.message)).toContain(
+      "Windows Job Object for process 42 did not acknowledge descendant drain before the reserved cleanup window elapsed",
+    )
   })
 
   test("Windows identity observations accept one terminal line ending and reject embedded line breaks", () => {
@@ -638,6 +728,254 @@ describe("CLI process cleanup containment", () => {
     expect(current.signalled).toBe(true)
   })
 
+  test("portable launch readiness reconciles only the direct gated PID", async () => {
+    const delayed = await portableLaunchReconciliationForTest([undefined])
+    expect(delayed).toEqual({ _tag: "pending" })
+    const pending = await portableLaunchReconciliationForTest([
+      {
+        pid: 42,
+        parent: 1,
+        group: 42,
+        started: "started",
+        executable: "gate",
+        containment: "nonce:test",
+        nonce: true,
+      },
+    ])
+    expect(pending).toEqual({ _tag: "pending" })
+
+    const ready = await portableLaunchReconciliationForTest([
+      {
+        pid: 42,
+        parent: 1,
+        group: 42,
+        started: "started",
+        executable: "opencode",
+        containment: "nonce:test",
+        nonce: true,
+      },
+    ])
+    expect(ready).toMatchObject({ _tag: "ready", target: { executable: "opencode" } })
+  })
+
+  test("portable launch distinguishes short-lived exits from identity conflicts", async () => {
+    await expect(portableLaunchReconciliationForTest([undefined], "exited")).resolves.toEqual({ _tag: "exited" })
+    await expect(portableLaunchReconciliationForTest([], "pending", Date.now())).resolves.toEqual({ _tag: "deadline" })
+    const conflict = await portableLaunchReconciliationForTest([
+      {
+        pid: 42,
+        parent: 1,
+        group: 99,
+        started: "started",
+        executable: "opencode",
+        containment: "nonce:test",
+        nonce: true,
+      },
+    ])
+    expect(conflict).toEqual({ _tag: "conflict", message: "portable gate PID 42 changed identity before launch" })
+  })
+
+  test("portable pre-tracker escalation only signals the reconciled launch group", async () => {
+    await expect(portableGateEscalationForTest()).resolves.toEqual({
+      events: ["SIGTERM:-42", "SIGKILL:-42"],
+      errors: [],
+    })
+    const changed = await portableGateEscalationForTest(true)
+    expect(changed.events).toEqual([])
+    expect(changed.errors.map((error) => error.message)).toEqual([
+      "portable gate PID 42 identity changed before SIGTERM",
+      "portable gate PID 42 identity changed before SIGKILL",
+    ])
+  })
+
+  test("portable tracker hands the reconciled exec target to known-target cleanup", async () => {
+    await expect(portableTrackerHandoffCleanupForTest()).resolves.toEqual({
+      events: ["SIGTERM:opencode", "SIGKILL:opencode"],
+      errors: [],
+    })
+  })
+
+  test("portable readiness filesystem failures reap the owned gate or target", async () => {
+    if (process.platform === "win32") return
+    for (const kind of ["read", "unlink"] as const) {
+      const result = await portableFilesystemFailureForTest(kind)
+      expect(result.reaped).toBe(true)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.cause)).toContain(
+        kind === "read" ? "synthetic readiness read failed" : "synthetic readiness unlink failed",
+      )
+    }
+  })
+
+  test("portable initial identity waits through delayed and unreadable nonce observations", async () => {
+    if (process.platform === "win32") return
+    await expect(portableInitialIdentityRetryForTest("delayed")).resolves.toBeGreaterThanOrEqual(3)
+    await expect(portableInitialIdentityRetryForTest("unreadable")).resolves.toBeGreaterThanOrEqual(3)
+  })
+
+  test("forced-portable Linux controller installs its protected nonce through exec", async () => {
+    if (process.platform !== "linux") return
+    await expect(portableLinuxControllerEnvironmentForTest()).resolves.toBe(true)
+  })
+
+  test("portable reconciliation failure adopts the exec target before cleanup", async () => {
+    if (process.platform === "win32") return
+    await expect(portableFailedReconciliationCleanupHandoffForTest()).resolves.toEqual({
+      events: ["SIGTERM:opencode", "SIGKILL:opencode"],
+      errors: [],
+    })
+    const result = await portableReconciliationFailureCleanupForTest()
+    expect(result.reaped).toBe(true)
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic reconciliation failure")
+  })
+
+  test("portable controller kills a TERM-ignoring descendant after the root exits", async () => {
+    if (process.platform === "win32") return
+    const result = await portableOpaqueExecCleanupForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(result.rootExitedAfterTerm).toBe(true)
+    expect(result.descendantGone).toBe(true)
+    expect(result.controllerHasDistinctNonce).toBe(true)
+    expect(result.durationMs).toBeLessThan(2_500)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic hanging cleanup probe aborted")
+    if (process.platform === "darwin") {
+      expect(formatProcessErrorForTest(result.cause)).toContain("synthetic persistent post-exec native observation failure")
+      expect(result.signalPaths).toContain("signalKnown:SIGKILL")
+      return
+    }
+    expect(result.signalPaths).toContain("signal:SIGTERM")
+  })
+
+  test("successful portable cleanup waits for controller KILL and removes acknowledged controls", async () => {
+    if (process.platform === "win32") return
+    const result = await portableControllerCompletionForTest()
+    expect(result.descendantGone).toBe(true)
+    expect(result.durationMs).toBeGreaterThanOrEqual(400)
+    expect(result.durationMs).toBeLessThan(2_500)
+    expect(result.removedControls).toBe(6)
+  })
+
+  test("portable finalizer falls back when the controller pauses after kill-issued", async () => {
+    if (process.platform === "win32") return
+    await expect(portableCompletionBeforeKillFallbackForTest()).resolves.toEqual({
+      fallback: true,
+      killIssued: true,
+      rootGone: true,
+      descendantGone: true,
+      controllerGone: true,
+    })
+  })
+
+  test("portable abort-write failure still falls back and verifies descendant disappearance", async () => {
+    if (process.platform === "win32") return
+    const result = await portableAbortWriteFailureForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic portable abort write failed")
+    expect(result.fallback).toBe(true)
+    expect(result.descendantGone).toBe(true)
+  })
+
+  test("portable pre-tracker abort failure kills and verifies the TERM-ignoring controller", async () => {
+    if (process.platform === "win32") return
+    const result = await portablePreTrackerControllerFailureForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic pre-tracker portable abort write failed")
+    expect(result.fallback).toBe(true)
+    expect(result.rootReaped).toBe(true)
+    expect(result.controllerGone).toBe(true)
+  })
+
+  test("portable failure before controller capture still finalizes the authenticated controller", async () => {
+    if (process.platform === "win32") return
+    const result = await portablePreControllerCaptureFailureForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic portable exit observation failed")
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic pre-controller portable abort write failed")
+    expect(result.fallback).toBe(true)
+    expect(result.rootReaped).toBe(true)
+    expect(result.controllerGone).toBe(true)
+  })
+
+  test("portable controllerStatus read and authentication failures recover the controller before abort fallback", async () => {
+    if (process.platform === "win32") return
+    for (const kind of ["read", "authenticate"] as const) {
+      const result = await portableControllerRecoveryFailureForTest(kind)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.cause)).toContain(
+        kind === "read" ? "synthetic controllerStatus read failed" : "synthetic controllerStatus authentication failed",
+      )
+      expect(formatProcessErrorForTest(result.cause)).toContain("synthetic controller recovery abort write failed")
+      expect(result.fallback).toBe(true)
+      expect(result.controllerGone).toBe(true)
+    }
+  })
+
+  test("portable persistent controllerStatus failures use nonce discovery without spending finalization reserve", async () => {
+    if (process.platform === "win32") return
+    for (const kind of ["read", "authenticate"] as const) {
+      const result = await portablePersistentControllerRecoveryForTest(kind)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.cause)).toContain(
+        kind === "read" ? "synthetic controllerStatus read failed" : "synthetic controllerStatus authentication failed",
+      )
+      expect(formatProcessErrorForTest(result.cause)).toContain("synthetic controller recovery abort write failed")
+      expect(result.attempts).toBeGreaterThan(1)
+      expect(result.fallback).toBe(true)
+      expect(result.controllerGone).toBe(true)
+      expect(result.durationMs).toBeLessThan(3_000)
+    }
+  })
+
+  test("portable private-nonce controller recovery ignores ordinary controller descendants", async () => {
+    if (process.platform === "win32") return
+    for (const kind of ["read", "authenticate"] as const) {
+      const result = await portableControllerDescendantPersistentRecoveryForTest(kind)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.cause)).toContain(
+        kind === "read" ? "synthetic controllerStatus read failed" : "synthetic controllerStatus authentication failed",
+      )
+      expect(formatProcessErrorForTest(result.cause)).toContain("synthetic controller recovery abort write failed")
+      expect(result.recoveredController).toBe(true)
+      expect(result.fallback).toBe(true)
+      expect(result.controllerGone).toBe(true)
+      expect(result.descendantGone).toBe(true)
+      expect(result.durationMs).toBeLessThan(3_000)
+    }
+  })
+
+  test("portable private-nonce authority rejects a second unrelated root", () => {
+    expect(portableControllerAuthorityForTest()).toEqual({ descendantAuthority: 42, forgeryAuthority: undefined })
+  })
+
+  test("portable controllerStatus retries accept a late authenticated status before cleanup escalation", async () => {
+    if (process.platform === "win32") return
+    for (const kind of ["read", "authenticate"] as const) {
+      const result = await portableLateControllerRecoveryForTest(kind)
+      expect(result.cause).toBeInstanceOf(AggregateError)
+      expect(result.attempts).toBe(4)
+      expect(result.fallback).toBe(true)
+      expect(result.controllerGone).toBe(true)
+      expect(result.durationMs).toBeLessThan(3_000)
+    }
+  })
+
+  test("portable readiness tolerates concurrent partial publication", async () => {
+    if (process.platform === "win32") return
+    await expect(portableReadinessPartialPublicationForTest()).resolves.toEqual([3, 3])
+  })
+
+  test("portable production spawn preserves short-lived stdout, stderr, and exit status", async () => {
+    if (process.platform === "win32") return
+    for (const exitCode of [0, 23]) {
+      await expect(portableShortLivedProcessForTest(exitCode)).resolves.toEqual({
+        exitCode,
+        stdout: "short stdout\n",
+        stderr: "short stderr\n",
+      })
+    }
+  })
+
   test("portable signalling reserves TERM and KILL for known targets while discovery probes stall", async () => {
     await expect(portableSignalDiscoveryBudgetForTest()).resolves.toEqual([
       "SIGTERM",
@@ -645,6 +983,17 @@ describe("CLI process cleanup containment", () => {
       "SIGKILL",
       "discovery",
     ])
+  })
+
+  test("portable cleanup bounds reconciliation before reserving containment phases", () => {
+    expect(portableCleanupReserveForTest(10_000, 5_000)).toEqual({
+      observationDeadline: 5_250,
+      containmentReserve: 3_000,
+      termReserve: 500,
+      killReserve: 500,
+      reapReserve: 1_000,
+      descendantReserve: 1_000,
+    })
   })
 
   test("production finalizer signals a known Darwin target before broad slow probes", async () => {
@@ -660,6 +1009,15 @@ describe("CLI process cleanup containment", () => {
     expect(result.events).toContain("slice:5")
     expect(result.events).toContain("SIGKILL:77")
     expect(result.events.indexOf("SIGKILL:77")).toBeGreaterThan(result.events.indexOf("slice:5"))
+  })
+
+  test("production finalizer moves from a confirmed Darwin root exit to descendants", async () => {
+    const result = await darwinFinalizerDiscoveryForTest("exited-root")
+    expect(result.events).not.toContain("SIGTERM:42")
+    expect(result.events).not.toContain("SIGKILL:42")
+    expect(result.events).toContain("slice:5")
+    expect(result.events).toContain("SIGKILL:77")
+    expect(result.events.indexOf("child.reaped")).toBeLessThan(result.events.indexOf("slice:1"))
   })
 
   test("production finalizer resumes Darwin discovery beyond the former KILL cap", async () => {
@@ -787,6 +1145,51 @@ describe("CLI process cleanup containment", () => {
     } finally {
       if (existsSync(pidFile)) unlinkSync(pidFile)
     }
+  })
+
+  test("helper finalization cannot overrun its absolute observation deadline", async () => {
+    if (process.platform === "win32") return
+    const started = Date.now()
+    await expect(commandResultForTest(["/bin/sh", "-c", "sleep 30"], 100)).rejects.toThrow(
+      "did not exit before the cleanup deadline",
+    )
+    // The operation deadline remains short, but owned abort/ack/reap has its
+    // own bounded reserve after it so the helper cannot be orphaned.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(100)
+    expect(Date.now() - started).toBeLessThan(1_500)
+  })
+
+  test("helper retains abort controls when acknowledgement cannot be observed during its cleanup reserve", async () => {
+    if (process.platform === "win32") return
+    const result = await commandCleanupReserveForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("did not acknowledge abort")
+    expect(formatProcessErrorForTest(result.cause)).toContain("controls were retained")
+    expect(result.retained).toBe(true)
+    expect(result.durationMs).toBeGreaterThanOrEqual(900)
+    expect(result.durationMs).toBeLessThan(1_750)
+  })
+
+  test("Linux cgroup discovery stops at its absolute slice and preserves escalation time", async () => {
+    if (process.platform !== "linux") return
+    await expect(linuxProcDiscoveryDeadlineForTest()).resolves.toMatchObject({ snapshots: [], complete: false })
+    const result = await linuxCgroupDiscoveryDeadlineForTest()
+    expect(result.memberInspections).toBe(64)
+    expect(result.missingMemberInspections).toBe(3)
+    expect(result.complete).toBe(false)
+    expect(result.escalationRemaining).toBe(700)
+  })
+
+  test("Linux aborted cgroup cleanup stops large membership reads at its absolute deadline", async () => {
+    if (process.platform !== "linux") return
+    await expect(abortedCgroupMembershipDeadlineForTest()).resolves.toEqual({
+      membershipReads: 1,
+      snapshotReads: 5,
+      containmentReads: 4,
+      readsAfterDeadline: 0,
+      signals: 2,
+      elapsed: 100,
+    })
   })
 
   cliIt.live(

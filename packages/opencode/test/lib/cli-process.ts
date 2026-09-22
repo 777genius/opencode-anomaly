@@ -101,7 +101,11 @@ type ProcessTracker = {
   readonly scanComplete?: () => boolean
   readonly hasKnown?: () => boolean
   readonly broadDiscovery?: boolean
-  readonly stop: () => Promise<void>
+  readonly windowsJob?: boolean
+  // Only the native Job Object's member query can attest containment on
+  // Windows. A vanished supervisor is merely a vanished observer.
+  readonly jobDrained?: () => boolean
+  readonly stop: (deadline?: number) => Promise<void>
   readonly signal: (
     signal: "SIGINT" | "SIGTERM" | "SIGKILL",
     deadline: number,
@@ -112,6 +116,13 @@ type ProcessTracker = {
     deadline: number,
     mark: ReturnType<typeof unitDiagnostic>,
   ) => Promise<void>
+  // A portable launch starts by tracking the gate shell. Once its direct PID
+  // has been reconciled after exec, cleanup must own the program now using
+  // that PID rather than retaining the shell executable identity.
+  readonly handoff?: (identity: ProcessIdentity) => Promise<void>
+  // A portable gate installs a member of its own group before exec. This
+  // control is therefore an owned termination capability, not a saved PID.
+  readonly abort?: () => Promise<void>
   readonly errors: readonly Error[]
   // The serialized facade exposes its raw implementation only to one owned
   // cleanup operation. Public discovery and signalling still enter the same
@@ -138,6 +149,20 @@ type TrackedProcess = {
 
 const quiescenceScans = 3
 const quiescenceDelayMs = 50
+// The native supervisor waits this long for every Job Object member to exit
+// before it can publish its drained record. Cleanup must reserve the same
+// bounded window instead of killing that observer after the ordinary TERM
+// grace period.
+const windowsJobDrainReserveMs = 4_000
+// Do not lend the native drain window to ordinary cleanup. Once the Job
+// Object has had its full wait, this separate window still has to reap the
+// captured supervisor and prove that containment is gone when it failed to
+// acknowledge the drain.
+const windowsJobFallbackReserveMs = 4_000
+const windowsJobInspectionReserveMs = 500
+const windowsJobContainmentReserveMs = 500
+const linuxCgroupDiscoverySliceMs = 250
+const linuxProcDiscoverySliceMs = 250
 const linuxBootIdentity =
   process.platform === "linux" ? readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() : ""
 const containmentRoot = "/sys/fs/cgroup"
@@ -152,6 +177,18 @@ type PortableSnapshots = {
   readonly snapshots: readonly ProcessSnapshot[]
   readonly errors: readonly Error[]
   readonly complete: boolean
+}
+
+type PortableController = {
+  readonly identity: ProcessSnapshot
+  readonly nonce: string
+  readonly target?: ProcessSnapshot
+  readonly abort: string
+  readonly acknowledgement: string
+  readonly completion: string
+  readonly controls: readonly string[]
+  readonly filesystem: PortableFilesystem
+  readonly onFallback?: () => void
 }
 
 type DarwinScanCursor = {
@@ -300,14 +337,18 @@ function updateContainedIdentity(previous: ProcessIdentity, current: ProcessIden
   throw new Error(`process ${previous.pid} changed identity inside containment`)
 }
 
-function containedPids(cgroupPath: string) {
+function containedPids(cgroupPath: string, deadline?: number, now = Date.now) {
+  if (deadline !== undefined && now() >= deadline)
+    throw new Error(`cgroup discovery deadline elapsed for ${cgroupPath}`)
   return readFileSync(path.join(cgroupPath, "cgroup.procs"), "utf8")
     .split("\n")
-    .filter(Boolean)
-    .map((value) => {
+    .flatMap((value) => {
+      if (!value) return []
+      if (deadline !== undefined && now() >= deadline)
+        throw new Error(`cgroup discovery deadline elapsed for ${cgroupPath}`)
       const pid = Number(value)
       if (!Number.isSafeInteger(pid)) throw new Error(`containment ${cgroupPath} returned an invalid PID`)
-      return pid
+      return [pid]
     })
 }
 
@@ -319,8 +360,9 @@ function signalExact(
   mark: ReturnType<typeof unitDiagnostic>,
   errors: Error[],
   send: (pid: number, signal: "SIGINT" | "SIGTERM" | "SIGKILL") => void = (pid, signal) => process.kill(pid, signal),
+  now = Date.now,
 ) {
-  if (Date.now() >= deadline) {
+  if (now() >= deadline) {
     recordError(errors, `deadline elapsed before ${signal} for process ${identity.pid}`, undefined)
     return
   }
@@ -337,7 +379,7 @@ function signalExact(
     return
   }
   // Inspection can itself consume the deadline. Never signal after it.
-  if (Date.now() >= deadline) {
+  if (now() >= deadline) {
     recordError(errors, `deadline elapsed after inspecting process ${identity.pid} before ${signal}`, undefined)
     return
   }
@@ -364,36 +406,71 @@ function trackContainedProcess(
   child: Pick<ReturnType<typeof Bun.spawn>, "pid">,
   containment: string,
   cgroupPath: string,
+  test?: {
+    readonly now?: () => number
+    readonly members?: (cgroupPath: string) => number[]
+    readonly snapshot?: (pid: number) => ProcessSnapshot | undefined
+    readonly containmentForPID?: (pid: number) => string
+  },
 ): ProcessTracker {
   const tracked = new Map<number, ProcessIdentity>()
   const errors: Error[] = []
   let emptyScans = 0
-  const inspect = (pid: number) => {
-    const snapshot = linuxSnapshot(pid)
-    if (!snapshot) return
-    const currentContainment = linuxCgroup(pid)
+  let scanComplete = true
+  const now = test?.now ?? Date.now
+  const snapshot = test?.snapshot ?? linuxSnapshot
+  const containmentForPID = test?.containmentForPID ?? linuxCgroup
+  const inspect = (pid: number, deadline?: number) => {
+    if (deadline !== undefined && now() >= deadline) return
+    const current = snapshot(pid)
+    if (!current) return
+    if (deadline !== undefined && now() >= deadline) return
+    const currentContainment = containmentForPID(pid)
+    if (deadline !== undefined && now() >= deadline) return
     if (currentContainment !== containment) throw new Error(`process ${pid} escaped containment ${containment}`)
-    return { ...snapshot, containment }
+    return { ...current, containment }
   }
-  const scan = async () => {
+  const scan = async (deadline = now() + 4_000) => {
+    // Cgroup membership can grow while a target forks. Bound every /proc and
+    // cgroup walk to a short slice so TERM/KILL/reap retain time from the
+    // caller's absolute cleanup deadline.
+    const scanDeadline = Math.min(deadline, now() + linuxCgroupDiscoverySliceMs)
+    if (now() >= scanDeadline) {
+      scanComplete = false
+      emptyScans = 0
+      recordError(errors, `cgroup discovery deadline elapsed for process ${child.pid}`, undefined)
+      return
+    }
     try {
       let pids: number[]
       try {
-        pids = containedPids(cgroupPath)
+        pids = test?.members?.(cgroupPath) ?? containedPids(cgroupPath, scanDeadline, now)
       } catch (cause) {
         // A cgroup can disappear after its last process exits (for example
         // when a parent cleanup races ours). That is already quiescent.
         if (isMissingProcess(cause)) {
           tracked.clear()
+          scanComplete = true
           emptyScans += 1
           return
         }
         throw cause
       }
+      if (now() >= scanDeadline) {
+        scanComplete = false
+        emptyScans = 0
+        recordError(errors, `cgroup discovery deadline elapsed for process ${child.pid}`, undefined)
+        return
+      }
+      let complete = true
       const current = pids.flatMap((pid) => {
+        if (now() >= scanDeadline) {
+          complete = false
+          return []
+        }
         let identity: ProcessIdentity | undefined
         try {
-          identity = inspect(pid)
+          identity = inspect(pid, scanDeadline)
         } catch (cause) {
           // A single vanishing or inaccessible member must not hide later
           // members. Keep every healthy identity available for escalation.
@@ -405,6 +482,7 @@ function trackContainedProcess(
         // corruption, and other live members still need cleanup.
         return identity ? [identity] : []
       })
+      if (now() >= scanDeadline) complete = false
       const members = new Set(current.map((identity) => identity.pid))
       current.forEach((identity) => {
         const previous = tracked.get(identity.pid)
@@ -416,33 +494,45 @@ function trackContainedProcess(
           tracked.set(identity.pid, identity)
         }
       })
-      Array.from(tracked.values())
-        .filter((identity) => !members.has(identity.pid))
-        .forEach((identity) => {
-          try {
-            const live = linuxSnapshot(identity.pid)
-            if (live)
-              recordError(errors, `recorded process ${identity.pid} left containment while still live`, undefined)
-            if (!live) tracked.delete(identity.pid)
-          } catch (cause) {
-            if (!isMissingProcess(cause))
-              recordError(errors, `failed to confirm containment member ${identity.pid} absence`, cause)
-          }
-        })
-      emptyScans = tracked.size === 0 ? emptyScans + 1 : 0
+      // An incomplete enumeration cannot prove a previously known member
+      // absent, nor can it certify a newly skipped member harmless.
+      if (complete)
+        Array.from(tracked.values())
+          .filter((identity) => !members.has(identity.pid))
+          .some((identity) => {
+            if (now() >= scanDeadline) {
+              complete = false
+              return true
+            }
+            try {
+              const live = snapshot(identity.pid)
+              if (now() >= scanDeadline) complete = false
+              if (live)
+                recordError(errors, `recorded process ${identity.pid} left containment while still live`, undefined)
+              if (!live) tracked.delete(identity.pid)
+            } catch (cause) {
+              if (!isMissingProcess(cause))
+                recordError(errors, `failed to confirm containment member ${identity.pid} absence`, cause)
+            }
+            return !complete
+          })
+      scanComplete = complete
+      emptyScans = complete && tracked.size === 0 ? emptyScans + 1 : 0
     } catch (cause) {
+      scanComplete = false
       emptyScans = 0
       recordError(errors, `failed to inspect containment for process ${child.pid}`, cause)
     }
   }
   return serializeTracker({
-    scan: async () => {
-      await scan()
+    scan: async (deadline) => {
+      await scan(deadline)
       return Array.from(tracked.values())
     },
-    stop: async () => {
-      await scan()
-      if (errors.length || tracked.size || emptyScans < quiescenceScans) {
+    scanComplete: () => scanComplete,
+    stop: async (deadline) => {
+      await scan(deadline)
+      if (errors.length || !scanComplete || tracked.size || emptyScans < quiescenceScans) {
         recordError(errors, `containment ${containment} was not quiescent before removal`, undefined)
         return
       }
@@ -455,11 +545,55 @@ function trackContainedProcess(
       }
     },
     signal: async (signal, deadline, mark) => {
-      await scan()
+      await scan(deadline)
       Array.from(tracked.values()).forEach((identity) => signalExact(identity, inspect, signal, deadline, mark, errors))
     },
     errors,
   })
+}
+
+export async function linuxCgroupDiscoveryDeadlineForTest() {
+  let now = 0
+  let memberInspections = 0
+  let missingMemberInspections = 0
+  let initial = true
+  const tracker = trackContainedProcess(
+    { pid: 42 },
+    "test",
+    "/synthetic",
+    {
+      now: () => now,
+      members: () => (initial ? Array.from({ length: 64 }, (_, index) => index + 100) : []),
+      snapshot: (pid) => {
+        if (initial) memberInspections += 1
+        if (!initial) {
+          missingMemberInspections += 1
+          now += 100
+          return
+        }
+        return {
+          pid,
+          parent: 1,
+          group: 42,
+          started: `started:${pid}`,
+          executable: "synthetic",
+          containment: "",
+          nonce: true,
+        }
+      },
+      containmentForPID: () => "test",
+    },
+  )
+  await tracker.scan(1_000)
+  initial = false
+  const deadline = 1_000
+  await tracker.scan(deadline)
+  return {
+    memberInspections,
+    missingMemberInspections,
+    complete: tracker.scanComplete?.(),
+    escalationRemaining: deadline - now,
+  }
 }
 
 function trackPortableProcess(
@@ -473,6 +607,9 @@ function trackPortableProcess(
     readonly exists?: (pid: number, deadline: number) => Promise<boolean>
     readonly broadDiscovery?: boolean
     readonly send?: (pid: number, signal: "SIGINT" | "SIGTERM" | "SIGKILL") => void
+    readonly abort?: () => void | Promise<void>
+    readonly controller?: PortableController
+    readonly onSignalPath?: (path: "signal" | "signalKnown", signal: "SIGINT" | "SIGTERM" | "SIGKILL") => void
   },
 ): ProcessTracker {
   const tracked = new Map<number, ProcessIdentity>()
@@ -566,13 +703,18 @@ function trackPortableProcess(
     scanComplete: () => scanComplete,
     hasKnown: () => tracked.size > 0,
     broadDiscovery: options?.broadDiscovery ?? process.platform === "darwin",
-    stop: async () => {},
+    stop: async (deadline = Date.now() + 4_000) => {
+      if (!options?.controller) return
+      await finalizePortableController(options.controller, deadline, errors)
+    },
     signalKnown: async (signal, deadline, mark) => {
+      options?.onSignalPath?.("signalKnown", signal)
       for (const identity of tracked.values()) {
         await signalPortableExact(identity, inspectKnown, signal, deadline, mark, errors, options?.send)
       }
     },
     signal: async (signal, deadline, mark) => {
+      options?.onSignalPath?.("signal", signal)
       await signalPortableTargets(
         Array.from(tracked.values()),
         async (discoveryDeadline) => {
@@ -586,6 +728,19 @@ function trackPortableProcess(
         errors,
         options?.send,
       )
+    },
+    handoff: async (identity) => {
+      if (
+        identity.pid !== child.pid ||
+        identity.started !== gateRoot.started ||
+        identity.containment !== gateRoot.containment
+      )
+        throw new Error(`portable gate PID ${child.pid} changed identity during exec handoff`)
+      awaitingGateExec = false
+      tracked.set(identity.pid, identity)
+    },
+    abort: async () => {
+      await options?.abort?.()
     },
     errors,
   })
@@ -728,11 +883,11 @@ type DarwinFinalizerRealChildResult = {
 }
 
 export function darwinFinalizerDiscoveryForTest(
-  kind: "slow-probes" | "partial-prefix" | "long-prefix",
+  kind: "slow-probes" | "partial-prefix" | "long-prefix" | "exited-root",
 ): Promise<DarwinFinalizerSyntheticResult>
 export function darwinFinalizerDiscoveryForTest(kind: "initial-observation-failure"): Promise<DarwinFinalizerRealChildResult>
 export async function darwinFinalizerDiscoveryForTest(
-  kind: "slow-probes" | "partial-prefix" | "long-prefix" | "initial-observation-failure",
+  kind: "slow-probes" | "partial-prefix" | "long-prefix" | "exited-root" | "initial-observation-failure",
 ): Promise<DarwinFinalizerSyntheticResult | DarwinFinalizerRealChildResult> {
   const root = {
     pid: 42,
@@ -830,9 +985,12 @@ export async function darwinFinalizerDiscoveryForTest(
   let descendantSeen = false
   let known: ProcessIdentity[] = [root]
   let resolveExit: (code: number) => void = () => {}
-  const exited = new Promise<number>((resolve) => {
-    resolveExit = resolve
-  })
+  const exited =
+    kind === "exited-root"
+      ? Promise.resolve(0)
+      : new Promise<number>((resolve) => {
+          resolveExit = resolve
+        })
   const reaped = exited.then((code) => {
     events.push("child.reaped")
     return code
@@ -863,6 +1021,10 @@ export async function darwinFinalizerDiscoveryForTest(
     broadDiscovery: true,
     signalKnown: async (signal) => {
       known.forEach((identity) => {
+        if (kind === "exited-root" && identity.pid === root.pid) {
+          known = known.filter((candidate) => candidate.pid !== root.pid)
+          return
+        }
         events.push(`${signal}:${identity.pid}`)
         if (signal !== "SIGKILL") return
         if (identity.pid === root.pid) resolveExit(0)
@@ -916,6 +1078,472 @@ async function portableSnapshot(
   throw new Error(`Linux nonce-authorized process ${pid} could not be reconciled before deadline`)
 }
 
+type PortableLaunchObservation =
+  | { readonly _tag: "pending" }
+  | { readonly _tag: "ready"; readonly target: ProcessSnapshot }
+  | { readonly _tag: "exited" }
+  | { readonly _tag: "conflict"; readonly message: string }
+  | { readonly _tag: "deadline" }
+
+type PortableCleanupHandoff =
+  | { readonly _tag: "ready" }
+  | { readonly _tag: "exited" }
+  | { readonly _tag: "unresolved" }
+
+// Reconciliation is diagnostic and must not consume the containment work that
+// follows it. These slices leave deterministic room for every finalizer phase.
+const portableCleanupObservationSliceMs = 250
+const portableCleanupTermReserveMs = 500
+const portableCleanupKillReserveMs = 500
+const portableCleanupReapReserveMs = 1_000
+const portableCleanupDescendantReserveMs = 1_000
+const portableCleanupContainmentReserveMs =
+  portableCleanupTermReserveMs +
+  portableCleanupKillReserveMs +
+  portableCleanupReapReserveMs +
+  portableCleanupDescendantReserveMs
+// The controller protocol runs after ordinary target cleanup. Keep a separate
+// window for an identity-checked group KILL and proof that its target group
+// drained; a durable marker alone cannot prove either operation happened.
+const portableControllerFallbackReserveMs = 1_000
+// Acquisition cleanup may begin before the tracker exists. Bound status-file
+// retries independently so direct-gate TERM plus controller group KILL/reap
+// still have an explicit window if that status path is permanently opaque.
+const portableControllerStatusRecoverySliceMs = 250
+const portableControllerAcquisitionReserveMs = portableCleanupTermReserveMs + portableControllerFallbackReserveMs
+
+function portableControllerRecoveryDeadline(deadline: number, now = Date.now()) {
+  return Math.min(deadline - portableControllerAcquisitionReserveMs, now + portableControllerStatusRecoverySliceMs)
+}
+
+function windowsJobCleanupPhases(deadline: number, now = Date.now()) {
+  const drainDeadline = Math.min(deadline - windowsJobFallbackReserveMs, now + windowsJobDrainReserveMs)
+  return {
+    drainDeadline,
+    inspectionDeadline: Math.min(deadline - windowsJobContainmentReserveMs, drainDeadline + windowsJobInspectionReserveMs),
+    reapDeadline: deadline - windowsJobContainmentReserveMs,
+    fallbackDeadline: deadline,
+  }
+}
+
+export function windowsJobCleanupPhasesForTest(deadline: number, now: number) {
+  return windowsJobCleanupPhases(deadline, now)
+}
+
+function portableCleanupObservationDeadline(deadline: number, now = Date.now()) {
+  return Math.min(
+    deadline - portableCleanupContainmentReserveMs,
+    now + portableCleanupObservationSliceMs,
+  )
+}
+
+export function portableCleanupReserveForTest(deadline: number, now: number) {
+  return {
+    observationDeadline: portableCleanupObservationDeadline(deadline, now),
+    containmentReserve: portableCleanupContainmentReserveMs,
+    termReserve: portableCleanupTermReserveMs,
+    killReserve: portableCleanupKillReserveMs,
+    reapReserve: portableCleanupReapReserveMs,
+    descendantReserve: portableCleanupDescendantReserveMs,
+  }
+}
+
+async function acquirePortableGate(
+  pid: number,
+  nonce: string,
+  deadline: number,
+  exited: () => "pending" | "exited" | "failed",
+  observe: PortableObserve = portableSnapshot,
+): Promise<PortableLaunchObservation> {
+  while (Date.now() < deadline) {
+    try {
+      // A short direct observation keeps a transient /proc or procargs failure
+      // from consuming the whole admission window. The nonce and native
+      // creation token are still checked by portableSnapshot before ownership
+      // crosses into the tracker.
+      const current = await observePortable(
+        observe,
+        pid,
+        nonce,
+        Math.min(deadline, Date.now() + 250),
+        true,
+        "initial",
+      )
+      if (current) {
+        if (current.group !== pid || !current.nonce)
+          return { _tag: "conflict", message: `portable gate PID ${pid} changed identity before launch` }
+        return { _tag: "ready", target: current }
+      }
+    } catch {
+      // A nonce read or native observation can be transient while the gate is
+      // starting. Only an observed identity mismatch is a launch conflict.
+    }
+    const state = exited()
+    if (state === "exited") return { _tag: "exited" }
+    if (state === "failed") return { _tag: "conflict", message: `failed to observe portable process ${pid} exit` }
+    await Bun.sleep(5)
+  }
+  return { _tag: "deadline" }
+}
+
+async function handoffPortableCleanupTarget(
+  tracker: ProcessTracker,
+  gate: ProcessSnapshot,
+  nonce: string,
+  deadline: number,
+  exited: () => "pending" | "exited" | "failed",
+  errors: Error[],
+  observe: PortableObserve = portableSnapshot,
+): Promise<PortableCleanupHandoff> {
+  if (!tracker.handoff) return { _tag: "unresolved" }
+  let observationError: unknown
+  const observationDeadline = portableCleanupObservationDeadline(deadline)
+  while (Date.now() < observationDeadline) {
+    try {
+      const current = await observePortable(observe, gate.pid, nonce, observationDeadline, true, "cleanup")
+      if (!current) {
+        if (exited() === "exited") return { _tag: "exited" }
+        await Bun.sleep(5)
+        continue
+      }
+      if (
+        current.started !== gate.started ||
+        current.group !== gate.group ||
+        current.group !== gate.pid ||
+        !current.nonce
+      ) {
+        recordError(errors, `portable gate PID ${gate.pid} identity changed during acquisition cleanup`, undefined)
+        return { _tag: "unresolved" }
+      }
+      // The shell's `exec` retains the PID and creation token while replacing
+      // its executable. Adopt that exact, freshly nonce-authorized target
+      // before TERM/KILL so tracker cleanup cannot retain the old shell image.
+      if (current.executable !== gate.executable) await tracker.handoff(current)
+      return { _tag: "ready" }
+    } catch (cause) {
+      observationError = cause
+      if (exited() === "exited") return { _tag: "exited" }
+      await Bun.sleep(5)
+    }
+  }
+  if (observationError)
+    recordError(errors, `failed to reconcile portable gate PID ${gate.pid} during acquisition cleanup`, observationError)
+  return { _tag: "unresolved" }
+}
+
+// This is deliberately a direct-PID protocol. Broad nonce discovery is for
+// cleanup only: using it to decide that the launch gate may open made a busy
+// Darwin /proc walk both a readiness dependency and a PID-reuse window.
+async function reconcilePortableLaunch(
+  pid: number,
+  nonce: string,
+  gate: ProcessSnapshot,
+  deadline: number,
+  exited: () => "pending" | "exited" | "failed",
+  observe: PortableObserve = portableSnapshot,
+): Promise<PortableLaunchObservation> {
+  if (Date.now() >= deadline) return { _tag: "deadline" }
+  const current = await observePortable(observe, pid, nonce, deadline, true, "reconcile")
+  if (!current) {
+    const state = exited()
+    if (state === "exited") return { _tag: "exited" }
+    if (state === "failed") return { _tag: "conflict", message: `failed to observe portable process ${pid} exit` }
+    return { _tag: "pending" }
+  }
+  if (
+    current.started !== gate.started ||
+    current.group !== gate.group ||
+    current.group !== pid ||
+    !current.nonce
+  )
+    return { _tag: "conflict", message: `portable gate PID ${pid} changed identity before launch` }
+  if (current.executable === gate.executable) return { _tag: "pending" }
+  return { _tag: "ready", target: current }
+}
+
+export async function portableLaunchReconciliationForTest(
+  states: readonly (ProcessSnapshot | undefined)[],
+  exit: "pending" | "exited" | "failed" = "pending",
+  deadline = Date.now() + 1_000,
+) {
+  let next = 0
+  const gate = {
+    pid: 42,
+    parent: 1,
+    group: 42,
+    started: "started",
+    executable: "gate",
+    containment: "nonce:test",
+    nonce: true,
+  } satisfies ProcessSnapshot
+  return reconcilePortableLaunch(42, "test", gate, deadline, () => exit, async () => states[next++])
+}
+
+async function signalPortableGateGroup(
+  gate: ProcessSnapshot,
+  nonce: string,
+  signal: "SIGTERM" | "SIGKILL",
+  deadline: number,
+  errors: Error[],
+  observe: (pid: number, nonce: string, deadline: number, confirmedNonce?: boolean) => Promise<ProcessSnapshot | undefined> =
+    portableSnapshot,
+  send: (pid: number, signal: "SIGTERM" | "SIGKILL") => void = (pid, name) => process.kill(pid, name),
+) {
+  try {
+    const current = await observe(gate.pid, nonce, deadline, true)
+    if (!current) return
+    if (
+      current.started !== gate.started ||
+      current.executable !== gate.executable ||
+      current.group !== gate.group ||
+      current.group !== gate.pid
+    ) {
+      recordError(errors, `portable gate PID ${gate.pid} identity changed before ${signal}`, undefined)
+      return
+    }
+    send(-gate.group, signal)
+  } catch (cause) {
+    if (!isMissingProcess(cause)) recordError(errors, `failed to signal portable gate group ${gate.group} with ${signal}`, cause)
+  }
+}
+
+async function signalPortableControllerGroup(
+  controller: PortableController,
+  signal: "SIGKILL",
+  deadline: number,
+  errors: Error[],
+) {
+  try {
+    const current = await portableSnapshot(controller.identity.pid, controller.nonce, deadline, true)
+    if (!current) return
+    if (
+      current.started !== controller.identity.started ||
+      current.executable !== controller.identity.executable ||
+      current.group !== controller.identity.group
+    ) {
+      recordError(errors, `portable controller PID ${controller.identity.pid} changed identity before ${signal}`, undefined)
+      return
+    }
+    process.kill(-current.group, signal)
+  } catch (cause) {
+    if (!isMissingProcess(cause))
+      recordError(errors, `failed to signal portable controller group ${controller.identity.group} with ${signal}`, cause)
+  }
+}
+
+type PortableControllerCompletion = {
+  readonly acknowledged: boolean
+  readonly killIssued: boolean
+  readonly failed: boolean
+  readonly controllerExited: boolean
+  readonly targetExited: boolean
+  readonly groupDrained: boolean
+  readonly killFinished: boolean
+}
+
+async function portableIdentityExited(identity: ProcessSnapshot, deadline: number, errors: Error[], name: string) {
+  try {
+    if (Date.now() >= deadline) return false
+    const current =
+      process.platform === "linux" ? linuxSnapshot(identity.pid) : await darwinNativeSnapshot(identity.pid)
+    if (!current) return true
+    if (current.started !== identity.started) return true
+    if (current.group !== identity.group)
+      recordError(errors, `portable ${name} PID ${identity.pid} changed group during finalization`, undefined)
+    return false
+  } catch (cause) {
+    recordError(errors, `failed to verify portable ${name} ${identity.pid} exit during finalization`, cause)
+    return false
+  }
+}
+
+async function portableGroupDrained(group: number, deadline: number, errors: Error[]) {
+  try {
+    if (process.platform === "linux")
+      return !readdirSync("/proc")
+        .filter((entry) => /^\d+$/.test(entry))
+        .some((entry) => {
+          if (Date.now() >= deadline) return true
+          return linuxSnapshot(Number(entry))?.group === group
+        })
+    const output = await commandOutput(["ps", "-axo", "pid=,pgid="], deadline)
+    return !output.split("\n").some((line) => {
+      const [pid, observed] = line.trim().split(/\s+/)
+      return /^\d+$/.test(pid ?? "") && Number(observed) === group
+    })
+  } catch (cause) {
+    recordError(errors, `failed to verify portable group ${group} drain during finalization`, cause)
+    return false
+  }
+}
+
+async function finalizePortableController(controller: PortableController, deadline: number, errors: Error[]) {
+  const priorErrors = errors.length
+  const state = () => {
+    try {
+      const completion = controller.filesystem.exists(controller.completion)
+        ? controller.filesystem.read(controller.completion)
+        : ""
+      return {
+        acknowledged: controller.filesystem.exists(controller.acknowledgement),
+        killIssued: completion === "kill-issued",
+        failed: completion === "failed",
+      }
+    } catch (cause) {
+      recordError(errors, `failed to read portable controller completion for ${controller.identity.pid}`, cause)
+      return { acknowledged: false, killIssued: false, failed: false }
+    }
+  }
+  const completion = async (limit: number): Promise<PortableControllerCompletion> => {
+    const marker = state()
+    const [controllerExited, targetExited, groupDrained] = await Promise.all([
+      portableIdentityExited(controller.identity, limit, errors, "controller"),
+      controller.target ? portableIdentityExited(controller.target, limit, errors, "target") : Promise.resolve(true),
+      portableGroupDrained(controller.identity.group, limit, errors),
+    ])
+    return {
+      ...marker,
+      controllerExited,
+      targetExited,
+      groupDrained,
+      // kill-issued is only an intent record. A KILL finishes only once the
+      // protected controller is gone and neither its direct target nor group
+      // has a surviving member.
+      killFinished: marker.killIssued && controllerExited && targetExited && groupDrained,
+    }
+  }
+  const wait = async (limit: number) => {
+    while (Date.now() < limit) {
+      const current = await completion(Math.min(limit, Date.now() + 250))
+      if (current.failed || (current.acknowledged && current.killFinished)) return current
+      await Bun.sleep(5)
+    }
+    return completion(limit)
+  }
+  let aborted = true
+  try {
+    // This write is intentionally the tracker\'s only immediate controller
+    // action. The controller retains the verified PGID and performs TERM/KILL
+    // itself, so no stale PID or group escapes this ownership boundary.
+    ;(controller.filesystem.write ?? writeFileSync)(controller.abort, "abort")
+  } catch (cause) {
+    aborted = false
+    recordError(errors, `failed to write portable controller abort for ${controller.identity.pid}`, cause)
+  }
+  const grace = Math.min(deadline - portableControllerFallbackReserveMs, Date.now() + 750)
+  const completed = aborted ? await wait(grace) : undefined
+  if (!(completed?.acknowledged && completed.killFinished)) {
+    // A sleeping or wedged controller cannot leave its group alive forever.
+    // Revalidate the controller\'s immutable identity immediately before the
+    // parent performs the same group KILL as the controller would have.
+    controller.onFallback?.()
+    await signalPortableControllerGroup(controller, "SIGKILL", deadline, errors)
+  }
+  const final = await wait(deadline)
+  if (!final.acknowledged)
+    recordError(errors, `portable controller ${controller.identity.pid} did not acknowledge abort before cleanup deadline`, undefined)
+  if (!final.killIssued)
+    recordError(errors, `portable controller ${controller.identity.pid} did not issue its bounded group KILL before cleanup deadline`, undefined)
+  if (final.failed)
+    recordError(errors, `portable controller ${controller.identity.pid} failed its bounded group KILL`, undefined)
+  if (!final.controllerExited)
+    recordError(errors, `portable controller ${controller.identity.pid} did not exit after group KILL`, undefined)
+  if (controller.target && !final.targetExited)
+    recordError(errors, `portable target ${controller.target.pid} did not exit after group KILL`, undefined)
+  if (!final.groupDrained)
+    recordError(errors, `portable controller group ${controller.identity.group} did not drain after group KILL`, undefined)
+  if (errors.length > priorErrors) return
+  controller.controls.forEach((file) => {
+    try {
+      if (controller.filesystem.exists(file)) controller.filesystem.unlink(file)
+    } catch (cause) {
+      recordError(errors, `failed to remove portable controller control ${file}`, cause)
+    }
+  })
+}
+
+export async function portableGateEscalationForTest(changedIdentity = false) {
+  const gate = {
+    pid: 42,
+    parent: 1,
+    group: 42,
+    started: "started",
+    executable: "gate",
+    containment: "nonce:test",
+    nonce: true,
+  } satisfies ProcessSnapshot
+  const errors: Error[] = []
+  const events: string[] = []
+  const observe = async () => (changedIdentity ? { ...gate, started: "reused" } : gate)
+  const send = (pid: number, signal: "SIGTERM" | "SIGKILL") => events.push(`${signal}:${pid}`)
+  await signalPortableGateGroup(gate, "test", "SIGTERM", Date.now() + 1_000, errors, observe, send)
+  await signalPortableGateGroup(gate, "test", "SIGKILL", Date.now() + 1_000, errors, observe, send)
+  return { events, errors }
+}
+
+// Exercise the production portable tracker after the same direct-PID exec
+// reconciliation used by spawnTracked. Without the handoff, signalKnown sees
+// the gate executable and rejects the running program as an identity change.
+export async function portableTrackerHandoffCleanupForTest() {
+  const gate = {
+    pid: 42,
+    parent: 1,
+    group: 42,
+    started: "started",
+    executable: "gate",
+    containment: "nonce:test",
+    nonce: true,
+  } satisfies ProcessSnapshot
+  const target = { ...gate, executable: "opencode" }
+  const events: string[] = []
+  const tracker = trackPortableProcess({ pid: 42 }, "test", gate, {
+    broadDiscovery: true,
+    inspectKnown: async () => target,
+    send: (_pid, signal) => events.push(`${signal}:${target.executable}`),
+  })
+  if (!tracker.handoff || !tracker.signalKnown) throw new Error("portable tracker lacks known-target handoff cleanup")
+  await tracker.handoff(target)
+  await tracker.signalKnown("SIGTERM", Date.now() + 1_000, () => {})
+  await tracker.signalKnown("SIGKILL", Date.now() + 1_000, () => {})
+  return { events, errors: tracker.errors }
+}
+
+export async function portableFailedReconciliationCleanupHandoffForTest() {
+  const gate = {
+    pid: 42,
+    parent: 1,
+    group: 42,
+    started: "started",
+    executable: "gate",
+    containment: "nonce:test",
+    nonce: true,
+  } satisfies ProcessSnapshot
+  const target = { ...gate, executable: "opencode" }
+  const events: string[] = []
+  const cleanupErrors: Error[] = []
+  const tracker = trackPortableProcess({ pid: 42 }, "test", gate, {
+    broadDiscovery: true,
+    inspectKnown: async () => target,
+    send: (_pid, signal) => events.push(`${signal}:${target.executable}`),
+  })
+  if (!tracker.signalKnown) throw new Error("portable tracker lacks known-target cleanup")
+  await reconcilePortableLaunch(42, "test", gate, Date.now() + 1_000, () => "pending", async () => {
+    throw new Error("synthetic reconciliation failure")
+  }).catch(() => undefined)
+  await handoffPortableCleanupTarget(
+    tracker,
+    gate,
+    "test",
+    Date.now() + 4_000,
+    () => "pending",
+    cleanupErrors,
+    async () => target,
+  )
+  await tracker.signalKnown("SIGTERM", Date.now() + 1_000, () => {})
+  await tracker.signalKnown("SIGKILL", Date.now() + 1_000, () => {})
+  return { events, errors: [...tracker.errors, ...cleanupErrors] }
+}
+
 async function portableSnapshots(
   nonce: string,
   deadline = Date.now() + 4_000,
@@ -924,23 +1552,29 @@ async function portableSnapshots(
 ): Promise<PortableSnapshots> {
   if (process.platform === "linux") {
     const errors: Error[] = []
-    const snapshots = readdirSync("/proc")
-      .filter((entry) => /^\d+$/.test(entry))
-      .flatMap((entry) => {
-        const pid = Number(entry)
-        try {
-          if (!linuxHasNonce(pid, nonce)) return []
-          const snapshot = linuxSnapshot(pid)
-          return snapshot ? [{ ...snapshot, containment: `nonce:${nonce}`, nonce: true }] : []
-        } catch (cause) {
-          // A failed read after the environment proves this is ours is
-          // material: retain every other healthy member, but never certify
-          // the launch quiescent while a nonce-authorized snapshot is opaque.
-          recordError(errors, `failed to snapshot nonce-authorized process ${pid}`, cause)
-          return []
-        }
-      })
-    return { snapshots, errors, complete: true }
+    const discoveryDeadline = Math.min(deadline, Date.now() + linuxProcDiscoverySliceMs)
+    if (Date.now() >= discoveryDeadline) return { snapshots: [], errors, complete: false }
+    let complete = true
+    const snapshots = readdirSync("/proc").flatMap((entry) => {
+      if (Date.now() >= discoveryDeadline) {
+        complete = false
+        return []
+      }
+      if (!/^\d+$/.test(entry)) return []
+      const pid = Number(entry)
+      try {
+        if (!linuxHasNonce(pid, nonce)) return []
+        const snapshot = linuxSnapshot(pid)
+        return snapshot ? [{ ...snapshot, containment: `nonce:${nonce}`, nonce: true }] : []
+      } catch (cause) {
+        // A failed read after the environment proves this is ours is
+        // material: retain every other healthy member, but never certify
+        // the launch quiescent while a nonce-authorized snapshot is opaque.
+        recordError(errors, `failed to snapshot nonce-authorized process ${pid}`, cause)
+        return []
+      }
+    })
+    return { snapshots, errors, complete }
   }
   if (process.platform !== "darwin")
     throw new Error(`portable process containment is unsupported on ${process.platform}`)
@@ -994,6 +1628,58 @@ async function portableSnapshots(
   } catch (cause) {
     return { snapshots: [], errors: [new Error("failed to enumerate macOS processes", { cause })], complete: false }
   }
+}
+
+async function discoverPortableController(nonce: string, group: number, deadline: number) {
+  let failure: unknown
+  while (Date.now() < deadline) {
+    const result = await portableSnapshots(nonce, deadline)
+    const candidates = result.snapshots.filter((snapshot) => snapshot.nonce && snapshot.group === group)
+    // The controller's private nonce is inherited by its ordinary shell
+    // children (including `sleep`). The durable authority is the unique root
+    // of that nonce-bearing family in the verified launch group, not an
+    // arbitrary individual match. A second root remains ambiguous: it may be
+    // an unrelated process that forged the nonce, so never select either.
+    const authorities = portableControllerAuthorities(candidates)
+    if (result.complete && result.errors.length === 0 && authorities.length === 1) return authorities[0]
+    if (authorities.length > 1)
+      failure = new Error(`portable controller discovery found multiple nonce-authorized authorities in group ${group}`)
+    else if (candidates.length)
+      failure = new Error(`portable controller discovery could not identify one nonce-authorized authority in group ${group}`)
+    else failure = result.errors[0] ?? new Error(`portable controller was not yet visible in group ${group}`)
+    if (Date.now() < deadline) await Bun.sleep(5)
+  }
+  throw new Error(`portable controller could not be independently discovered in group ${group}`, { cause: failure })
+}
+
+function portableControllerAuthorities(candidates: readonly ProcessSnapshot[]) {
+  const candidatePIDs = new Set(candidates.map((candidate) => candidate.pid))
+  return candidates.filter((candidate) => !candidatePIDs.has(candidate.parent))
+}
+
+export function portableControllerAuthorityForTest() {
+  const controller = {
+    pid: 42,
+    parent: 1,
+    group: 7,
+    started: "controller",
+    executable: "controller",
+    containment: "nonce:test",
+    nonce: true,
+  } satisfies ProcessSnapshot
+  const child = { ...controller, pid: 43, parent: controller.pid, started: "child", executable: "sleep" }
+  const forgery = { ...controller, pid: 44, started: "forgery", executable: "forgery" }
+  const descendantAuthorities = portableControllerAuthorities([controller, child])
+  const forgeryAuthorities = portableControllerAuthorities([controller, child, forgery])
+  return {
+    descendantAuthority: descendantAuthorities.length === 1 ? descendantAuthorities[0]?.pid : undefined,
+    forgeryAuthority: forgeryAuthorities.length === 1 ? forgeryAuthorities[0]?.pid : undefined,
+  }
+}
+
+export async function linuxProcDiscoveryDeadlineForTest() {
+  if (process.platform !== "linux") throw new Error("Linux /proc discovery regression requires Linux")
+  return portableSnapshots("test", Date.now())
 }
 
 function readNulString(bytes: Uint8Array, position: number) {
@@ -1055,6 +1741,9 @@ export function darwinProbeDeadlineForTest(deadline: number) {
 }
 
 async function darwinProcArgs(pid: number, deadline: number, onSpawn?: (pid: number) => void) {
+  // This is called from a bounded discovery slice. Every owned helper action,
+  // including its failure cleanup, inherits that same slice.
+  const probeDeadline = darwinProbeDeadline(deadline)
   let child: ReturnType<typeof Bun.spawn>
   let identity: Omit<ProcessSnapshot, "nonce" | "containment"> | undefined
   try {
@@ -1085,13 +1774,13 @@ async function darwinProcArgs(pid: number, deadline: number, onSpawn?: (pid: num
       identity,
       stdout,
       stderr,
+      probeDeadline,
       cause instanceof Error ? cause : new Error(`failed to set up macOS process ${pid} argument observation`, { cause }),
     )
   }
   // A single inaccessible unrelated PID must not consume the launch-wide
   // discovery budget. A nonce target that was already observed is handled by
   // darwinSnapshot's fail-closed path instead of being retried indefinitely.
-  const probeDeadline = darwinProbeDeadline(deadline)
   const remaining = probeDeadline - Date.now()
   if (remaining <= 0)
     return cleanupDarwinProcArgs(
@@ -1099,6 +1788,7 @@ async function darwinProcArgs(pid: number, deadline: number, onSpawn?: (pid: num
       identity,
       stdout,
       stderr,
+      probeDeadline,
       new Error("macOS process acquisition deadline elapsed before reading environment"),
     )
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -1117,6 +1807,7 @@ async function darwinProcArgs(pid: number, deadline: number, onSpawn?: (pid: num
       identity,
       stdout,
       stderr,
+      probeDeadline,
       cause instanceof Error ? cause : new Error(`failed to read macOS process ${pid} arguments`, { cause }),
     )
   } finally {
@@ -1155,25 +1846,28 @@ async function cleanupDarwinProcArgs(
   identity: Omit<ProcessSnapshot, "nonce" | "containment"> | undefined,
   stdout: Promise<Uint8Array> | undefined,
   stderr: Promise<Uint8Array> | undefined,
+  deadline: number,
   operationError: Error,
 ): Promise<never> {
   const cleanupErrors: Error[] = []
-  const reserveDeadline = Date.now() + 4_000
+  const reserveDeadline = deadline
   const signal = async (name: "SIGTERM" | "SIGKILL") => {
     try {
       // The Bun handle belongs to this helper even if native identity capture
       // failed. It is the only safe pre-identity escape hatch and keeps a
       // synchronous getter failure from leaking the probe.
-      if (!identity) {
-        child.kill(name)
+      if (!identity || Date.now() >= reserveDeadline) {
+        child.kill(Date.now() >= reserveDeadline ? "SIGKILL" : name)
         return
       }
       const current = await darwinNativeSnapshot(child.pid)
       if (!current) return
       if (!sameDarwinInstance(identity, current))
         throw new Error(`macOS argument probe ${child.pid} identity changed before ${name}`)
-      if (Date.now() >= reserveDeadline)
-        throw new Error(`cleanup deadline elapsed after inspecting macOS argument probe ${child.pid}`)
+      if (Date.now() >= reserveDeadline) {
+        child.kill("SIGKILL")
+        return
+      }
       process.kill(child.pid, name)
     } catch (cause) {
       if (!isMissingProcess(cause))
@@ -1181,7 +1875,9 @@ async function cleanupDarwinProcArgs(
     }
   }
   await signal("SIGTERM")
-  const termWait = Math.min(2_000, Math.max(reserveDeadline - Date.now(), 0))
+  // Leave the remainder of the inherited slice for a hard kill and stream
+  // closure; a TERM-resistant sysctl helper must not consume that reserve.
+  const termWait = Math.min(50, Math.max(reserveDeadline - Date.now(), 0))
   if (!(await exitedWithin(child, termWait, "after macOS argument probe SIGTERM", cleanupErrors))) {
     await signal("SIGKILL")
     if (
@@ -1427,13 +2123,32 @@ async function commandOutput(command: string[], deadline: number) {
   return result.stdout
 }
 
-async function commandResult(command: string[], deadline: number) {
+const commandHelperCleanupReserveMs = 1_000
+
+type CommandFilesystem = {
+  readonly exists: (file: string) => boolean
+  readonly read: (file: string) => string
+  readonly write: (file: string, contents: string) => void
+  readonly unlink: (file: string) => void
+}
+
+type CommandHelperTestOptions = {
+  readonly filesystem?: CommandFilesystem
+  readonly onControls?: (controls: readonly string[]) => void
+}
+
+async function commandResult(command: string[], deadline: number, test?: CommandHelperTestOptions) {
   if (Date.now() >= deadline) throw new Error(`cleanup deadline elapsed before ${command[0]}`)
+  const filesystem =
+    test?.filesystem ??
+    ({ exists: existsSync, read: (file) => readFileSync(file, "utf8"), write: writeFileSync, unlink: unlinkSync } satisfies CommandFilesystem)
   const nonce = crypto.randomUUID()
   const status = path.join(os.tmpdir(), `opencode-command-status-${nonce}`)
   const pendingStatus = `${status}.pending`
   const release = path.join(os.tmpdir(), `opencode-command-release-${nonce}`)
   const abort = path.join(os.tmpdir(), `opencode-command-abort-${nonce}`)
+  const abortAcknowledgement = `${abort}.ack`
+  const controls = [status, pendingStatus, release, abort, abortAcknowledgement]
   // On POSIX the directly spawned shell remains the leader of its dedicated
   // session until this caller releases it. Its watcher is therefore an
   // ownership capability established at spawn: it can kill its own live
@@ -1445,16 +2160,18 @@ async function commandResult(command: string[], deadline: number) {
       : [
           "/bin/sh",
           "-c",
-          'status="$1" pending="$2" release="$3" abort="$4"; shift 4; (while [ ! -e "$release" ] && [ ! -e "$abort" ]; do sleep 0.01; done; [ -e "$abort" ] && kill -KILL -$$) >/dev/null 2>&1 & watcher=$!; "$@" & command=$!; wait "$command"; code=$?; printf "%s\\n" "$code" > "$pending" && mv -f "$pending" "$status"; exec 1>&-; while [ ! -e "$release" ] && [ ! -e "$abort" ]; do sleep 0.01; done; kill "$watcher" 2>/dev/null || :; [ -e "$abort" ] && kill -KILL -$$; exit "$code"',
+          'status="$1" pending="$2" release="$3" abort="$4" acknowledged="$5"; shift 5; (while [ ! -e "$release" ] && [ ! -e "$abort" ]; do sleep 0.01; done; if [ -e "$abort" ]; then printf "aborted\\n" > "$acknowledged"; kill -KILL -$$; fi) >/dev/null 2>&1 & watcher=$!; "$@" & command=$!; wait "$command"; code=$?; printf "%s\\n" "$code" > "$pending" && mv -f "$pending" "$status"; exec 1>&-; while [ ! -e "$release" ] && [ ! -e "$abort" ]; do sleep 0.01; done; if [ -e "$abort" ]; then printf "aborted\\n" > "$acknowledged"; kill -KILL -$$; fi; kill "$watcher" 2>/dev/null || :; exit "$code"',
           "--",
           status,
           pendingStatus,
           release,
           abort,
+          abortAcknowledgement,
           ...command,
         ],
     { stdout: "pipe", stderr: "ignore", detached: process.platform !== "win32" },
   )
+  test?.onControls?.(controls)
   // The child is owned as soon as spawn returns. Keep every subsequent setup
   // step inside the finalizer boundary: even a hostile synchronous getter or
   // then accessor must fall through to the abort-and-reap reserve below.
@@ -1484,11 +2201,11 @@ async function commandResult(command: string[], deadline: number) {
         const [exitCode, output] = await Promise.all([ownedExited, ownedStdout])
         return { exitCode, stdout: output }
       }
-      while (!existsSync(status)) {
+      while (!filesystem.exists(status)) {
         if (Date.now() >= deadline) throw new Error(`${command[0]} did not exit before the cleanup deadline`)
         await new Promise<void>((resolve) => setTimeout(resolve, 5))
       }
-      const exitCode = commandStatus(readFileSync(status, "utf8"))
+      const exitCode = commandStatus(filesystem.read(status))
       if (exitCode === undefined) throw new Error(`${command[0]} returned an invalid exit status`)
       // Keep the helper watchdog armed until every inherited stdout writer
       // closes. The drain is already concurrent, so this cannot deadlock on a
@@ -1496,7 +2213,7 @@ async function commandResult(command: string[], deadline: number) {
       // inherited that pipe after its command root exited.
       const output = await ownedStdout
       if (aborted) throw new Error(`${command[0]} helper operation was aborted during cleanup`)
-      writeFileSync(release, "release")
+      filesystem.write(release, "release")
       await ownedExited
       return { exitCode, stdout: output }
     }
@@ -1514,37 +2231,44 @@ async function commandResult(command: string[], deadline: number) {
   } finally {
     if (timer) clearTimeout(timer)
     const cleanupErrors: Error[] = []
+    let cleanupAcknowledged = completed
+    let cleanupReaped = completed
     if (!completed) {
       // Promise.race does not cancel `result()`. Prevent its delayed stdout
       // continuation from publishing a release after this finalizer begins.
       aborted = true
-      // The operation deadline bounds only the helper operation. Reaping a
-      // timed-out helper gets its own reserve so an elapsed read deadline
-      // cannot turn cleanup into a no-op.
-      const cleanupDeadline = Date.now() + 4_000
+      // The operation deadline protects the caller's probe. Once it expires,
+      // the owned helper still needs a small, independent interval to deliver
+      // abort, observe its acknowledgement, and reap its process group.
+      const cleanupDeadline = Date.now() + commandHelperCleanupReserveMs
       try {
-        await stopCommandChild(child, abort, cleanupDeadline)
+        cleanupAcknowledged = await stopCommandChild(child, abort, abortAcknowledgement, cleanupDeadline, filesystem)
       } catch (cause) {
         collectCleanupErrors(cleanupErrors, cause)
       }
-      if (
-        !(await exitedWithin(
-          child,
-          Math.max(cleanupDeadline - Date.now(), 0),
-          `after failed ${command[0]}`,
-          cleanupErrors,
-        ))
-      ) {
+      cleanupReaped = await exitedWithin(
+        child,
+        Math.max(cleanupDeadline - Date.now(), 0),
+        `after failed ${command[0]}`,
+        cleanupErrors,
+      )
+      if (!cleanupReaped) {
         cleanupErrors.push(new Error(`${command[0]} helper did not exit before the cleanup deadline`))
       }
     }
-    ;[status, pendingStatus, release, abort].forEach((file) => {
-      try {
-        if (existsSync(file)) unlinkSync(file)
-      } catch (cause) {
-        recordError(cleanupErrors, `failed to remove command helper control ${file}`, cause)
-      }
-    })
+    // A surviving helper may still need its abort control. Retain the whole
+    // control set unless the independent cleanup reserve observed both its
+    // acknowledgement and its captured-handle reap.
+    if (!cleanupAcknowledged || !cleanupReaped)
+      cleanupErrors.push(new Error(`${command[0]} helper controls were retained because cleanup was not acknowledged and reaped`))
+    if (cleanupAcknowledged && cleanupReaped)
+      controls.forEach((file) => {
+        try {
+          if (filesystem.exists(file)) filesystem.unlink(file)
+        } catch (cause) {
+          recordError(cleanupErrors, `failed to remove command helper control ${file}`, cause)
+        }
+      })
     if (cleanupErrors.length) {
       throw new AggregateError(
         operationError ? [operationError, ...cleanupErrors] : cleanupErrors,
@@ -1598,14 +2322,42 @@ async function drainCommandStdout(stream: ReadableStream<Uint8Array>) {
 
 // Kept narrow so the regression test exercises the production helper deadline
 // and its finalizer without exposing the helper implementation to fixtures.
-export function commandResultForTest(command: string[], timeoutMs: number) {
-  return commandResult(command, Date.now() + timeoutMs)
+export function commandResultForTest(command: string[], timeoutMs: number, test?: CommandHelperTestOptions) {
+  return commandResult(command, Date.now() + timeoutMs, test)
+}
+
+export async function commandCleanupReserveForTest() {
+  if (process.platform === "win32") throw new Error("POSIX helper cleanup regression requires a POSIX host")
+  let controls: readonly string[] = []
+  const started = Date.now()
+  const cause = await commandResult(
+    ["/bin/sh", "-c", "sleep 30"],
+    Date.now() + 25,
+    {
+      filesystem: {
+        exists: (file) => (file.endsWith(".ack") ? false : existsSync(file)),
+        read: (file) => readFileSync(file, "utf8"),
+        write: writeFileSync,
+        unlink: unlinkSync,
+      },
+      onControls: (files) => {
+        controls = files
+      },
+    },
+  ).catch((cause) => cause)
+  const retained = controls.filter((file) => file.includes("opencode-command-abort-")).every(existsSync)
+  controls.forEach((file) => {
+    if (existsSync(file)) unlinkSync(file)
+  })
+  return { cause, retained, durationMs: Date.now() - started }
 }
 
 async function stopCommandChild(
   child: Pick<ReturnType<typeof Bun.spawn>, "pid" | "kill">,
   abort: string,
+  acknowledgement: string,
   deadline: number,
+  filesystem: Pick<CommandFilesystem, "exists" | "write"> = { exists: existsSync, write: writeFileSync },
 ) {
   if (process.platform === "win32") {
     // Bun retains the native process handle for a helper it spawned, unlike a
@@ -1615,18 +2367,21 @@ async function stopCommandChild(
     } catch (cause) {
       if (!isMissingProcess(cause)) throw cause
     }
-    return
+    return true
   }
   const errors: Error[] = []
   try {
-    if (Date.now() >= deadline) throw new Error(`cleanup deadline elapsed before aborting helper ${child.pid}`)
     // The spawned group leader's watcher evaluates `$$` in its own original
     // session. A stale numeric group is never sent from this process.
-    writeFileSync(abort, "abort")
+    filesystem.write(abort, "abort")
   } catch (cause) {
     errors.push(new Error(`failed to abort helper process group ${child.pid}`, { cause }))
   }
+  while (errors.length === 0 && !filesystem.exists(acknowledgement) && Date.now() < deadline) await Bun.sleep(5)
+  if (errors.length === 0 && !filesystem.exists(acknowledgement))
+    errors.push(new Error(`helper process group ${child.pid} did not acknowledge abort before the cleanup deadline`))
   if (errors.length) throw new AggregateError(errors, `failed to stop helper process tree ${child.pid}`)
+  return true
 }
 
 function serializeTracker(tracker: ProcessTracker): ProcessTracker {
@@ -1641,8 +2396,18 @@ function serializeTracker(tracker: ProcessTracker): ProcessTracker {
   }
   return {
     scan: (deadline) => run(() => tracker.scan(deadline)),
+    scanComplete: tracker.scanComplete,
+    hasKnown: tracker.hasKnown,
+    broadDiscovery: tracker.broadDiscovery,
+    windowsJob: tracker.windowsJob,
+    jobDrained: tracker.jobDrained,
     signal: (signal, deadline, mark) => run(() => tracker.signal(signal, deadline, mark)),
-    stop: () => run(() => tracker.stop()),
+    signalKnown: tracker.signalKnown
+      ? (signal, deadline, mark) => run(() => tracker.signalKnown!(signal, deadline, mark))
+      : undefined,
+    handoff: tracker.handoff ? (identity) => run(() => tracker.handoff!(identity)) : undefined,
+    abort: tracker.abort ? () => run(() => tracker.abort!()) : undefined,
+    stop: (deadline) => run(() => tracker.stop(deadline)),
     errors: tracker.errors,
     run: (operation) => run(operation),
     unlocked: tracker,
@@ -1707,30 +2472,55 @@ async function signalWindowsJob(
   errors: Error[],
   inspect: (deadline: number) => Promise<ProcessIdentity | undefined>,
   abort: () => void,
-) {
-  let current: ProcessIdentity | undefined
+  completed?: () => boolean,
+  fallbackDeadline = deadline + windowsJobFallbackReserveMs,
+  timing?: {
+    readonly now: () => number
+    readonly sleep: (milliseconds: number) => Promise<void>
+  },
+): Promise<boolean> {
+  const now = timing?.now ?? Date.now
+  const sleep = timing?.sleep ?? Bun.sleep
+  // Writing the abort begins native Job Object draining. Do it before any
+  // potentially slow identity probe: observation belongs to the fallback
+  // phase and cannot steal the drain interval.
+  let abortWritten = true
+  try {
+    abort()
+  } catch (abortCause) {
+    abortWritten = false
+    recordError(errors, `failed to write Windows job abort for ${child.pid}`, abortCause)
+  }
+  if (abortWritten && completed) {
+    while (now() < deadline) {
+      try {
+        if (completed()) return true
+      } catch (cause) {
+        recordError(errors, `failed to read Windows job completion for process ${child.pid}`, cause)
+        break
+      }
+      await sleep(5)
+    }
+    recordError(
+      errors,
+      `Windows Job Object for process ${child.pid} did not acknowledge descendant drain before the reserved cleanup window elapsed`,
+      undefined,
+    )
+  }
   try {
     // A Job Object owns every descendant from creation, including a root
-    // which exits between scans. Revalidate this supervisor immediately
-    // before requesting its handle be closed; never use taskkill /t.
-    current = await inspect(deadline)
-    if (!current) return
-    if (!sameIdentity(root, current)) {
+    // which exits between scans. This probe deliberately runs only after the
+    // dedicated native drain phase; Bun's captured handle remains exact even
+    // if the observation itself fails.
+    const current = await inspect(Math.min(fallbackDeadline, deadline + windowsJobInspectionReserveMs))
+    if (current && !sameIdentity(root, current))
       recordError(errors, `Windows job supervisor ${child.pid} identity changed before close`, undefined)
-    }
-    if (Date.now() >= deadline) {
-      recordError(errors, `cleanup deadline elapsed before closing Windows job ${child.pid}`, undefined)
-      return
-    }
+    if (now() >= fallbackDeadline)
+      recordError(errors, `cleanup fallback deadline elapsed before closing Windows job ${child.pid}`, undefined)
   } catch (cause) {
     // A failed CIM/status read is not authority to leave a known native
     // child alive. Bun's captured handle targets exactly this supervisor.
     recordError(errors, `failed to inspect Windows job for process ${child.pid}`, cause)
-  }
-  try {
-    abort()
-  } catch (abortCause) {
-    recordError(errors, `failed to write Windows job abort for ${child.pid}`, abortCause)
   }
   try {
     child.kill()
@@ -1739,6 +2529,7 @@ async function signalWindowsJob(
     if (!isMissingProcess(termination))
       recordError(errors, `failed to terminate Windows job supervisor ${child.pid}`, termination)
   }
+  return false
 }
 
 export async function windowsCapturedHandleCleanupForTest(root: ProcessIdentity, current: ProcessIdentity) {
@@ -1767,9 +2558,12 @@ function trackWindowsProcess(
   release: string,
   abort: string,
   status: string,
+  completion: string,
   supervisor: string,
+  job: string,
 ): ProcessTracker {
   const errors: Error[] = []
+  let drained = false
   const scan = async (deadline = Date.now() + 4_000) => {
     try {
       const current = (await windowsIdentity(child.pid, deadline))[0]
@@ -1783,9 +2577,11 @@ function trackWindowsProcess(
     }
   }
   return serializeTracker({
+    windowsJob: true,
+    jobDrained: () => drained,
     scan,
     stop: async () => {
-      ;[status, release, abort, supervisor].forEach((file) => {
+      ;[status, release, abort, completion, supervisor].forEach((file) => {
         try {
           if (existsSync(file)) unlinkSync(file)
         } catch (cause) {
@@ -1794,7 +2590,7 @@ function trackWindowsProcess(
       })
     },
     signal: async (_signal, deadline, mark) => {
-      await signalWindowsJob(
+      drained = await signalWindowsJob(
         child,
         root,
         deadline,
@@ -1802,10 +2598,63 @@ function trackWindowsProcess(
         errors,
         async (inspectionDeadline) => (await windowsIdentity(child.pid, inspectionDeadline))[0],
         () => writeFileSync(abort, "abort"),
+        () => existsSync(completion) && windowsSupervisorCompletion(readFileSync(completion, "utf8"), job),
       )
     },
     errors,
   })
+}
+
+// Exercise the same abort, acknowledgement, and captured-handle path as the
+// Windows tracker without requiring a Windows host. The observer publishes its
+// drain record only after its asynchronous Job Object cleanup completes.
+export async function windowsSupervisorDrainLifecycleForTest(
+  acknowledgementDelayMs?: number,
+  deadline = 8_000,
+  supervisorDisappears = false,
+) {
+  const errors: Error[] = []
+  const events: string[] = []
+  const root = { pid: 42, started: "started", executable: "supervisor", containment: "job" }
+  let state: "running" | "draining" | "exited" | "terminated" = "running"
+  let acknowledged = false
+  let now = 0
+  await signalWindowsJob(
+    {
+      pid: root.pid,
+      kill: () => {
+        state = "terminated"
+        events.push("terminated")
+      },
+    },
+    root,
+    windowsJobCleanupPhases(deadline, now).drainDeadline,
+    () => {},
+    errors,
+    async () => {
+      events.push("inspected")
+      return supervisorDisappears ? undefined : root
+    },
+    () => {
+      state = "draining"
+      events.push("abort")
+    },
+    () => {
+      if (acknowledgementDelayMs === undefined || now < acknowledgementDelayMs) return false
+      acknowledged = true
+      state = "exited"
+      if (!events.includes("job-drained")) events.push("job-drained")
+      return true
+    },
+    deadline,
+    {
+      now: () => now,
+      sleep: async (milliseconds) => {
+        now += milliseconds
+      },
+    },
+  )
+  return { state, acknowledged, events, errors }
 }
 
 function prepareCgroup() {
@@ -1828,45 +2677,126 @@ function prepareCgroup() {
   }
 }
 
-async function removeAbortedCgroup(cgroupPath: string, containment: string, deadline: number) {
+async function removeAbortedCgroup(
+  cgroupPath: string,
+  containment: string,
+  deadline: number,
+  test?: {
+    readonly now?: () => number
+    readonly members?: (cgroupPath: string, deadline: number, now: () => number) => number[]
+    readonly snapshot?: (pid: number) => ProcessSnapshot | undefined
+    readonly containmentForPID?: (pid: number) => string
+    readonly send?: (pid: number) => void
+    readonly sleep?: (milliseconds: number) => Promise<void>
+  },
+) {
   const errors: Error[] = []
-  while (Date.now() < deadline) {
+  const now = test?.now ?? Date.now
+  const members = test?.members ?? containedPids
+  const snapshot = test?.snapshot ?? linuxSnapshot
+  const containmentForPID = test?.containmentForPID ?? linuxCgroup
+  const send = test?.send ?? ((pid: number) => process.kill(pid, "SIGKILL"))
+  const inspect = (pid: number): ProcessIdentity | undefined => {
+    if (now() >= deadline) return
+    const identity = snapshot(pid)
+    if (!identity || now() >= deadline) return
+    const currentContainment = containmentForPID(pid)
+    if (now() >= deadline) return
+    return { ...identity, containment: currentContainment }
+  }
+  while (now() < deadline) {
     try {
-      const pids = containedPids(cgroupPath)
+      // Aborted acquisition has no later escalation phase to reserve. Spend
+      // the full deadline here, but do not start even one more /proc or
+      // cgroup read after it has elapsed.
+      if (now() >= deadline) break
+      const pids = members(cgroupPath, deadline, now)
+      if (now() >= deadline) break
       if (pids.length === 0) {
         rmdirSync(cgroupPath)
         if (errors.length) throw new AggregateError(errors, `failed to clean aborted containment ${cgroupPath}`)
         return
       }
-      pids.forEach((pid) => {
-        const identity = linuxSnapshot(pid)
-        if (!identity || linuxCgroup(pid) !== containment) {
+      for (const pid of pids) {
+        if (now() >= deadline) break
+        const identity = snapshot(pid)
+        if (!identity) continue
+        if (now() >= deadline) break
+        const currentContainment = containmentForPID(pid)
+        if (now() >= deadline) break
+        if (currentContainment !== containment) {
           throw new Error(`cannot safely clean aborted containment member ${pid}`)
         }
         signalExact(
-          { ...identity, containment: linuxCgroup(pid) },
-          (candidate) => {
-            const snapshot = linuxSnapshot(candidate)
-            if (!snapshot) return
-            return { ...snapshot, containment: linuxCgroup(candidate) }
-          },
+          { ...identity, containment: currentContainment },
+          inspect,
           "SIGKILL",
           deadline,
           () => {},
           errors,
+          (candidate) => send(candidate),
+          now,
         )
-      })
+      }
     } catch (cause) {
       if (isMissingProcess(cause)) continue
       recordError(errors, `failed to remove aborted containment ${cgroupPath}`, cause)
-      if (Date.now() >= deadline) throw new AggregateError(errors, `failed to remove aborted containment ${cgroupPath}`)
+      if (now() >= deadline) throw new AggregateError(errors, `failed to remove aborted containment ${cgroupPath}`)
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(5, Math.max(deadline - Date.now(), 0))))
+    const remaining = deadline - now()
+    if (remaining <= 0) break
+    if (test?.sleep) await test.sleep(Math.min(5, remaining))
+    else await new Promise<void>((resolve) => setTimeout(resolve, Math.min(5, remaining)))
   }
   throw new AggregateError(
     [...errors, new Error(`aborted containment ${cgroupPath} did not become empty`)],
     `failed to remove aborted containment ${cgroupPath}`,
   )
+}
+
+export async function abortedCgroupMembershipDeadlineForTest() {
+  const started = Date.now()
+  let now = started
+  let membershipReads = 0
+  let snapshotReads = 0
+  let containmentReads = 0
+  let readsAfterDeadline = 0
+  let signals = 0
+  const deadline = started + 100
+  const members = Array.from({ length: 10_000 }, (_, index) => index + 100)
+  await removeAbortedCgroup("/synthetic", "test", deadline, {
+    now: () => now,
+    members: () => {
+      if (now >= deadline) readsAfterDeadline += 1
+      membershipReads += 1
+      return members
+    },
+    snapshot: (pid) => {
+      if (now >= deadline) readsAfterDeadline += 1
+      snapshotReads += 1
+      now += 12
+      return {
+        pid,
+        parent: 1,
+        group: 42,
+        started: `started:${pid}`,
+        executable: "synthetic",
+        containment: "",
+        nonce: true,
+      }
+    },
+    containmentForPID: () => {
+      if (now >= deadline) readsAfterDeadline += 1
+      containmentReads += 1
+      now += 10
+      return "test"
+    },
+    send: () => {
+      signals += 1
+    },
+    sleep: async () => {},
+  }).catch(() => undefined)
+  return { membershipReads, snapshotReads, containmentReads, readsAfterDeadline, signals, elapsed: now - started }
 }
 
 function windowsSupervisorScript() {
@@ -1877,18 +2807,22 @@ using System;
 using System.Text;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 public static class OpenCodeTestJob {
   const uint CREATE_SUSPENDED=4, EXTENDED_STARTUPINFO_PRESENT=0x80000, STARTF_USESTDHANDLES=256, WAIT_OBJECT_0=0, WAIT_TIMEOUT=258, WAIT_FAILED=0xffffffff, CLEANUP_WAIT_MS=4000;
   static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST = new IntPtr(0x0002000d);
   [StructLayout(LayoutKind.Sequential)] public struct Basic { public long PerProcessUserTimeLimit, PerJobUserTimeLimit; public uint LimitFlags; public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize; public uint ActiveProcessLimit; public UIntPtr Affinity; public uint PriorityClass, SchedulingClass; }
   [StructLayout(LayoutKind.Sequential)] public struct IoCounters { public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount, ReadTransferCount, WriteTransferCount, OtherTransferCount; }
   [StructLayout(LayoutKind.Sequential)] public struct Extended { public Basic BasicLimitInformation; public IoCounters IoInfo; public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed; }
+  [StructLayout(LayoutKind.Sequential)] public struct Accounting { public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime; public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses; }
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct StartupInfo { public uint cb; public string lpReserved, lpDesktop, lpTitle; public uint dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags; public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError; }
   [StructLayout(LayoutKind.Sequential)] struct StartupInfoEx { public StartupInfo StartupInfo; public IntPtr lpAttributeList; }
   [StructLayout(LayoutKind.Sequential)] struct ProcessInformation { public IntPtr hProcess, hThread; public uint dwProcessId, dwThreadId; }
   [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] static extern bool CreateProcess(string app, StringBuilder command, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref StartupInfoEx startup, out ProcessInformation process);
   [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr CreateJobObject(IntPtr a,string b);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetInformationJobObject(IntPtr j,int c,IntPtr i,int l);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool QueryInformationJobObject(IntPtr j,int c,out Accounting i,int l,IntPtr r);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool TerminateJobObject(IntPtr j,uint code);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool InitializeProcThreadAttributeList(IntPtr list,int count,int flags,ref IntPtr size);
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool UpdateProcThreadAttribute(IntPtr list,uint flags,IntPtr attribute,IntPtr value,IntPtr size,IntPtr previous,IntPtr returned);
   [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
@@ -1907,13 +2841,14 @@ public static class OpenCodeTestJob {
   // Unsigned subtraction is defined across its 49.7-day wrap and this bounded
   // interval is far below half that range.
   static void WaitForExit(IntPtr process,string call) { var began=GetTickCount(); while(true) { var elapsed=unchecked(GetTickCount()-began); if(elapsed>=CLEANUP_WAIT_MS) throw new TimeoutException(call+" timed out"); var remaining=CLEANUP_WAIT_MS-elapsed; var wait=WaitForSingleObject(process,remaining<(uint)50 ? remaining : (uint)50); if(wait==WAIT_OBJECT_0) return; if(wait==WAIT_TIMEOUT) continue; if(wait==WAIT_FAILED) throw Failure(call); throw new Exception(call+" returned "+wait); } }
+  static void WaitForJobDrain(IntPtr job) { var began=GetTickCount(); while(true) { var elapsed=unchecked(GetTickCount()-began); if(elapsed>=CLEANUP_WAIT_MS) throw new TimeoutException("Job Object descendant drain timed out"); Accounting accounting; Check(QueryInformationJobObject(job,1,out accounting,Marshal.SizeOf(typeof(Accounting)),IntPtr.Zero),"QueryInformationJobObject"); if(accounting.ActiveProcesses==0) return; Thread.Sleep(10); } }
   static void StopProcess(IntPtr process,List<Exception> errors) { if(process==IntPtr.Zero) return; if(!TerminateProcess(process,125)) errors.Add(Failure("TerminateProcess")); try { WaitForExit(process,"WaitForSingleObject after TerminateProcess"); } catch(Exception error) { errors.Add(error); } }
   static void Close(IntPtr handle,string call,List<Exception> errors) { if(handle!=IntPtr.Zero&&!CloseHandle(handle)) errors.Add(Failure(call)); }
   static string Quote(string s) { var quoted=new StringBuilder("\""); var slashes=0; foreach(var c in s) { if(c=='\\') { slashes++; continue; } if(c=='\"') { quoted.Append('\\',slashes*2+1); quoted.Append('\"'); slashes=0; continue; } quoted.Append('\\',slashes); slashes=0; quoted.Append(c); } quoted.Append('\\',slashes*2); quoted.Append('\"'); return quoted.ToString(); }
-  public static IntPtr Start(string status) {
+  public static IntPtr Start(string status,string jobName) {
     if(Marshal.SizeOf(typeof(Basic)) != (IntPtr.Size==8 ? 64 : 40) || Marshal.SizeOf(typeof(IoCounters)) != 48 || Marshal.SizeOf(typeof(Extended)) != (IntPtr.Size==8 ? 144 : 104)) throw new Exception("JOBOBJECT_EXTENDED_LIMIT_INFORMATION layout mismatch");
-    var job=CreateJobObject(IntPtr.Zero,null); if(job==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"CreateJobObject");
-    try { var info=new Extended(); info.BasicLimitInformation.LimitFlags=0x2000; var pointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Extended))); try { Marshal.StructureToPtr(info,pointer,false); Check(SetInformationJobObject(job,9,pointer,Marshal.SizeOf(typeof(Extended))),"SetInformationJobObject"); } finally { Marshal.FreeHGlobal(pointer); } long created,ignored1,ignored2,ignored3; Check(GetProcessTimes(GetCurrentProcess(),out created,out ignored1,out ignored2,out ignored3),"GetProcessTimes"); var pending=status+"."+Guid.NewGuid().ToString("N")+".pending"; System.IO.File.WriteAllText(pending,System.Diagnostics.Process.GetCurrentProcess().Id+"${separator}"+created); System.IO.File.Move(pending,status); return job; } catch(Exception error) { var errors=new List<Exception>(); errors.Add(error); Close(job,"CloseHandle job after Start failure",errors); if(errors.Count>1) throw new AggregateException("Windows Job Object startup cleanup failed",errors); throw; }
+    var job=CreateJobObject(IntPtr.Zero,"Local\\OpenCodeTestJob-"+jobName); if(job==IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"CreateJobObject");
+    try { if(Marshal.GetLastWin32Error()==183) throw new Exception("named Job Object already exists"); var info=new Extended(); info.BasicLimitInformation.LimitFlags=0x2000; var pointer=Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Extended))); try { Marshal.StructureToPtr(info,pointer,false); Check(SetInformationJobObject(job,9,pointer,Marshal.SizeOf(typeof(Extended))),"SetInformationJobObject"); } finally { Marshal.FreeHGlobal(pointer); } long created,ignored1,ignored2,ignored3; Check(GetProcessTimes(GetCurrentProcess(),out created,out ignored1,out ignored2,out ignored3),"GetProcessTimes"); var pending=status+"."+Guid.NewGuid().ToString("N")+".pending"; System.IO.File.WriteAllText(pending,System.Diagnostics.Process.GetCurrentProcess().Id+"${separator}"+created+"${separator}"+jobName); System.IO.File.Move(pending,status); return job; } catch(Exception error) { var errors=new List<Exception>(); errors.Add(error); Close(job,"CloseHandle job after Start failure",errors); if(errors.Count>1) throw new AggregateException("Windows Job Object startup cleanup failed",errors); throw; }
   }
   public static int Run(IntPtr job,string[] command,string abort) {
     var attributesSize=IntPtr.Zero; InitializeProcThreadAttributeList(IntPtr.Zero,1,0,ref attributesSize);
@@ -1928,14 +2863,14 @@ public static class OpenCodeTestJob {
       if(!exited) StopProcess(process.hProcess,errors); Close(process.hThread,"CloseHandle thread",errors); Close(process.hProcess,"CloseHandle process",errors); if(errors.Count>0) throw new AggregateException("Windows Job Object process cleanup failed",errors); return code;
     } finally { if(initialized) DeleteProcThreadAttributeList(attributes); Marshal.FreeHGlobal(jobList); Marshal.FreeHGlobal(attributes); }
   }
-  public static void Stop(IntPtr job) { if(job!=IntPtr.Zero) Check(CloseHandle(job),"CloseHandle job"); }
+  public static void Stop(IntPtr job,string completion,string jobName) { if(job==IntPtr.Zero) return; var errors=new List<Exception>(); if(!TerminateJobObject(job,125)) errors.Add(Failure("TerminateJobObject")); try { WaitForJobDrain(job); var pending=completion+"."+Guid.NewGuid().ToString("N")+".pending"; System.IO.File.WriteAllText(pending,jobName+"${separator}"+"0"); System.IO.File.Move(pending,completion); } catch(Exception error) { errors.Add(error); } if(!CloseHandle(job)) errors.Add(Failure("CloseHandle job")); if(errors.Count>0) throw new AggregateException("Windows Job Object descendant cleanup failed",errors); }
 }
 '@
 $job=$null
 $failure=$null
-try { $delay=[int]$env:OPENCODE_TEST_STATUS_DELAY_MS; if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }; $job=[OpenCodeTestJob]::Start($env:OPENCODE_TEST_STATUS); while (!(Test-Path -LiteralPath $env:OPENCODE_TEST_RELEASE) -and !(Test-Path -LiteralPath $env:OPENCODE_TEST_ABORT)) { Start-Sleep -Milliseconds 10 }; if (Test-Path -LiteralPath $env:OPENCODE_TEST_ABORT) { exit 125 }; exit [OpenCodeTestJob]::Run($job,$Command,$env:OPENCODE_TEST_ABORT) }
+try { $delay=[int]$env:OPENCODE_TEST_STATUS_DELAY_MS; if ($delay -gt 0) { Start-Sleep -Milliseconds $delay }; $job=[OpenCodeTestJob]::Start($env:OPENCODE_TEST_STATUS,$env:OPENCODE_TEST_JOB_ID); while (!(Test-Path -LiteralPath $env:OPENCODE_TEST_RELEASE) -and !(Test-Path -LiteralPath $env:OPENCODE_TEST_ABORT)) { Start-Sleep -Milliseconds 10 }; if (Test-Path -LiteralPath $env:OPENCODE_TEST_ABORT) { exit 125 }; exit [OpenCodeTestJob]::Run($job,$Command,$env:OPENCODE_TEST_ABORT) }
 catch { $failure=$_.Exception }
-finally { if ($null -ne $job) { try { [OpenCodeTestJob]::Stop($job) } catch { if ($null -ne $failure) { throw [System.AggregateException]::new("Windows Job Object supervisor cleanup failed",[System.Exception[]]@($failure,$_.Exception)) }; throw } }; if ($null -ne $failure) { throw $failure } }`
+finally { if ($null -ne $job) { try { [OpenCodeTestJob]::Stop($job,$env:OPENCODE_TEST_COMPLETION,$env:OPENCODE_TEST_JOB_ID) } catch { if ($null -ne $failure) { throw [System.AggregateException]::new("Windows Job Object supervisor cleanup failed",[System.Exception[]]@($failure,$_.Exception)) }; throw } }; if ($null -ne $failure) { throw $failure } }`
   return script
 }
 
@@ -1948,15 +2883,23 @@ export function windowsSupervisorProtocolForTest() {
 }
 
 function windowsSupervisorStatus(record: string) {
-  const match = /^(\d+)\t(\d+)/.exec(record)
+  const match = /^(\d+)\t(\d+)\t([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i.exec(record)
   if (!match || match[0] !== record) return
   const pid = Number(match[1])
   if (!Number.isSafeInteger(pid) || pid <= 0 || !/^[1-9]\d*$/.test(match[2])) return
-  return { pid, created: match[2] }
+  return { pid, created: match[2], job: match[3] }
 }
 
 export function windowsSupervisorStatusForTest(record: string) {
   return windowsSupervisorStatus(record)
+}
+
+function windowsSupervisorCompletion(record: string, job: string) {
+  return record === `${job}\t0`
+}
+
+export function windowsSupervisorCompletionForTest(record: string, job: string) {
+  return windowsSupervisorCompletion(record, job)
 }
 
 function windowsSupervisorArguments(record: string) {
@@ -1994,6 +2937,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
   const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
   const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
   const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
+  const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
   const target = path.join(os.tmpdir(), `opencode-supervisor-argv-${nonce}.ps1`)
   const supervisor = writeWindowsSupervisor(nonce)
   let child: ReturnType<typeof Bun.spawn> | undefined
@@ -2011,6 +2955,8 @@ export async function windowsSupervisorArgumentRoundTripForTest(
           OPENCODE_TEST_RELEASE: release,
           OPENCODE_TEST_ABORT: abort,
           OPENCODE_TEST_STATUS: status,
+          OPENCODE_TEST_COMPLETION: completion,
+          OPENCODE_TEST_JOB_ID: nonce,
           OPENCODE_TEST_STATUS_DELAY_MS: `${statusDelayMs}`,
         },
       },
@@ -2026,7 +2972,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
     while (!existsSync(status) && Date.now() < acquisitionDeadline)
       await new Promise<void>((resolve) => setTimeout(resolve, 5))
     if (!existsSync(status)) throw new Error("Windows supervisor did not publish launch status")
-    if (!windowsSupervisorStatus(readFileSync(status, "utf8")))
+    if (windowsSupervisorStatus(readFileSync(status, "utf8"))?.job !== nonce)
       throw new Error("Windows supervisor published an invalid launch status")
     // This deadline is deliberately created after the atomic status record.
     // It bounds the released target (including a pipe that never closes), not
@@ -2050,6 +2996,8 @@ export async function windowsSupervisorArgumentRoundTripForTest(
       if (timer) clearTimeout(timer)
     })
     if (exitCode !== 0) throw new Error(`Windows supervisor argv probe exited with ${exitCode}: ${stderr}`)
+    if (!existsSync(completion) || !windowsSupervisorCompletion(readFileSync(completion, "utf8"), nonce))
+      throw new Error("Windows supervisor exited without acknowledging Job Object descendant drain")
     completed = true
     return windowsSupervisorArguments(stdout)
   } catch (cause) {
@@ -2081,7 +3029,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
         cleanupErrors.push(new Error("Windows supervisor argv probe did not exit during cleanup"))
       }
     }
-    ;[status, release, abort, target, supervisor].forEach((file) => {
+    ;[status, release, abort, completion, target, supervisor].forEach((file) => {
       try {
         if (existsSync(file)) unlinkSync(file)
       } catch (cause) {
@@ -2307,15 +3255,81 @@ public static class OpenCodeArgv {
   }
 }
 
+type PortableFilesystem = {
+  readonly exists: (file: string) => boolean
+  readonly read: (file: string) => string
+  readonly write?: (file: string, contents: string) => void
+  readonly unlink: (file: string) => void
+}
+
+type PortableObserve = (
+  pid: number,
+  nonce: string,
+  deadline: number,
+  confirmedNonce?: boolean,
+  stage?: "initial" | "reconcile" | "cleanup",
+  signal?: AbortSignal,
+) => Promise<ProcessSnapshot | undefined>
+
+async function observePortable(
+  observe: PortableObserve,
+  pid: number,
+  nonce: string,
+  deadline: number,
+  confirmedNonce: boolean,
+  stage: "initial" | "reconcile" | "cleanup",
+) {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) throw new Error(`portable ${stage} observation deadline elapsed`)
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      observe(pid, nonce, deadline, confirmedNonce, stage, controller.signal),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort()
+          reject(new Error(`portable ${stage} observation exceeded its deadline`))
+        }, remaining)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+type SpawnTrackedTestOptions = {
+  readonly forcePortable?: boolean
+  readonly portableFilesystem?: PortableFilesystem
+  readonly portableObserve?: PortableObserve
+  // The test-only pause sits after the controller publishes kill-issued and
+  // before its group KILL, making that otherwise tiny crash window observable.
+  readonly portableControllerPause?: string
+  // A private-nonce controller naturally has short-lived `sleep` children.
+  // This fixture keeps one alive so recovery has to distinguish the durable
+  // controller authority from an ordinary inherited-nonce descendant.
+  readonly portableControllerDescendant?: string
+  readonly portableExitObservationFailure?: boolean
+  readonly onPortableControllerCapture?: (controller: ProcessSnapshot) => void
+  readonly onPortableControllerRecovered?: (controller: ProcessSnapshot) => void
+  readonly onPortableControllerSetup?: (controls: { readonly ready: string; readonly completion: string }) => void
+  readonly onPortableControllerFallback?: () => void
+  readonly portableKnownInspect?: (pid: number, deadline: number) => Promise<ProcessIdentity | undefined>
+  readonly onPortableTrackerSignal?: (path: "signal" | "signalKnown", signal: "SIGINT" | "SIGTERM" | "SIGKILL") => void
+  readonly onPortableSpawn?: (child: ReturnType<typeof Bun.spawn>) => void
+}
+
 async function spawnTracked(
   command: string[],
   options: Parameters<typeof Bun.spawn>[1],
+  test?: SpawnTrackedTestOptions,
 ) {
   if (process.platform === "win32") {
     const nonce = crypto.randomUUID()
     const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
     const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
     const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
+    const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
     const supervisor = writeWindowsSupervisor(nonce)
     let child: ReturnType<typeof Bun.spawn>
     try {
@@ -2329,6 +3343,8 @@ async function spawnTracked(
           OPENCODE_TEST_RELEASE: release,
           OPENCODE_TEST_ABORT: abort,
           OPENCODE_TEST_STATUS: status,
+          OPENCODE_TEST_COMPLETION: completion,
+          OPENCODE_TEST_JOB_ID: nonce,
         },
       })
     } catch (cause) {
@@ -2404,7 +3420,7 @@ async function spawnTracked(
       } finally {
         // The supervisor may still be observing these files until it is known
         // dead. Do not remove a control signal before the reap above.
-        ;[status, release, abort, supervisor].forEach((file) => {
+        ;[status, release, abort, completion, supervisor].forEach((file) => {
           try {
             if (existsSync(file)) unlinkSync(file)
           } catch (cleanup) {
@@ -2429,10 +3445,15 @@ async function spawnTracked(
         await new Promise<void>((resolve) => setTimeout(resolve, 5))
       const trustedStatus = existsSync(status) ? windowsSupervisorStatus(readFileSync(status, "utf8")) : undefined
       root = (await windowsIdentity(child.pid, acquisitionDeadline))[0]
-      if (!root || trustedStatus?.pid !== child.pid || root.started !== `native:${trustedStatus.created}`) {
+      if (
+        !root ||
+        trustedStatus?.pid !== child.pid ||
+        trustedStatus.job !== nonce ||
+        root.started !== `native:${trustedStatus.created}`
+      ) {
         throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
       }
-      const tracker = trackWindowsProcess(child, root, release, abort, status, supervisor)
+      const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
       const captured = await tracker.scan(acquisitionDeadline)
       if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
         throw new Error("failed to establish Windows Job Object containment")
@@ -2443,7 +3464,7 @@ async function spawnTracked(
       return await abortLaunch(cause)
     }
   }
-  const cgroup = prepareCgroup()
+  const cgroup = test?.forcePortable ? undefined : prepareCgroup()
   if (cgroup) {
     const status = path.join(os.tmpdir(), `opencode-cgroup-${crypto.randomUUID()}`)
     const release = path.join(os.tmpdir(), `opencode-release-${crypto.randomUUID()}`)
@@ -2531,18 +3552,91 @@ async function spawnTracked(
   // The portable contract is a dedicated POSIX group plus a per-launch nonce.
   // The gate prevents exec of OpenCode until the group and tracker are proven.
   const nonce = crypto.randomUUID()
+  // The controller stays in the launch group after the direct child exits.
+  // It must not look like an ordinary nonce descendant: Darwin discovery can
+  // signal such members during TERM grace and prevent its unconditional group
+  // KILL from reaching a TERM-ignoring descendant.
+  const controllerNonce = crypto.randomUUID()
+  const ready = path.join(os.tmpdir(), `opencode-ready-${nonce}`)
+  const pendingReady = `${ready}.pending`
   const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
   const abortFile = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
+  const acknowledgement = path.join(os.tmpdir(), `opencode-ack-${nonce}`)
+  const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
+  // This separate, atomically published controller record is deliberately
+  // admitted before any gate/readiness observation. It gives acquisition
+  // cleanup a nonce-authenticated group authority even if the gate vanishes
+  // or a readiness read throws.
+  const controllerStatus = path.join(os.tmpdir(), `opencode-controller-${nonce}`)
+  const pendingControllerStatus = `${controllerStatus}.pending`
+  const controllerPause = test?.portableControllerPause
+  const controllerDescendant = test?.portableControllerDescendant
+  const filesystem =
+    test?.portableFilesystem ??
+    ({
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      write: writeFileSync,
+      unlink: unlinkSync,
+    } satisfies PortableFilesystem)
   let child: ReturnType<typeof Bun.spawn>
   try {
     child = Bun.spawn(
       [
         "/bin/sh",
         "-c",
-        'while [ ! -e "$1" ] && [ ! -e "$2" ]; do sleep 0.01; done; [ -e "$2" ] && exit 125; rm "$1"; shift 2; exec "$@"',
+        // Publish readiness before waiting for release. Rename makes the
+        // marker visible as one complete record, never an exists-but-empty
+        // file. The parent verifies this particular group leader directly;
+        // the target cannot exec yet.
+        // Once abort is observed, the controller remains in the verified
+        // group after the leader exits. It keeps that numeric group from
+        // being recycled, then always kills it after a bounded TERM grace.
+        `leader=$$; controller_nonce="$7"; (
+          # A shell assignment in this fork is not visible in Linux /proc until
+          # an exec. The controller owns the eventual group KILL, so publish
+          # its PID only after exec has installed its distinct kernel env.
+          exec env OPENCODE_TEST_PROCESS_NONCE="$controller_nonce" /bin/sh -c '
+            leader=$1
+            abort=$2
+            pending=$3
+            ready=$4
+            acknowledgement=$5
+            completion=$6
+            pause=$7
+            controller_status=$8
+            controller_descendant=$9
+            controller_pending="$controller_status.pending"
+            if [ -n "$controller_descendant" ]; then
+              /bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
+              printf "%s:%s" "$$" "$!" > "$controller_descendant"
+            fi
+            printf "controller:%s" "$$" > "$controller_pending" && mv -f "$controller_pending" "$controller_status"
+            trap "" TERM
+            printf "ready:%s" "$$" > "$pending" && mv -f "$pending" "$ready"
+            while [ ! -e "$abort" ]; do sleep 0.01; done
+            printf "ack" > "$acknowledgement"
+            kill -TERM -"$leader" 2>/dev/null || :
+            sleep 0.5
+            # This only records that KILL is about to be issued. The parent
+            # must still verify controller exit and group drain before it can
+            # treat the kill as finished.
+            printf "kill-issued" > "$completion"
+            while [ -n "$pause" ] && [ -e "$pause" ]; do sleep 0.01; done
+            kill -KILL -"$leader" 2>/dev/null || { printf "failed" > "$completion"; exit 1; }
+          ' controller "$leader" "$4" "$1" "$2" "$5" "$6" "$8" "$9" "\${10}"
+        ) >/dev/null 2>&1 & while [ ! -e "$3" ] && [ ! -e "$4" ]; do sleep 0.01; done; [ -e "$4" ] && exit 125; rm "$3"; shift 10; exec "$@"`,
         "--",
+        pendingReady,
+        ready,
         release,
         abortFile,
+        acknowledgement,
+        completion,
+        controllerNonce,
+        controllerPause ?? "",
+        controllerStatus,
+        controllerDescendant ?? "",
         ...command,
       ],
       {
@@ -2555,129 +3649,799 @@ async function spawnTracked(
     throw new Error("failed to spawn portable gate", { cause })
   }
   const acquisitionDeadline = Date.now() + 4_000
+  let rawExited: Promise<number> | undefined
   let tracker: ProcessTracker | undefined
+  let gate: ProcessSnapshot | undefined
+  let controller: ProcessSnapshot | undefined
+  let exitState: "pending" | "exited" | "failed" = "pending"
+  // Own the native handle before any filesystem or /proc operation. This is
+  // the provisional ownership boundary for failures before the tracker exists.
+  let exitObservationFailure: Error | undefined
+  try {
+    if (test?.portableExitObservationFailure) throw new Error("synthetic portable exit observation failed")
+    rawExited = child.exited
+    void rawExited.catch(() => {})
+  } catch (cause) {
+    exitObservationFailure = new Error("failed to observe portable gate exit", { cause })
+  }
+  const captureController = async (deadline: number, retryFailures = false) => {
+    let controllerRecord = ""
+    let failure: unknown
+    while (Date.now() < deadline) {
+      try {
+        controllerRecord = filesystem.read(controllerStatus)
+        if (!controllerRecord.startsWith("controller:")) {
+          await Bun.sleep(5)
+          continue
+        }
+        const controllerPID = Number(controllerRecord.slice("controller:".length))
+        if (!Number.isSafeInteger(controllerPID) || controllerPID <= 0)
+          throw new Error("portable gate did not publish a valid controller identity before launch")
+        const captured = await observePortable(
+          test?.portableObserve ?? portableSnapshot,
+          controllerPID,
+          controllerNonce,
+          deadline,
+          true,
+          "initial",
+        )
+        if (!captured || !captured.nonce || captured.group !== child.pid)
+          throw new Error("portable gate controller was not nonce-authenticated before launch")
+        return captured
+      } catch (cause) {
+        if (!retryFailures && !isMissingProcess(cause)) throw cause
+        failure = cause
+        await Bun.sleep(5)
+      }
+    }
+    throw new Error("portable gate controller could not be located and authenticated during cleanup", { cause: failure })
+  }
   const abort = async (cause: unknown) => {
     const errors: Error[] = [cause instanceof Error ? cause : new Error("portable acquisition failed", { cause })]
     const cleanupDeadline = Date.now() + 4_000
+    // The controller record publishes a nonce-authenticated member before
+    // readiness. Its filesystem and exact-PID authentication are advisory
+    // during cleanup: bound retries, then independently find the controller
+    // by its private nonce in the launch process group. That leaves time for
+    // direct-gate TERM plus controller group KILL and reap when the status
+    // path remains persistently unavailable.
+    if (!tracker && !controller) {
+      let statusFailure: unknown
+      try {
+        controller = await captureController(portableControllerRecoveryDeadline(cleanupDeadline), true)
+      } catch (controllerCause) {
+        statusFailure = controllerCause
+      }
+      if (!controller) {
+        try {
+          controller = await discoverPortableController(
+            controllerNonce,
+            child.pid,
+            portableControllerRecoveryDeadline(cleanupDeadline),
+          )
+        } catch (discoveryCause) {
+          recordError(
+            errors,
+            "failed to independently recover portable controller during acquisition cleanup",
+            statusFailure ? new AggregateError([statusFailure, discoveryCause]) : discoveryCause,
+          )
+        }
+      }
+      if (controller) test?.onPortableControllerRecovered?.(controller)
+    }
+    // Controller verification happens before tracker creation. Preserve that
+    // identity across an acquisition failure: the direct gate can reap after
+    // TERM while this TERM-ignoring group member still owns a descendant.
+    const provisionalController =
+      !tracker && controller
+        ? {
+            identity: controller,
+            nonce: controllerNonce,
+            target: gate,
+            abort: abortFile,
+            acknowledgement,
+            completion,
+            controls: [
+              ready,
+              pendingReady,
+              release,
+              abortFile,
+              acknowledgement,
+              completion,
+              controllerStatus,
+              pendingControllerStatus,
+              ...(controllerPause ? [controllerPause] : []),
+            ],
+            filesystem,
+            onFallback: test?.onPortableControllerFallback,
+          }
+        : undefined
     // Abort opens the gate only far enough for the shell to exit. It must be
     // done before waiting, and cleanup never inherits an expired acquisition
     // deadline.
     try {
-      writeFileSync(abortFile, "abort")
+      ;(filesystem.write ?? writeFileSync)(abortFile, "abort")
     } catch (abortCause) {
       recordError(errors, "failed to write portable acquisition abort", abortCause)
     }
     try {
       if (tracker) {
-        await terminateProcessPromise(child, () => {}, tracker, cleanupDeadline)
-      } else {
-        // The gate is the direct Bun child captured at spawn. This is the
-        // only pre-tracker fallback; later failures always use the tracker.
-        child.kill()
+        // Release may race a reconciliation exception or deadline. Re-observe
+        // this exact nonce-bearing PID before signalling so cleanup owns the
+        // exec'd program rather than the obsolete gate-shell executable.
+        if (gate) {
+          const handoff = await handoffPortableCleanupTarget(
+            tracker,
+            gate,
+            nonce,
+            cleanupDeadline,
+            () => exitState,
+            errors,
+            test?.portableObserve,
+          )
+          if (handoff._tag === "unresolved")
+            recordError(
+              errors,
+              `portable cleanup handoff for gate PID ${gate.pid} remained unresolved; activating controlled group termination`,
+              undefined,
+            )
+        }
+        await terminateProcessPromise(child, () => {}, tracker, cleanupDeadline, rawExited)
+      }
+      if (!tracker) {
+        // Before tracking, abort keeps the target gated. A reconciled gate
+        // permits identity-safe group cleanup of its shell helper; otherwise
+        // the exact Bun handle is the only safe signal target.
+        if (gate) await signalPortableGateGroup(gate, nonce, "SIGTERM", cleanupDeadline, errors)
+        else child.kill("SIGTERM")
+        await exitedWithin(child, 500, "after portable acquisition TERM", errors, rawExited)
+        // A reaped direct gate does not prove the group is gone. In
+        // particular, its controller ignores TERM and can keep descendants
+        // alive after the shell's exit. Its verified identity authorizes the
+        // finalizer's group KILL and disappearance checks even before a
+        // ProcessTracker has been installed.
+        if (provisionalController) await finalizePortableController(provisionalController, cleanupDeadline, errors)
+        else if (gate) await signalPortableGateGroup(gate, nonce, "SIGKILL", cleanupDeadline, errors)
+        else child.kill("SIGKILL")
+        await exitedWithin(
+          child,
+          Math.max(cleanupDeadline - Date.now(), 0),
+          "after portable acquisition SIGKILL",
+          errors,
+          rawExited,
+        )
       }
     } catch (cleanup) {
       collectCleanupErrors(errors, cleanup)
     }
-    if (
-      !(await exitedWithin(
-        child,
-        Math.max(cleanupDeadline - Date.now(), 0),
-        "after portable acquisition failure",
-        errors,
-      ))
-    ) {
+    const reaped = await exitedWithin(
+      child,
+      Math.max(cleanupDeadline - Date.now(), 0),
+      "after portable acquisition failure",
+      errors,
+      rawExited,
+    )
+    if (!reaped) {
       errors.push(new Error("portable gate shell remained unresolved after acquisition failure"))
+      // The gate may still be reading these controls. Retain them until the
+      // process is no longer observable instead of clearing its abort signal.
+      throw new AggregateError(errors, "failed to establish portable process containment before launching opencode")
     }
-    ;[release, abortFile].forEach((file) => {
-      try {
-        if (existsSync(file)) unlinkSync(file)
-      } catch (cleanup) {
-        recordError(errors, `failed to remove portable acquisition control ${file}`, cleanup)
-      }
-    })
+    // Before controller identity is verified, retaining its controls is safer
+    // than removing an abort request a live controller may still be reading.
+    // Once a tracker exists, its finalizer owns acknowledgement, completion,
+    // and removal on both successful and failed launches.
     throw new AggregateError(errors, "failed to establish portable process containment before launching opencode")
   }
-  const initial = await portableSnapshots(nonce, acquisitionDeadline, child.pid).catch(abort)
-  if (initial.errors.length) {
-    return await abort(new AggregateError(initial.errors, "failed to snapshot portable containment before launch"))
-  }
-  const root = initial.snapshots.find((snapshot) => snapshot.pid === child.pid)
-  if (!root || !root.nonce || root.group !== child.pid) {
-    return await abort(new Error("failed to capture portable gate identity before launching opencode"))
-  }
-  tracker = trackPortableProcess(child, nonce, root)
-  const captured = await tracker.scan(acquisitionDeadline)
-  if (tracker.errors.length || !captured.some((identity) => sameIdentity(root, identity))) {
-    const errors: Error[] = []
-    const cleanupDeadline = Date.now() + 4_000
-    try {
-      writeFileSync(abortFile, "abort")
-    } catch (cleanup) {
-      collectCleanupErrors(errors, cleanup)
-    }
-    try {
-      await terminateProcessPromise(child, () => {}, tracker, cleanupDeadline)
-    } catch (cleanup) {
-      collectCleanupErrors(errors, cleanup)
-    }
-    ;[release, abortFile].forEach((file) => {
-      try {
-        if (existsSync(file)) unlinkSync(file)
-      } catch (cleanup) {
-        collectCleanupErrors(errors, cleanup)
-      }
-    })
-    throw new AggregateError(
-      [...tracker.errors, ...errors],
-      "failed to establish portable process containment before launching opencode",
-    )
-  }
+  // The shell is owned from spawn through the direct-PID handoff. Keep every
+  // readiness/control-file operation inside this boundary: a synchronous
+  // filesystem failure must still abort, escalate, and reap the gate/target.
   try {
+    if (rawExited)
+      rawExited.then(
+        () => {
+          exitState = "exited"
+        },
+        () => {
+          exitState = "failed"
+        },
+      )
+    // Capture the protected controller before reading or reconciling the
+    // gate. From this point an abort-write failure cannot strand a member
+    // after the direct gate has exited: its controller nonce authenticates
+    // the exact group KILL and final drain verification.
+    controller = await captureController(acquisitionDeadline)
+    test?.onPortableControllerCapture?.(controller)
+    test?.onPortableSpawn?.(child)
+    if (exitObservationFailure) throw exitObservationFailure
+    // This direct identity is independent of readiness-file contents. A
+    // transient unreadable nonce or process observation is pending, not an
+    // acquisition failure, until the gate exits or the admission deadline.
+    const initial = await acquirePortableGate(child.pid, nonce, acquisitionDeadline, () => exitState, test?.portableObserve)
+    if (initial._tag !== "ready") {
+      if (initial._tag === "exited") throw new Error("portable gate exited before publishing readiness")
+      if (initial._tag === "conflict") throw new Error(initial.message)
+      if (initial._tag === "deadline") throw new Error("portable gate did not publish an identity before launch deadline")
+      throw new Error("portable gate identity remained pending after acquisition")
+    }
+    gate = initial.target
+    // Read the marker before checking its content. Empty or incomplete data is
+    // retried until the deadline, so a concurrent publisher cannot expose an
+    // exists-then-empty one-shot failure even on a filesystem without rename.
+    let readiness = ""
+    while (Date.now() < acquisitionDeadline) {
+      try {
+        readiness = filesystem.read(ready)
+      } catch (cause) {
+        if (!isMissingProcess(cause)) throw cause
+      }
+      if (readiness.startsWith("ready:")) break
+      await Bun.sleep(5)
+    }
+    const readyControllerPID = Number(readiness.slice("ready:".length))
+    if (!Number.isSafeInteger(readyControllerPID) || readyControllerPID !== controller.pid)
+      throw new Error("portable gate did not publish a valid controller before launch")
+    if (controller.group !== gate.group)
+      throw new Error("portable gate controller was not verified in the launch group")
+    test?.onPortableControllerSetup?.({ ready, completion })
+    tracker = trackPortableProcess(child, nonce, gate, {
+      abort: () => (filesystem.write ?? writeFileSync)(abortFile, "abort"),
+      controller: {
+        identity: controller,
+        nonce: controllerNonce,
+        target: gate,
+        abort: abortFile,
+        acknowledgement,
+        completion,
+        controls: [
+          ready,
+          pendingReady,
+          release,
+          abortFile,
+          acknowledgement,
+          completion,
+          controllerStatus,
+          pendingControllerStatus,
+          ...(controllerPause ? [controllerPause] : []),
+        ],
+        filesystem,
+        onFallback: test?.onPortableControllerFallback,
+      },
+      inspectKnown: test?.portableKnownInspect,
+      onSignalPath: test?.onPortableTrackerSignal,
+    })
+    // trackPortableProcess admits the reconciled direct gate immediately. Its
+    // broad nonce walk remains a cleanup mechanism and cannot delay launch.
     writeFileSync(release, "release")
-  } catch (cause) {
-    const errors: Error[] = [new Error("failed to open portable launch gate", { cause })]
-    const cleanupDeadline = Date.now() + 4_000
-    try {
-      writeFileSync(abortFile, "abort")
-    } catch (cleanup) {
-      collectCleanupErrors(errors, cleanup)
-    }
-    try {
-      await terminateProcessPromise(child, () => {}, tracker, cleanupDeadline)
-    } catch (cleanup) {
-      collectCleanupErrors(errors, cleanup)
-    }
-    ;[release, abortFile].forEach((file) => {
-      try {
-        if (existsSync(file)) unlinkSync(file)
-      } catch (cleanup) {
-        collectCleanupErrors(errors, cleanup)
+    while (true) {
+      const observation = await reconcilePortableLaunch(
+        child.pid,
+        nonce,
+        gate,
+        acquisitionDeadline,
+        () => exitState,
+        test?.portableObserve,
+      )
+      if (observation._tag === "ready") {
+        if (!tracker.handoff) throw new Error("portable tracker cannot adopt reconciled exec target")
+        await tracker.handoff(observation.target)
+        return { child, tracker, rawExited }
       }
-    })
-    throw new AggregateError(errors, "failed to release portable launch gate")
-  }
-  const transitionDeadline = acquisitionDeadline
-  while (Date.now() < transitionDeadline) {
-    const observed = (await tracker.scan(transitionDeadline)).find((identity) => identity.pid === child.pid)
-    if (tracker.errors.length) break
-    if (observed && observed.started === root.started && observed.executable !== root.executable)
-      return { child, tracker }
-    await new Promise<void>((resolve) => setTimeout(resolve, 5))
-  }
-  const errors: Error[] = [new Error("portable gate shell did not exec OpenCode with its recorded identity")]
-  try {
-    await terminateProcessPromise(child, () => {}, tracker, Date.now() + 4_000)
-  } catch (cleanup) {
-    collectCleanupErrors(errors, cleanup)
-  }
-  ;[release, abortFile].forEach((file) => {
-    try {
-      if (existsSync(file)) unlinkSync(file)
-    } catch (cleanup) {
-      collectCleanupErrors(errors, cleanup)
+      if (observation._tag === "exited") {
+        return { child, tracker, rawExited }
+      }
+      if (observation._tag === "conflict") throw new Error(observation.message)
+      if (observation._tag === "deadline")
+        throw new Error("portable gate did not reconcile its direct PID before launch deadline")
+      await Bun.sleep(5)
     }
+  } catch (cause) {
+    return await abort(cause)
+  }
+}
+
+// These use the same gated spawn path as the CLI builders while forcing the
+// portable branch. The injected filesystem is deliberately limited to test
+// seams around operations which otherwise throw synchronously from node:fs.
+export async function portableFilesystemFailureForTest(kind: "read" | "unlink") {
+  let exited: Promise<number> | undefined
+  let failed = false
+  const cause = await spawnTracked(
+    [process.execPath, "-e", 'process.stdout.write("started\\n"); process.stderr.write("started\\n"); setInterval(() => {}, 1_000)'],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableFilesystem: {
+        exists: existsSync,
+        read: (file) => {
+          if (kind === "read" && file.includes("opencode-ready-")) throw new Error("synthetic readiness read failed")
+          return readFileSync(file, "utf8")
+        },
+        unlink: (file) => {
+          if (kind === "unlink" && !failed && file.includes("opencode-ready-")) {
+            failed = true
+            throw new Error("synthetic readiness unlink failed")
+          }
+          unlinkSync(file)
+        },
+      },
+      onPortableSpawn: (child) => {
+        exited = child.exited
+        void exited.catch(() => {})
+      },
+    },
+  ).catch((cause) => cause)
+  const reaped = await Promise.resolve(exited).then(
+    () => true,
+    () => true,
+  )
+  return { cause, reaped }
+}
+
+export async function portableShortLivedProcessForTest(exitCode: number) {
+  const proc = await spawnTracked(
+    [
+      process.execPath,
+      "-e",
+      `process.stdout.write("short stdout\\n"); process.stderr.write("short stderr\\n"); process.exit(${exitCode})`,
+    ],
+    { stdout: "pipe", stderr: "pipe" },
+    { forcePortable: true },
+  )
+  const stdout = new Response(proc.child.stdout).text()
+  const stderr = new Response(proc.child.stderr).text()
+  const observed = proc.rawExited ?? proc.child.exited
+  const actual = await observed
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, observed)
+  return { exitCode: actual, stdout: await stdout, stderr: await stderr }
+}
+
+export async function portableInitialIdentityRetryForTest(kind: "delayed" | "unreadable") {
+  let attempts = 0
+  const proc = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
+        if (stage === "initial" && attempts++ < 2) {
+          if (kind === "unreadable") throw new Error("synthetic unreadable nonce")
+          return
+        }
+        return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+      },
+    },
+  )
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  return attempts
+}
+
+// Linux exposes the environment supplied at exec(2), not a shell's later
+// export. This forced-portable path proves the controller's protected nonce is
+// actually visible to /proc before it is admitted as the group sentinel.
+export async function portableLinuxControllerEnvironmentForTest() {
+  if (process.platform !== "linux") throw new Error("Linux /proc environment regression requires Linux")
+  let gatePID = 0
+  let controllerHasDistinctKernelNonce = false
+  const proc = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      onPortableSpawn: (child) => {
+        gatePID = child.pid
+      },
+      portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
+        if (stage === "initial" && pid !== gatePID) controllerHasDistinctKernelNonce = linuxHasNonce(pid, nonce)
+        return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+      },
+    },
+  )
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  return controllerHasDistinctKernelNonce
+}
+
+export async function portableReadinessPartialPublicationForTest() {
+  const start = async () => {
+    let partialReads = 0
+    const proc = await spawnTracked(
+      [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+      { stdout: "pipe", stderr: "pipe" },
+      {
+        forcePortable: true,
+        portableFilesystem: {
+          exists: existsSync,
+          read: (file) => {
+            const value = readFileSync(file, "utf8")
+            if (file.includes("opencode-ready-") && partialReads++ < 2) return partialReads === 1 ? "" : "rea"
+            return value
+          },
+          unlink: unlinkSync,
+        },
+      },
+    )
+    await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+    return partialReads
+  }
+  return Promise.all([start(), start()])
+}
+
+export async function portableReconciliationFailureCleanupForTest() {
+  let exited: Promise<number> | undefined
+  const cause = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
+        if (stage === "reconcile") throw new Error("synthetic reconciliation failure")
+        return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+      },
+      onPortableSpawn: (child) => {
+        exited = child.exited
+        void exited.catch(() => {})
+      },
+    },
+  ).catch((cause) => cause)
+  const reaped = await Promise.resolve(exited).then(
+    () => true,
+    () => true,
+  )
+  return { cause, reaped }
+}
+
+// This exercises the actual gated spawn and finalizer path. After exec, both
+// the cleanup observation and every exact-target recheck stay opaque while a
+// descendant ignores TERM. The pre-exec controller is the only authority that
+// can still contain that group, and its abort signal must also bound the
+// hanging observation itself.
+export async function portableOpaqueExecCleanupForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  const marker = path.join(os.tmpdir(), `opencode-portable-descendant-${crypto.randomUUID()}`)
+  const rootTermMarker = `${marker}.root-term`
+  const descendant = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)'
+  const target = `const child = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(descendant)}], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid)); process.on("SIGTERM", () => { require("node:fs").writeFileSync(${JSON.stringify(rootTermMarker)}, "TERM"); process.exit(0) }); setInterval(() => {}, 1_000)`
+  const started = Date.now()
+  const signalPaths: string[] = []
+  const initialNonces = new Map<number, string>()
+  const cause = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      unlink: (file) => {
+        if (file.includes("opencode-ready-")) throw new Error("synthetic post-exec cleanup trigger")
+        unlinkSync(file)
+      },
+    },
+    portableObserve: async (pid, nonce, deadline, confirmedNonce, stage, signal) => {
+      if (stage === "initial") initialNonces.set(pid, nonce)
+      if (stage === "reconcile") {
+        while (!existsSync(marker)) {
+          if (Date.now() >= deadline) throw new Error("descendant did not start before reconciliation deadline")
+          await Bun.sleep(5)
+        }
+      }
+      if (stage === "cleanup")
+        return new Promise<ProcessSnapshot | undefined>((_, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("synthetic hanging cleanup probe aborted")), {
+            once: true,
+          })
+        })
+      return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+    },
+    // Darwin finalization uses signalKnown before its broad nonce walk, so
+    // this reaches the native known-target branch. Linux uses tracker.signal;
+    // keep that assertion on its real branch below.
+    portableKnownInspect:
+      process.platform === "darwin"
+        ? async () => {
+            throw new Error("synthetic persistent post-exec native observation failure")
+          }
+        : undefined,
+    onPortableTrackerSignal: (path, signal) => signalPaths.push(`${path}:${signal}`),
+  }).catch((cause) => cause)
+  const descendantPID = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0
+  const descendantGone =
+    descendantPID > 0 &&
+    (() => {
+      try {
+        process.kill(descendantPID, 0)
+        return false
+      } catch (error) {
+        return isMissingProcess(error)
+      }
+    })()
+  const rootExitedAfterTerm = existsSync(rootTermMarker)
+  if (existsSync(marker)) unlinkSync(marker)
+  if (existsSync(rootTermMarker)) unlinkSync(rootTermMarker)
+  return {
+    cause,
+    descendantGone,
+    rootExitedAfterTerm,
+    durationMs: Date.now() - started,
+    signalPaths,
+    controllerHasDistinctNonce: new Set(initialNonces.values()).size === 2,
+  }
+}
+
+// A controller is deliberately outside nonce discovery. This regression keeps
+// a non-nonce child in the verified group, so ordinary scans become empty as
+// soon as the direct root exits. Successful finalization must still wait for
+// the controller's own bounded group KILL before it reports success.
+export async function portableControllerCompletionForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  const marker = path.join(os.tmpdir(), `opencode-portable-controller-child-${crypto.randomUUID()}`)
+  const child = `process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)`
+  const target = `const child = require("node:child_process").spawn("/usr/bin/env", ["-u", "OPENCODE_TEST_PROCESS_NONCE", ${JSON.stringify(process.execPath)}, "-e", ${JSON.stringify(child)}], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid)); process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1_000)`
+  const removed = new Set<string>()
+  const proc = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      unlink: (file) => {
+        removed.add(path.basename(file).replace(/-[^-]+$/, ""))
+        unlinkSync(file)
+      },
+    },
   })
-  throw new AggregateError(errors, "portable gate did not complete its exact exec transition")
+  while (!existsSync(marker)) await Bun.sleep(5)
+  const started = Date.now()
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  const pid = Number(readFileSync(marker, "utf8"))
+  const descendantGone = (() => {
+    try {
+      process.kill(pid, 0)
+      return false
+    } catch (cause) {
+      return isMissingProcess(cause)
+    }
+  })()
+  if (existsSync(marker)) unlinkSync(marker)
+  return { descendantGone, durationMs: Date.now() - started, removedControls: removed.size }
+}
+
+// Stop the controller at the exact point where the old protocol wrote its
+// success marker. The marker is now only kill-issued, so finalization must use
+// its own identity-checked group KILL rather than trusting that publication.
+export async function portableCompletionBeforeKillFallbackForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  const marker = path.join(os.tmpdir(), `opencode-portable-paused-child-${crypto.randomUUID()}`)
+  const pause = path.join(os.tmpdir(), `opencode-portable-pause-${crypto.randomUUID()}`)
+  writeFileSync(pause, "pause")
+  const child = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)'
+  const target = `const child = require("node:child_process").spawn("/usr/bin/env", ["-u", "OPENCODE_TEST_PROCESS_NONCE", ${JSON.stringify(process.execPath)}, "-e", ${JSON.stringify(child)}], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid)); process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1_000)`
+  let controls: { readonly ready: string; readonly completion: string } | undefined
+  let fallback = false
+  const proc = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableControllerPause: pause,
+    onPortableControllerSetup: (value) => {
+      controls = value
+    },
+    onPortableControllerFallback: () => {
+      fallback = true
+    },
+  })
+  if (!controls) throw new Error("portable controller controls were not published")
+  const controllerControls = controls
+  while (!existsSync(marker)) await Bun.sleep(5)
+  const controllerPID = Number(readFileSync(controllerControls.ready, "utf8").slice("ready:".length))
+  const termination = terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  try {
+    const issuedDeadline = Date.now() + 2_000
+    while (!existsSync(controllerControls.completion) && Date.now() < issuedDeadline) await Bun.sleep(5)
+    if (!existsSync(controllerControls.completion)) throw new Error("portable controller did not publish kill-issued before its pause")
+    const killIssued = readFileSync(controllerControls.completion, "utf8") === "kill-issued"
+    await termination
+    const descendantPID = Number(readFileSync(marker, "utf8"))
+    const rootGone = !(await portablePidExists(proc.child.pid, Date.now() + 1_000))
+    const descendantGone = !(await portablePidExists(descendantPID, Date.now() + 1_000))
+    const controllerGone = !(await portablePidExists(controllerPID, Date.now() + 1_000))
+    return { fallback, killIssued, rootGone, descendantGone, controllerGone }
+  } finally {
+    if (existsSync(pause)) unlinkSync(pause)
+    await termination.catch(() => undefined)
+    if (existsSync(marker)) unlinkSync(marker)
+  }
+}
+
+// An abort control can fail after the controller has been verified. That
+// failure remains diagnostic-only: exact controller-group fallback KILL and
+// all disappearance checks still have to run before cleanup returns.
+export async function portableAbortWriteFailureForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  const marker = path.join(os.tmpdir(), `opencode-portable-abort-write-${crypto.randomUUID()}`)
+  const descendant = 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000)'
+  const target = `const child = require("node:child_process").spawn("/usr/bin/env", ["-u", "OPENCODE_TEST_PROCESS_NONCE", ${JSON.stringify(process.execPath)}, "-e", ${JSON.stringify(descendant)}], { stdio: "ignore" }); require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid)); process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1_000)`
+  let fallback = false
+  const proc = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      write: (file, contents) => {
+        if (file.includes("opencode-abort-")) throw new Error("synthetic portable abort write failed")
+        writeFileSync(file, contents)
+      },
+      unlink: unlinkSync,
+    },
+    onPortableControllerFallback: () => {
+      fallback = true
+    },
+  })
+  while (!existsSync(marker)) await Bun.sleep(5)
+  const cause = await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited).catch(
+    (cause) => cause,
+  )
+  const descendantPID = Number(readFileSync(marker, "utf8"))
+  const descendantGone = !(await portablePidExists(descendantPID, Date.now() + 1_000))
+  if (existsSync(marker)) unlinkSync(marker)
+  return { cause, fallback, descendantGone }
+}
+
+// Force failure after controller identity verification but before tracker
+// creation. The gate exits on TERM; cleanup still has to use the verified
+// controller identity to KILL the group and prove that controller vanished.
+export async function portablePreTrackerControllerFailureForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  let controllerPID = 0
+  let rootExited: Promise<number> | undefined
+  let fallback = false
+  const cause = await spawnTracked([process.execPath, "-e", "setInterval(() => {}, 1_000)"], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      write: (file, contents) => {
+        if (file.includes("opencode-abort-")) throw new Error("synthetic pre-tracker portable abort write failed")
+        writeFileSync(file, contents)
+      },
+      unlink: unlinkSync,
+    },
+    onPortableSpawn: (child) => {
+      rootExited = child.exited
+      void rootExited.catch(() => {})
+    },
+    onPortableControllerSetup: ({ ready }) => {
+      controllerPID = Number(readFileSync(ready, "utf8").slice("ready:".length))
+      throw new Error("synthetic pre-tracker controller failure")
+    },
+    onPortableControllerFallback: () => {
+      fallback = true
+    },
+  }).catch((cause) => cause)
+  const rootReaped = await Promise.resolve(rootExited).then(
+    () => true,
+    () => true,
+  )
+  const controllerGone = controllerPID > 0 && !(await portablePidExists(controllerPID, Date.now() + 1_000))
+  return { cause, fallback, rootReaped, controllerGone }
+}
+
+// The first fallible owner observation happens before the gate can be
+// reconciled. It must be deferred until the nonce-authenticated controller is
+// captured, so an abort-write failure still reaches group KILL and drain
+// verification after the direct gate disappears.
+export async function portablePreControllerCaptureFailureForTest() {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  let controllerPID = 0
+  let rootExited: Promise<number> | undefined
+  let fallback = false
+  const cause = await spawnTracked([process.execPath, "-e", "setInterval(() => {}, 1_000)"], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableExitObservationFailure: true,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => readFileSync(file, "utf8"),
+      write: (file, contents) => {
+        if (file.includes("opencode-abort-")) throw new Error("synthetic pre-controller portable abort write failed")
+        writeFileSync(file, contents)
+      },
+      unlink: unlinkSync,
+    },
+    onPortableSpawn: (child) => {
+      rootExited = child.exited
+      void rootExited.catch(() => {})
+    },
+    onPortableControllerCapture: (controller) => {
+      controllerPID = controller.pid
+    },
+    onPortableControllerFallback: () => {
+      fallback = true
+    },
+  }).catch((cause) => cause)
+  const rootReaped = await Promise.resolve(rootExited).then(
+    () => true,
+    () => true,
+  )
+  const controllerGone = controllerPID > 0 && !(await portablePidExists(controllerPID, Date.now() + 1_000))
+  return { cause, fallback, rootReaped, controllerGone }
+}
+
+async function portableControllerRecoveryForTest(
+  kind: "read" | "authenticate",
+  failures: number,
+  controllerDescendant?: string,
+) {
+  if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
+  let attempts = 0
+  let controllerPID = 0
+  let fallback = false
+  const started = Date.now()
+  const cause = await spawnTracked([process.execPath, "-e", "setInterval(() => {}, 1_000)"], { stdout: "pipe", stderr: "pipe" }, {
+    forcePortable: true,
+    portableControllerDescendant: controllerDescendant,
+    portableFilesystem: {
+      exists: existsSync,
+      read: (file) => {
+        if (kind === "read" && file.includes("opencode-controller-") && attempts++ < failures)
+          throw new Error("synthetic controllerStatus read failed")
+        return readFileSync(file, "utf8")
+      },
+      write: (file, contents) => {
+        if (file.includes("opencode-abort-")) throw new Error("synthetic controller recovery abort write failed")
+        writeFileSync(file, contents)
+      },
+      unlink: unlinkSync,
+    },
+    portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
+      if (kind === "authenticate" && stage === "initial" && attempts++ < failures)
+        throw new Error("synthetic controllerStatus authentication failed")
+      return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+    },
+    onPortableControllerRecovered: (controller) => {
+      controllerPID = controller.pid
+    },
+    onPortableControllerFallback: () => {
+      fallback = true
+    },
+  }).catch((cause) => cause)
+  return {
+    cause,
+    fallback,
+    controllerPID,
+    controllerGone: controllerPID > 0 && !(await portablePidExists(controllerPID, Date.now() + 1_000)),
+    attempts,
+    durationMs: Date.now() - started,
+  }
+}
+
+export function portableControllerRecoveryFailureForTest(kind: "read" | "authenticate") {
+  return portableControllerRecoveryForTest(kind, 1)
+}
+
+// A permanently unreadable status record must not consume the acquisition
+// cleanup deadline. The controller's distinct nonce provides an independent,
+// authenticated route to the launch group even while the abort write fails.
+export function portablePersistentControllerRecoveryForTest(kind: "read" | "authenticate") {
+  return portableControllerRecoveryForTest(kind, Number.POSITIVE_INFINITY)
+}
+
+// Keep a bounded status retry window: publication or authentication may become
+// available after the first failing read without delaying the reserved final
+// TERM/KILL/reap phase.
+export function portableLateControllerRecoveryForTest(kind: "read" | "authenticate") {
+  return portableControllerRecoveryForTest(kind, 3)
+}
+
+export async function portableControllerDescendantPersistentRecoveryForTest(kind: "read" | "authenticate") {
+  const marker = path.join(os.tmpdir(), `opencode-controller-descendant-${crypto.randomUUID()}`)
+  try {
+    const result = await portableControllerRecoveryForTest(kind, Number.POSITIVE_INFINITY, marker)
+    const [controller, descendant] = existsSync(marker) ? readFileSync(marker, "utf8").split(":").map(Number) : []
+    return {
+      ...result,
+      recoveredController: result.controllerPID === controller,
+      descendantGone:
+        typeof descendant === "number" &&
+        Number.isSafeInteger(descendant) &&
+        !(await portablePidExists(descendant, Date.now() + 1_000)),
+    }
+  } finally {
+    if (existsSync(marker)) unlinkSync(marker)
+  }
 }
 
 async function observeOwnedExit(
@@ -2781,7 +4545,7 @@ async function terminateProcessPromise(
   child: Pick<ReturnType<typeof Bun.spawn>, "pid" | "kill" | "exited">,
   mark: ReturnType<typeof unitDiagnostic>,
   tracker: ProcessTracker,
-  deadline = Date.now() + 4_000,
+  deadline = Date.now() + (tracker.windowsJob ? windowsJobDrainReserveMs + windowsJobFallbackReserveMs : 4_000),
   observed?: Promise<number>,
 ) {
   if (tracker.run && tracker.unlocked) {
@@ -2798,9 +4562,16 @@ async function terminateProcessPromiseUnlocked(
   observed?: Promise<number>,
 ) {
   const errors: Error[] = []
+  const windowsPhases = tracker.windowsJob ? windowsJobCleanupPhases(deadline) : undefined
+  // Portable cleanup delegates its last containment step to a protected
+  // controller. Do not let ordinary nonce discovery consume the controller's
+  // fallback KILL and identity-verification window.
+  const containmentDeadline = tracker.abort
+    ? Math.max(Date.now(), deadline - portableControllerFallbackReserveMs)
+    : (windowsPhases?.fallbackDeadline ?? deadline)
   const owned = async () => {
     const priorErrors = tracker.errors.length
-    const processes = await tracker.scan(deadline)
+    const processes = await tracker.scan(containmentDeadline)
     if (tracker.errors.length !== priorErrors) errors.push(...tracker.errors.slice(priorErrors))
     return processes
   }
@@ -2809,13 +4580,17 @@ async function terminateProcessPromiseUnlocked(
     resignal?: "SIGTERM" | "SIGKILL",
     returnOnKnown = false,
   ) => {
-    const until = Math.min(deadline, Date.now() + milliseconds)
+    const until = Math.min(containmentDeadline, Date.now() + milliseconds)
     let emptyScans = 0
     while (true) {
       const processes = await owned()
       if (resignal && processes.length) await signal(resignal)
       if (returnOnKnown && tracker.hasKnown?.()) return false
-      if (tracker.errors.length === 0 && tracker.scanComplete?.() !== false && processes.length === 0) {
+      // An opaque post-exec Darwin observation is still reported, but the
+      // controlled gate has already terminated its own verified group. Do not
+      // spend the descendant reserve treating that diagnostic as live
+      // membership once complete scans prove the group is empty.
+      if ((tracker.abort || tracker.errors.length === 0) && tracker.scanComplete?.() !== false && processes.length === 0) {
         emptyScans += 1
         if (emptyScans >= quiescenceScans) return true
       } else {
@@ -2826,23 +4601,45 @@ async function terminateProcessPromiseUnlocked(
       await new Promise<void>((resolve) => setTimeout(resolve, Math.min(remaining, quiescenceDelayMs)))
     }
   }
-  const signal = async (name: "SIGTERM" | "SIGKILL") => {
+  const signal = async (name: "SIGTERM" | "SIGKILL", limit = containmentDeadline) => {
     const priorErrors = tracker.errors.length
     // Darwin's broad nonce discovery has a separate budget. The finalizer
     // must spend its TERM/KILL and direct-child reap reserve on identities it
     // already owns before starting a broad PID walk.
-    if (tracker.broadDiscovery && tracker.signalKnown) await tracker.signalKnown(name, deadline, mark)
-    else await tracker.signal(name, deadline, mark)
+    if (tracker.broadDiscovery && tracker.signalKnown) await tracker.signalKnown(name, limit, mark)
+    else await tracker.signal(name, limit, mark)
     errors.push(...tracker.errors.slice(priorErrors))
     mark("exit.wait", child.pid)
   }
-  const reap = async (stage: string, limit = deadline) => {
-    const remaining = Math.max(Math.min(limit, deadline) - Date.now(), 0)
+  const reap = async (stage: string, limit = containmentDeadline) => {
+    const remaining = Math.max(Math.min(limit, containmentDeadline) - Date.now(), 0)
     return exitedWithin(child, remaining, stage, errors, observed)
   }
   // A direct child exit is not proof that a shell, grandchild, or pipe owner
   // is gone. This applies to ACP's EOF path as much as forced termination.
   try {
+    // A portable controller is a verified member of the launch group. Arm it
+    // before any root-directed signal so it retains authority when TERM makes
+    // the root disappear while a descendant ignores that TERM.
+    try {
+      await tracker.abort?.()
+    } catch (cause) {
+      collectCleanupErrors(errors, cause)
+    }
+    if (windowsPhases) {
+      // The Job Object's own native drain must start before any membership
+      // scan. It owns the entire first phase; the second is still available
+      // to reap the captured supervisor and inspect failed containment.
+      await signal("SIGTERM", windowsPhases.drainDeadline)
+      const reaped = await reap("after Windows Job Object drain", windowsPhases.reapDeadline)
+      // Do not infer Job Object membership from the supervisor PID. Its
+      // disappearance can race a surviving member; only the authenticated
+      // zero-member native acknowledgement can establish containment.
+      if (!tracker.jobDrained?.())
+        errors.push(new Error(`Windows Job Object containment for ${child.pid} did not acknowledge zero members`))
+      if (!reaped)
+        errors.push(new Error(`Windows job supervisor ${child.pid} did not reap after the reserved fallback window`))
+    }
     if (tracker.broadDiscovery) {
       // Darwin's nonce walk is broad, potentially slow, and its cursor can be
       // incomplete. Keep it entirely after the direct child's TERM/KILL/reap
@@ -2855,7 +4652,7 @@ async function terminateProcessPromiseUnlocked(
         // Each scan consumes only its bounded Darwin slice and advances the
         // cursor. Do not use a separate 1.5s cap here: a late PID-list prefix
         // remains a possible nonce descendant until enumeration completes.
-        const killed = await goneWithin(Math.max(deadline - Date.now(), 0), "SIGKILL")
+        const killed = await goneWithin(Math.max(containmentDeadline - Date.now(), 0), "SIGKILL")
         if (!killed) {
           if (tracker.scanComplete?.() === false)
             errors.push(
@@ -2869,7 +4666,7 @@ async function terminateProcessPromiseUnlocked(
       }
       if (!reaped) errors.push(new Error(`direct child ${child.pid} did not reap before Darwin discovery could begin`))
     }
-    if (!tracker.broadDiscovery) {
+    if (!tracker.broadDiscovery && !windowsPhases) {
       const initiallyGone = await goneWithin(quiescenceDelayMs * quiescenceScans)
       if (!initiallyGone) {
         await signal("SIGTERM")
@@ -2889,7 +4686,7 @@ async function terminateProcessPromiseUnlocked(
       errors.push(new Error(`direct child ${child.pid} did not reap before the cleanup deadline`))
   } finally {
     try {
-      await tracker.stop()
+      await tracker.stop(deadline)
     } catch (cause) {
       collectCleanupErrors(errors, cause)
     }
@@ -2942,7 +4739,15 @@ async function cleanupAcpProcess(child: AcpCleanupChild, tracker: ProcessTracker
   // tracker, escalation, and reaping path.
   await exitedWithin(child, 2_000, "after stdin close", errors)
   try {
-    await terminateProcessPromise(child, mark, tracker, Date.now() + 4_000)
+    // A Windows Job Object needs its native drain acknowledgement interval
+    // before the independent fallback/reap phase. Four seconds only covered
+    // fallback, leaving its drain deadline at "now" for ACP cleanup.
+    await terminateProcessPromise(
+      child,
+      mark,
+      tracker,
+      Date.now() + (tracker.windowsJob ? windowsJobDrainReserveMs + windowsJobFallbackReserveMs : 4_000),
+    )
   } catch (cause) {
     collectCleanupErrors(errors, cause)
   }
@@ -2984,6 +4789,31 @@ export async function acpCleanupFailuresForTest() {
   } catch (cause) {
     return { cause, stopped, terminated }
   }
+}
+
+export async function acpWindowsDrainReserveForTest() {
+  let signalDeadline = 0
+  const started = Date.now()
+  await cleanupAcpProcess(
+    {
+      pid: 42,
+      kill: () => {},
+      exited: Promise.resolve(0),
+      stdin: { end: () => {} },
+    } as AcpCleanupChild,
+    {
+      scan: async () => [],
+      signal: async (_signal, deadline) => {
+        signalDeadline = deadline
+      },
+      stop: async () => {},
+      windowsJob: true,
+      jobDrained: () => true,
+      errors: [],
+    },
+    () => {},
+  )
+  return signalDeadline - started
 }
 
 function collectCleanupErrors(errors: Error[], cause: unknown) {
