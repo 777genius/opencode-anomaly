@@ -33,6 +33,8 @@ import {
   portableFilesystemFailureForTest,
   portableInitialIdentityRetryForTest,
   portableControllerVisibilityRetryForTest,
+  portableDelayedControllerHandshakeForTest,
+  portableControllerStartupFailureForTest,
   portableLinuxControllerEnvironmentForTest,
   portableShortLivedProcessForTest,
   portableReadinessPartialPublicationForTest,
@@ -690,7 +692,7 @@ describe("CLI process cleanup containment", () => {
   test("Windows supervisor gives its PowerShell/C# handshake a separate deadline", async () => {
     if (process.platform !== "win32") return
     await expect(
-      windowsSupervisorArgumentRoundTripForTest(["slow handshake"], 1_000, undefined, undefined, 1_500),
+      windowsSupervisorArgumentRoundTripForTest(["slow handshake"], 1_000, undefined, undefined, 4_500),
     ).resolves.toEqual(["slow handshake"])
   })
 
@@ -833,6 +835,23 @@ describe("CLI process cleanup containment", () => {
     await expect(portableControllerVisibilityRetryForTest()).resolves.toBeGreaterThanOrEqual(3)
   })
 
+  test("portable controller admission waits for delayed signed publication before opening the gate", async () => {
+    if (process.platform === "win32") return
+    const result = await portableDelayedControllerHandshakeForTest()
+    expect(result.ready).toBe(true)
+    expect(result.durationMs).toBeGreaterThanOrEqual(75)
+    expect(result.durationMs).toBeLessThan(2_000)
+  })
+
+  test("portable controller startup failure reaps the owned gate without accepting a missing controller", async () => {
+    if (process.platform === "win32") return
+    const result = await portableControllerStartupFailureForTest()
+    expect(result.cause).toBeInstanceOf(AggregateError)
+    expect(formatProcessErrorForTest(result.cause)).toContain("portable gate exited before controller handshake")
+    expect(result.reaped).toBe(true)
+    expect(result.durationMs).toBeLessThan(2_000)
+  })
+
   test("forced-portable Linux controller installs its protected nonce through exec", async () => {
     if (process.platform !== "linux") return
     await expect(portableLinuxControllerEnvironmentForTest()).resolves.toBe(true)
@@ -873,7 +892,7 @@ describe("CLI process cleanup containment", () => {
     expect(result.descendantGone).toBe(true)
     expect(result.durationMs).toBeGreaterThanOrEqual(400)
     expect(result.durationMs).toBeLessThan(2_500)
-    expect(result.removedControls).toBe(6)
+    expect(result.removedControls).toBe(7)
   })
 
   test("portable finalizer falls back when the controller pauses after kill-issued", async () => {

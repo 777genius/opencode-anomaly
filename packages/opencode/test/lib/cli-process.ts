@@ -161,6 +161,10 @@ const windowsJobDrainReserveMs = 4_000
 const windowsJobFallbackReserveMs = 4_000
 const windowsJobInspectionReserveMs = 500
 const windowsJobContainmentReserveMs = 500
+// The Job Object controller has to compile its C# interop on each fresh
+// PowerShell host. This is admission work, never target runtime work, and has
+// a bounded but deliberately independent budget on cold Windows runners.
+const windowsSupervisorAdmissionTimeoutMs = 12_000
 const linuxCgroupDiscoverySliceMs = 250
 const linuxProcDiscoverySliceMs = 250
 const linuxBootIdentity =
@@ -2958,7 +2962,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
     const stderrResult = new Response(child.stderr).text()
     void stdoutResult.catch(() => {})
     void stderrResult.catch(() => {})
-    const acquisitionDeadline = Date.now() + 4_000
+    const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
     while (!existsSync(status) && Date.now() < acquisitionDeadline)
       await new Promise<void>((resolve) => setTimeout(resolve, 5))
     if (!existsSync(status)) throw new Error("Windows supervisor did not publish launch status")
@@ -3299,6 +3303,8 @@ type SpawnTrackedTestOptions = {
   // This fixture keeps one alive so recovery has to distinguish the durable
   // controller authority from an ordinary inherited-nonce descendant.
   readonly portableControllerDescendant?: string
+  readonly portableControllerPublicationDelayMs?: number
+  readonly portableControllerStartupFailure?: boolean
   readonly portableExitObservationFailure?: boolean
   readonly onPortableControllerCapture?: (controller: ProcessSnapshot) => void
   readonly onPortableControllerRecovered?: (controller: ProcessSnapshot) => void
@@ -3307,6 +3313,7 @@ type SpawnTrackedTestOptions = {
   readonly portableKnownInspect?: (pid: number, deadline: number) => Promise<ProcessIdentity | undefined>
   readonly onPortableTrackerSignal?: (path: "signal" | "signalKnown", signal: "SIGINT" | "SIGTERM" | "SIGKILL") => void
   readonly onPortableSpawn?: (child: ReturnType<typeof Bun.spawn>) => void
+  readonly onPortableGateSpawn?: (child: ReturnType<typeof Bun.spawn>) => void
 }
 
 async function spawnTracked(
@@ -3351,11 +3358,12 @@ async function spawnTracked(
       }
       throw new Error("failed to spawn Windows job supervisor", { cause })
     }
-    const acquisitionDeadline = Date.now() + 4_000
+    const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
     let root: ProcessIdentity | undefined
     let rawExited: Promise<number> | undefined
     let stdout: ReadableStream<Uint8Array> | undefined
     let stderr: ReadableStream<Uint8Array> | undefined
+    let supervisorExited = false
     const abortLaunch = async (cause: unknown) => {
       const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
       const cleanupDeadline = Date.now() + 4_000
@@ -3415,8 +3423,18 @@ async function spawnTracked(
       stdout = child.stdout
       stderr = child.stderr
       void Promise.resolve(rawExited).catch(() => {})
-      while (!existsSync(status) && Date.now() < acquisitionDeadline)
+      rawExited.then(
+        () => {
+          supervisorExited = true
+        },
+        () => {
+          supervisorExited = true
+        },
+      )
+      while (!existsSync(status) && !supervisorExited && Date.now() < acquisitionDeadline)
         await new Promise<void>((resolve) => setTimeout(resolve, 5))
+      if (supervisorExited)
+        throw new Error("Windows Job Object supervisor exited before publishing its authenticated launch status")
       root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
       if (!root) {
         throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
@@ -3529,6 +3547,10 @@ async function spawnTracked(
   const pendingReady = `${ready}.pending`
   const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
   const abortFile = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
+  // The controller cannot make the gate ready until this parent-issued,
+  // nonce-bound acknowledgement arrives. It turns publication into a real
+  // child-to-parent admission handshake instead of a lossy observation race.
+  const admission = path.join(os.tmpdir(), `opencode-admission-${nonce}`)
   const acknowledgement = path.join(os.tmpdir(), `opencode-ack-${nonce}`)
   const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
   // This separate, atomically published controller record is deliberately
@@ -3539,6 +3561,7 @@ async function spawnTracked(
   const pendingControllerStatus = `${controllerStatus}.pending`
   const controllerPause = test?.portableControllerPause
   const controllerDescendant = test?.portableControllerDescendant
+  const controllerPublicationDelay = test?.portableControllerPublicationDelayMs
   const filesystem =
     test?.portableFilesystem ??
     ({
@@ -3560,7 +3583,7 @@ async function spawnTracked(
         // Once abort is observed, the controller remains in the verified
         // group after the leader exits. It keeps that numeric group from
         // being recycled, then always kills it after a bounded TERM grace.
-        `leader=$$; controller_nonce="$7"; (
+        `leader=$$; controller_nonce="$8"; (
           # A shell assignment in this fork is not visible in Linux /proc until
           # an exec. The controller owns the eventual group KILL, so publish
           # its PID only after exec has installed its distinct kernel env.
@@ -3569,18 +3592,27 @@ async function spawnTracked(
             abort=$2
             pending=$3
             ready=$4
-            acknowledgement=$5
-            completion=$6
-            pause=$7
-            controller_status=$8
-            controller_descendant=$9
+            admission=$5
+            acknowledgement=$6
+            completion=$7
+            pause=$8
+            controller_status=$9
+            controller_descendant=\${10}
+            publication_delay=\${11}
+            startup_failure=\${12}
             controller_pending="$controller_status.pending"
+            [ "$startup_failure" = "true" ] && exit 125
             if [ -n "$controller_descendant" ]; then
-              /bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
+              sleep 1000000 &
               printf "%s:%s" "$$" "$!" > "$controller_descendant"
             fi
-            printf "controller:%s" "$$" > "$controller_pending" && mv -f "$controller_pending" "$controller_status"
+            [ -n "$publication_delay" ] && sleep "$publication_delay"
+            printf "controller:%s:%s" "$OPENCODE_TEST_PROCESS_NONCE" "$$" > "$controller_pending" && mv -f "$controller_pending" "$controller_status"
             trap "" TERM
+            expected_admission="admitted:$OPENCODE_TEST_PROCESS_NONCE:$$"
+            while [ ! -e "$admission" ] && [ ! -e "$abort" ]; do sleep 0.01; done
+            [ -e "$abort" ] && exit 125
+            [ "$(cat "$admission")" = "$expected_admission" ] || exit 125
             printf "ready:%s" "$$" > "$pending" && mv -f "$pending" "$ready"
             while [ ! -e "$abort" ]; do sleep 0.01; done
             printf "ack" > "$acknowledgement"
@@ -3592,19 +3624,22 @@ async function spawnTracked(
             printf "kill-issued" > "$completion"
             while [ -n "$pause" ] && [ -e "$pause" ]; do sleep 0.01; done
             kill -KILL -"$leader" 2>/dev/null || { printf "failed" > "$completion"; exit 1; }
-          ' controller "$leader" "$4" "$1" "$2" "$5" "$6" "$8" "$9" "\${10}"
-        ) >/dev/null 2>&1 & while [ ! -e "$3" ] && [ ! -e "$4" ]; do sleep 0.01; done; [ -e "$4" ] && exit 125; rm "$3"; shift 10; exec "$@"`,
+          ' controller "$leader" "$4" "$1" "$2" "$5" "$6" "$7" "$9" "\${10}" "\${11}" "\${12}" "\${13}"
+        ) >/dev/null 2>&1 & controller=$!; while [ ! -e "$3" ] && [ ! -e "$4" ]; do kill -0 "$controller" 2>/dev/null || exit 125; sleep 0.01; done; [ -e "$4" ] && exit 125; rm "$3"; shift 13; exec "$@"`,
         "--",
         pendingReady,
         ready,
         release,
         abortFile,
+        admission,
         acknowledgement,
         completion,
         controllerNonce,
         controllerPause ?? "",
         controllerStatus,
         controllerDescendant ?? "",
+        controllerPublicationDelay ? `${controllerPublicationDelay / 1_000}` : "",
+        test?.portableControllerStartupFailure ? "true" : "",
         ...command,
       ],
       {
@@ -3616,6 +3651,7 @@ async function spawnTracked(
   } catch (cause) {
     throw new Error("failed to spawn portable gate", { cause })
   }
+  test?.onPortableGateSpawn?.(child)
   const acquisitionDeadline = Date.now() + 4_000
   let rawExited: Promise<number> | undefined
   let tracker: ProcessTracker | undefined
@@ -3636,13 +3672,16 @@ async function spawnTracked(
     let controllerRecord = ""
     let failure: unknown
     while (Date.now() < deadline) {
+      if (exitState === "exited") throw new Error("portable gate exited before controller handshake")
+      if (exitState === "failed") throw new Error("failed to observe portable gate exit before controller handshake")
       try {
         controllerRecord = filesystem.read(controllerStatus)
-        if (!controllerRecord.startsWith("controller:")) {
+        const prefix = `controller:${controllerNonce}:`
+        if (!controllerRecord.startsWith(prefix)) {
           await Bun.sleep(5)
           continue
         }
-        const controllerPID = Number(controllerRecord.slice("controller:".length))
+        const controllerPID = Number(controllerRecord.slice(prefix.length))
         if (!Number.isSafeInteger(controllerPID) || controllerPID <= 0)
           throw new Error("portable gate did not publish a valid controller identity before launch")
         const captured = await observePortable(
@@ -3665,6 +3704,7 @@ async function spawnTracked(
         }
         if (!captured.nonce || captured.group !== child.pid)
           throw new Error("portable gate controller was not nonce-authenticated before launch")
+        ;(filesystem.write ?? writeFileSync)(admission, `admitted:${controllerNonce}:${controllerPID}`)
         return captured
       } catch (cause) {
         if (!retryFailures && !isMissingProcess(cause)) throw cause
@@ -3724,6 +3764,7 @@ async function spawnTracked(
               pendingReady,
               release,
               abortFile,
+              admission,
               acknowledgement,
               completion,
               controllerStatus,
@@ -3876,6 +3917,7 @@ async function spawnTracked(
           pendingReady,
           release,
           abortFile,
+          admission,
           acknowledgement,
           completion,
           controllerStatus,
@@ -4013,6 +4055,52 @@ export async function portableControllerVisibilityRetryForTest() {
   )
   await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
   return controllerObservations
+}
+
+// This uses the production gate. The controller delays its signed publication,
+// then waits for the parent's exact acknowledgement before it can publish
+// readiness or permit the target to exec.
+export async function portableDelayedControllerHandshakeForTest() {
+  const started = Date.now()
+  let ready = false
+  const proc = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableControllerPublicationDelayMs: 100,
+      onPortableControllerSetup: () => {
+        ready = true
+      },
+    },
+  )
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  return { ready, durationMs: Date.now() - started }
+}
+
+// A controller that exits before publication must make its gate exit too.
+// That gives the parent a bounded, owned cleanup path without accepting a
+// missing authority or guessing at a process group discovered after the fact.
+export async function portableControllerStartupFailureForTest() {
+  let exited: Promise<number> | undefined
+  const started = Date.now()
+  const cause = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableControllerStartupFailure: true,
+      onPortableGateSpawn: (child) => {
+        exited = child.exited
+        void exited.catch(() => {})
+      },
+    },
+  ).catch((cause) => cause)
+  const reaped = await Promise.resolve(exited).then(
+    () => true,
+    () => true,
+  )
+  return { cause, reaped, durationMs: Date.now() - started }
 }
 
 // Linux exposes the environment supplied at exec(2), not a shell's later
