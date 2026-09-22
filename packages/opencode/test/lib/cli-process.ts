@@ -37,11 +37,15 @@ import { Clock, Deferred, Duration, Effect, Layer, Queue, Schedule, Scope, Semap
 import { FetchHttpClient, HttpClient } from "effect/unstable/http"
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  renameSync,
   readlinkSync,
   rmdirSync,
   unlinkSync,
@@ -3551,6 +3555,7 @@ async function spawnTracked(
   // nonce-bound acknowledgement arrives. It turns publication into a real
   // child-to-parent admission handshake instead of a lossy observation race.
   const admission = path.join(os.tmpdir(), `opencode-admission-${nonce}`)
+  const pendingAdmission = `${admission}.pending`
   const acknowledgement = path.join(os.tmpdir(), `opencode-ack-${nonce}`)
   const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
   // This separate, atomically published controller record is deliberately
@@ -3603,7 +3608,11 @@ async function spawnTracked(
             controller_pending="$controller_status.pending"
             [ "$startup_failure" = "true" ] && exit 125
             if [ -n "$controller_descendant" ]; then
-              sleep 1000000 &
+              # This is deliberately a separate shell rather than sleep: it
+              # ignores TERM after the controller exits, so the controller's
+              # group KILL remains the only way to prove containment. Escape
+              # its empty trap action for this enclosing single-quoted script.
+              /bin/sh -c "trap \\\"\\\" TERM; while :; do sleep 1; done" &
               printf "%s:%s" "$$" "$!" > "$controller_descendant"
             fi
             [ -n "$publication_delay" ] && sleep "$publication_delay"
@@ -3704,7 +3713,21 @@ async function spawnTracked(
         }
         if (!captured.nonce || captured.group !== child.pid)
           throw new Error("portable gate controller was not nonce-authenticated before launch")
-        ;(filesystem.write ?? writeFileSync)(admission, `admitted:${controllerNonce}:${controllerPID}`)
+        // The controller uses an exists-then-read protocol. Publish a fully
+        // durable record as one namespace transition so it can never accept a
+        // partly written acknowledgement after a parent crash.
+        const descriptor = openSync(
+          pendingAdmission,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+          0o600,
+        )
+        try {
+          writeFileSync(descriptor, `admitted:${controllerNonce}:${controllerPID}`)
+          fsyncSync(descriptor)
+        } finally {
+          closeSync(descriptor)
+        }
+        renameSync(pendingAdmission, admission)
         return captured
       } catch (cause) {
         if (!retryFailures && !isMissingProcess(cause)) throw cause
@@ -3765,6 +3788,7 @@ async function spawnTracked(
               release,
               abortFile,
               admission,
+              pendingAdmission,
               acknowledgement,
               completion,
               controllerStatus,
@@ -3918,6 +3942,7 @@ async function spawnTracked(
           release,
           abortFile,
           admission,
+          pendingAdmission,
           acknowledgement,
           completion,
           controllerStatus,
@@ -4061,21 +4086,39 @@ export async function portableControllerVisibilityRetryForTest() {
 // then waits for the parent's exact acknowledgement before it can publish
 // readiness or permit the target to exec.
 export async function portableDelayedControllerHandshakeForTest() {
+  const marker = path.join(os.tmpdir(), `opencode-delayed-controller-target-${crypto.randomUUID()}`)
   const started = Date.now()
-  let ready = false
-  const proc = await spawnTracked(
-    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
-    { stdout: "pipe", stderr: "pipe" },
-    {
-      forcePortable: true,
-      portableControllerPublicationDelayMs: 100,
-      onPortableControllerSetup: () => {
-        ready = true
+  let admittedAt = 0
+  let targetExecutedBeforeAdmission = false
+  try {
+    const proc = await spawnTracked(
+      [
+        process.execPath,
+        "-e",
+        `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "executed"); setInterval(() => {}, 1_000)`,
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+      {
+        forcePortable: true,
+        portableControllerPublicationDelayMs: 100,
+        onPortableControllerCapture: () => {
+          admittedAt = Date.now()
+          targetExecutedBeforeAdmission = existsSync(marker)
+        },
       },
-    },
-  )
-  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
-  return { ready, durationMs: Date.now() - started }
+    )
+    const targetDeadline = Date.now() + 1_000
+    while (!existsSync(marker) && Date.now() < targetDeadline) await Bun.sleep(5)
+    const targetExecuted = existsSync(marker)
+    await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+    return {
+      admissionDurationMs: admittedAt - started,
+      targetExecuted,
+      targetExecutedBeforeAdmission,
+    }
+  } finally {
+    if (existsSync(marker)) unlinkSync(marker)
+  }
 }
 
 // A controller that exits before publication must make its gate exit too.

@@ -838,9 +838,11 @@ describe("CLI process cleanup containment", () => {
   test("portable controller admission waits for delayed signed publication before opening the gate", async () => {
     if (process.platform === "win32") return
     const result = await portableDelayedControllerHandshakeForTest()
-    expect(result.ready).toBe(true)
-    expect(result.durationMs).toBeGreaterThanOrEqual(75)
-    expect(result.durationMs).toBeLessThan(2_000)
+    expect(result.targetExecutedBeforeAdmission).toBe(false)
+    expect(result.targetExecuted).toBe(true)
+    // This is recorded before cleanup's independent TERM grace begins.
+    expect(result.admissionDurationMs).toBeGreaterThanOrEqual(75)
+    expect(result.admissionDurationMs).toBeLessThan(2_000)
   })
 
   test("portable controller startup failure reaps the owned gate without accepting a missing controller", async () => {
