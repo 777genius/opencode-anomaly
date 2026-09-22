@@ -2414,32 +2414,6 @@ function serializeTracker(tracker: ProcessTracker): ProcessTracker {
   }
 }
 
-async function windowsIdentity(pid: number, deadline = Date.now() + 4_000) {
-  const output = await commandOutput(
-    [
-      "powershell.exe",
-      "-NoProfile",
-      "-Command",
-      `Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\" | ForEach-Object { $process = Get-Process -Id $_.ProcessId -ErrorAction Stop; \"$($_.ProcessId)\t$($_.ParentProcessId)\t$($process.StartTime.ToFileTimeUtc())\t$($_.ExecutablePath)\" }`,
-    ],
-    deadline,
-  )
-  return windowsIdentityObservationForTest(pid, new TextDecoder().decode(new TextEncoder().encode(output))).map(
-    (identity) => ({
-      ...identity,
-      group: 0,
-      // FILETIME is a 64-bit value. Keep its validated decimal spelling intact:
-      // converting it to Number would collapse distinct identities.
-      started: `native:${identity.created}`,
-      executable: identity.executable,
-      containment: "job",
-      // CIM cannot attest an environment nonce. Windows ownership comes solely
-      // from the Job Object established by the supervisor.
-      nonce: false,
-    }),
-  )
-}
-
 export function windowsIdentityObservationForTest(pid: number, output: string) {
   if (output.length === 0) return []
   const record = output.endsWith("\r\n") ? output.slice(0, -2) : output.endsWith("\n") ? output.slice(0, -1) : output
@@ -2564,18 +2538,13 @@ function trackWindowsProcess(
 ): ProcessTracker {
   const errors: Error[] = []
   let drained = false
-  const scan = async (deadline = Date.now() + 4_000) => {
-    try {
-      const current = (await windowsIdentity(child.pid, deadline))[0]
-      if (!current) return []
-      if (!sameIdentity(root, current))
-        recordError(errors, `Windows job supervisor ${child.pid} identity changed`, undefined)
-      return [root]
-    } catch (cause) {
-      recordError(errors, `failed to scan Windows containment for process ${child.pid}`, cause)
-      return [root]
-    }
-  }
+  // The status record is atomically published by the native Job Object
+  // controller after it has created the job and read its own process creation
+  // token. Combining that immutable record with Bun's captured process handle
+  // is the ownership proof. Starting another PowerShell/CIM process here made
+  // containment admission depend on an unrelated controller's startup and
+  // could consume the entire bounded acquisition window.
+  const scan = async () => [root]
   return serializeTracker({
     windowsJob: true,
     jobDrained: () => drained,
@@ -2596,7 +2565,7 @@ function trackWindowsProcess(
         deadline,
         mark,
         errors,
-        async (inspectionDeadline) => (await windowsIdentity(child.pid, inspectionDeadline))[0],
+        async () => root,
         () => writeFileSync(abort, "abort"),
         () => existsSync(completion) && windowsSupervisorCompletion(readFileSync(completion, "utf8"), job),
       )
@@ -2892,6 +2861,27 @@ function windowsSupervisorStatus(record: string) {
 
 export function windowsSupervisorStatusForTest(record: string) {
   return windowsSupervisorStatus(record)
+}
+
+function windowsSupervisorIdentity(record: string, pid: number, job: string) {
+  const status = windowsSupervisorStatus(record)
+  if (!status || status.pid !== pid || status.job !== job) return
+  return {
+    pid,
+    // FILETIME is a 64-bit value. Keep its validated decimal spelling intact:
+    // converting it to Number would collapse distinct identities.
+    started: `native:${status.created}`,
+    // The native Job Object, not a PID lookup, is the Windows containment
+    // authority. Keep the authenticated job token as this identity's stable
+    // executable component so later cleanup never starts a second PowerShell
+    // observer merely to rediscover the controller.
+    executable: `job:${status.job}`,
+    containment: "job",
+  } satisfies ProcessIdentity
+}
+
+export function windowsSupervisorIdentityForTest(record: string, pid: number, job: string) {
+  return windowsSupervisorIdentity(record, pid, job)
 }
 
 function windowsSupervisorCompletion(record: string, job: string) {
@@ -3382,22 +3372,6 @@ async function spawnTracked(
         recordError(errors, "failed to write Windows acquisition release", releaseCause)
       }
       try {
-        // Bun's handle was captured as part of spawn and remains exact even
-        // while the PowerShell supervisor is still initializing. If a status
-        // record exists, also require its immutable creation token to match.
-        if (root) {
-          try {
-            const current = (await windowsIdentity(child.pid, cleanupDeadline))[0]
-            if (current && !sameIdentity(root, current))
-              recordError(
-                errors,
-                `Windows job supervisor ${child.pid} identity changed during acquisition cleanup`,
-                undefined,
-              )
-          } catch (termination) {
-            recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
-          }
-        }
         try {
           // Do this even if identity/status probing failed. `child` carries
           // Bun's exact native handle, so it cannot resolve a recycled PID.
@@ -3443,14 +3417,8 @@ async function spawnTracked(
       void Promise.resolve(rawExited).catch(() => {})
       while (!existsSync(status) && Date.now() < acquisitionDeadline)
         await new Promise<void>((resolve) => setTimeout(resolve, 5))
-      const trustedStatus = existsSync(status) ? windowsSupervisorStatus(readFileSync(status, "utf8")) : undefined
-      root = (await windowsIdentity(child.pid, acquisitionDeadline))[0]
-      if (
-        !root ||
-        trustedStatus?.pid !== child.pid ||
-        trustedStatus.job !== nonce ||
-        root.started !== `native:${trustedStatus.created}`
-      ) {
+      root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
+      if (!root) {
         throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
       }
       const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
@@ -3685,7 +3653,17 @@ async function spawnTracked(
           true,
           "initial",
         )
-        if (!captured || !captured.nonce || captured.group !== child.pid)
+        // Publishing the record is ordered after exec, but /proc can still
+        // briefly return no environment for that just-exec'd controller. A
+        // missing exact observation is readiness, not authority: retry the
+        // same authenticated PID until the admission deadline. A visible
+        // wrong nonce or group remains fail-closed and is never retried.
+        if (!captured) {
+          failure = new Error("portable gate controller was not yet visible before launch")
+          await Bun.sleep(5)
+          continue
+        }
+        if (!captured.nonce || captured.group !== child.pid)
           throw new Error("portable gate controller was not nonce-authenticated before launch")
         return captured
       } catch (cause) {
@@ -4014,6 +3992,27 @@ export async function portableInitialIdentityRetryForTest(kind: "delayed" | "unr
   )
   await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
   return attempts
+}
+
+// The controller publishes its atomically renamed status after exec, but an
+// immediate Linux /proc environment read can still be briefly empty. Exercise
+// that exact controller-only admission race: retries must retain the same
+// status PID and eventually establish authenticated containment.
+export async function portableControllerVisibilityRetryForTest() {
+  let controllerObservations = 0
+  const proc = await spawnTracked(
+    [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
+    { stdout: "pipe", stderr: "pipe" },
+    {
+      forcePortable: true,
+      portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
+        if (stage === "initial" && controllerObservations++ < 2) return
+        return portableSnapshot(pid, nonce, deadline, confirmedNonce)
+      },
+    },
+  )
+  await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 4_000, proc.rawExited)
+  return controllerObservations
 }
 
 // Linux exposes the environment supplied at exec(2), not a shell's later

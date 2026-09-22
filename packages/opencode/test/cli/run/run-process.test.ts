@@ -32,6 +32,7 @@ import {
   portableGateEscalationForTest,
   portableFilesystemFailureForTest,
   portableInitialIdentityRetryForTest,
+  portableControllerVisibilityRetryForTest,
   portableLinuxControllerEnvironmentForTest,
   portableShortLivedProcessForTest,
   portableReadinessPartialPublicationForTest,
@@ -61,6 +62,7 @@ import {
   windowsSupervisorDrainLifecycleForTest,
   windowsSupervisorCompletionForTest,
   windowsSupervisorProtocolForTest,
+  windowsSupervisorIdentityForTest,
   windowsSupervisorStatusForTest,
   linuxCgroupDiscoveryDeadlineForTest,
   abortedCgroupMembershipDeadlineForTest,
@@ -531,6 +533,19 @@ describe("CLI process cleanup containment", () => {
     })
   })
 
+  test("Windows acquisition derives controller identity from its authenticated Job Object status", () => {
+    const job = "3d2bb1c6-655a-4c55-ae29-a20439c11672"
+    const record = `123\t134102758400000000\t${job}`
+    expect(windowsSupervisorIdentityForTest(record, 123, job)).toEqual({
+      pid: 123,
+      started: "native:134102758400000000",
+      executable: `job:${job}`,
+      containment: "job",
+    })
+    expect(windowsSupervisorIdentityForTest(record, 124, job)).toBeUndefined()
+    expect(windowsSupervisorIdentityForTest(record, 123, "8d2bb1c6-655a-4c55-ae29-a20439c11672")).toBeUndefined()
+  })
+
   test("helper accepts only a complete atomically published numeric status", () => {
     expect(commandStatusForTest("0\n")).toBe(0)
     expect(commandStatusForTest("125\n")).toBe(125)
@@ -811,6 +826,11 @@ describe("CLI process cleanup containment", () => {
     if (process.platform === "win32") return
     await expect(portableInitialIdentityRetryForTest("delayed")).resolves.toBeGreaterThanOrEqual(3)
     await expect(portableInitialIdentityRetryForTest("unreadable")).resolves.toBeGreaterThanOrEqual(3)
+  })
+
+  test("portable controller admission retries an initially invisible authenticated status PID", async () => {
+    if (process.platform === "win32") return
+    await expect(portableControllerVisibilityRetryForTest()).resolves.toBeGreaterThanOrEqual(3)
   })
 
   test("forced-portable Linux controller installs its protected nonce through exec", async () => {
