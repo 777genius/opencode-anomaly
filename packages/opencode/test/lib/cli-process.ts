@@ -2866,6 +2866,7 @@ export async function abortedCgroupMembershipDeadlineForTest() {
 function windowsSupervisorScript() {
   const separator = "\t"
   const script = String.raw`param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Command)
+if ($env:OPENCODE_TEST_FAIL_BEFORE_STATUS -eq "1") { exit 125 }
 Add-Type @'
 using System;
 using System.Text;
@@ -3127,6 +3128,23 @@ export async function windowsSupervisorArgumentRoundTripForTest(
         operationError ? [operationError, ...cleanupErrors] : cleanupErrors,
         "Windows supervisor argv probe cleanup failed",
       )
+  }
+}
+
+export async function windowsSupervisorStartupRetryForTest() {
+  if (process.platform !== "win32") throw new Error("Windows supervisor test requires Windows")
+  const proc = await spawnTracked(
+    [process.execPath, "-e", 'process.stdout.write("ready")'],
+    { env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+    { windowsFailFirstSupervisor: true },
+  )
+  const observed = proc.rawExited ?? proc.child.exited
+  try {
+    if (!proc.stdout) throw new Error("Windows supervisor did not expose stdout")
+    const [exitCode, stdout] = await Promise.all([observed, new Response(proc.stdout).text()])
+    return { exitCode, stdout }
+  } finally {
+    await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 8_000, observed)
   }
 }
 
@@ -3431,6 +3449,7 @@ async function observePortable(
 
 type SpawnTrackedTestOptions = {
   readonly forcePortable?: boolean
+  readonly windowsFailFirstSupervisor?: boolean
   readonly portableFilesystem?: PortableFilesystem
   readonly portableObserve?: PortableObserve
   // The test-only pause sits after the controller publishes kill-issued and
@@ -3460,133 +3479,163 @@ async function spawnTracked(
   test?: SpawnTrackedTestOptions,
 ) {
   if (process.platform === "win32") {
-    const nonce = crypto.randomUUID()
-    const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
-    const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
-    const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
-    const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
-    const supervisor = writeWindowsSupervisor(nonce)
-    let child: ReturnType<typeof Bun.spawn>
-    try {
-      // `-File` gives the script's ValueFromRemainingArguments parameter the
-      // original argv. With `-Command`, these values are concatenated into
-      // PowerShell source and no longer arrive in `$Command` reliably.
-      child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor, ...command], {
-        ...options,
-        env: {
-          ...options.env,
-          OPENCODE_TEST_RELEASE: release,
-          OPENCODE_TEST_ABORT: abort,
-          OPENCODE_TEST_STATUS: status,
-          OPENCODE_TEST_COMPLETION: completion,
-          OPENCODE_TEST_JOB_ID: nonce,
-        },
-      })
-    } catch (cause) {
+    const startupFailures: Error[] = []
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const nonce = crypto.randomUUID()
+      const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
+      const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
+      const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
+      const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
+      const supervisor = writeWindowsSupervisor(nonce)
+      let child: ReturnType<typeof Bun.spawn>
       try {
-        unlinkSync(supervisor)
-      } catch (cleanup) {
-        throw new AggregateError(
-          [
-            new Error("failed to spawn Windows job supervisor", { cause }),
-            new Error("failed to remove Windows supervisor script", { cause: cleanup }),
-          ],
-          "failed to establish Windows Job Object containment",
-        )
-      }
-      throw new Error("failed to spawn Windows job supervisor", { cause })
-    }
-    const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
-    let root: ProcessIdentity | undefined
-    let rawExited: Promise<number> | undefined
-    let stdout: ReadableStream<Uint8Array> | undefined
-    let stderr: ReadableStream<Uint8Array> | undefined
-    let supervisorExited = false
-    const abortLaunch = async (cause: unknown) => {
-      const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
-      const cleanupDeadline = Date.now() + 4_000
-      // These must stay separate. If either filesystem operation fails, the
-      // other still gives the provisional supervisor a path to exit.
-      try {
-        writeFileSync(abort, "abort")
-      } catch (abortCause) {
-        recordError(errors, "failed to write Windows acquisition abort", abortCause)
-      }
-      try {
-        writeFileSync(release, "release")
-      } catch (releaseCause) {
-        recordError(errors, "failed to write Windows acquisition release", releaseCause)
-      }
-      try {
-        try {
-          // Do this even if identity/status probing failed. `child` carries
-          // Bun's exact native handle, so it cannot resolve a recycled PID.
-          child.kill()
-        } catch (termination) {
-          if (!isMissingProcess(termination))
-            recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
-        }
-        if (
-          !(await exitedWithin(
-            child,
-            Math.max(cleanupDeadline - Date.now(), 0),
-            "after Windows acquisition failure",
-            errors,
-            rawExited,
-          ))
-        ) {
-          errors.push(new Error("Windows Job Object supervisor did not exit after acquisition failure"))
-        }
-      } finally {
-        // The supervisor may still be observing these files until it is known
-        // dead. Do not remove a control signal before the reap above.
-        ;[status, release, abort, completion, supervisor].forEach((file) => {
-          try {
-            if (existsSync(file)) unlinkSync(file)
-          } catch (cleanup) {
-            recordError(errors, `failed to remove Windows acquisition control ${file}`, cleanup)
-          }
+        // `-File` gives the script's ValueFromRemainingArguments parameter the
+        // original argv. With `-Command`, these values are concatenated into
+        // PowerShell source and no longer arrive in `$Command` reliably.
+        child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor, ...command], {
+          ...options,
+          env: {
+            ...options?.env,
+            OPENCODE_TEST_RELEASE: release,
+            OPENCODE_TEST_ABORT: abort,
+            OPENCODE_TEST_STATUS: status,
+            OPENCODE_TEST_COMPLETION: completion,
+            OPENCODE_TEST_JOB_ID: nonce,
+            OPENCODE_TEST_FAIL_BEFORE_STATUS: test?.windowsFailFirstSupervisor && attempt === 0 ? "1" : "0",
+          },
         })
+      } catch (cause) {
+        try {
+          unlinkSync(supervisor)
+        } catch (cleanup) {
+          throw new AggregateError(
+            [
+              new Error("failed to spawn Windows job supervisor", { cause }),
+              new Error("failed to remove Windows supervisor script", { cause: cleanup }),
+            ],
+            "failed to establish Windows Job Object containment",
+          )
+        }
+        throw new Error("failed to spawn Windows job supervisor", { cause })
       }
-      throw new AggregateError(errors, "failed to establish Windows Job Object containment")
+      const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
+      let root: ProcessIdentity | undefined
+      let rawExited: Promise<number> | undefined
+      let stdout: ReadableStream<Uint8Array> | undefined
+      let stderr: ReadableStream<Uint8Array> | undefined
+      let supervisorExited = false
+      let observedExitCode: number | undefined
+      let exitedBeforeRelease = false
+      const abortLaunch = async (cause: unknown) => {
+        const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
+        const cleanupDeadline = Date.now() + 4_000
+        // These must stay separate. If either filesystem operation fails, the
+        // other still gives the provisional supervisor a path to exit.
+        try {
+          writeFileSync(abort, "abort")
+        } catch (abortCause) {
+          recordError(errors, "failed to write Windows acquisition abort", abortCause)
+        }
+        try {
+          writeFileSync(release, "release")
+        } catch (releaseCause) {
+          recordError(errors, "failed to write Windows acquisition release", releaseCause)
+        }
+        try {
+          try {
+            // Do this even if identity/status probing failed. `child` carries
+            // Bun's exact native handle, so it cannot resolve a recycled PID.
+            if (observedExitCode === undefined) child.kill()
+          } catch (termination) {
+            if (!isMissingProcess(termination))
+              recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
+          }
+          if (
+            !(await exitedWithin(
+              child,
+              Math.max(cleanupDeadline - Date.now(), 0),
+              "after Windows acquisition failure",
+              errors,
+              rawExited,
+            ))
+          ) {
+            errors.push(new Error("Windows Job Object supervisor did not exit after acquisition failure"))
+          }
+        } finally {
+          // The supervisor may still be observing these files until it is known
+          // dead. Do not remove a control signal before the reap above.
+          ;[status, release, abort, completion, supervisor].forEach((file) => {
+            try {
+              if (existsSync(file)) unlinkSync(file)
+            } catch (cleanup) {
+              recordError(errors, `failed to remove Windows acquisition control ${file}`, cleanup)
+            }
+          })
+        }
+        throw new AggregateError(errors, "failed to establish Windows Job Object containment")
+      }
+      // The status is written by Start() using GetProcessTimes on the inherited
+      // native process handle, before this process is ever allowed to launch the
+      // application. Do not defer this identity acquisition to cleanup.
+      try {
+        // Access each child-owned resource before any status, identity, or
+        // release work. If Bun throws synchronously here, abortLaunch still owns
+        // the exact supervisor handle and will terminate, escalate, and reap it.
+        rawExited = child.exited
+        if (!(child.stdout instanceof ReadableStream) || !(child.stderr instanceof ReadableStream))
+          throw new Error("Windows Job Object supervisor did not expose pipe streams")
+        stdout = child.stdout
+        stderr = child.stderr
+        void Promise.resolve(rawExited).catch(() => {})
+        rawExited.then(
+          (code) => {
+            supervisorExited = true
+            observedExitCode = code
+          },
+          () => {
+            supervisorExited = true
+          },
+        )
+        while (!existsSync(status) && !supervisorExited && Date.now() < acquisitionDeadline)
+          await new Promise<void>((resolve) => setTimeout(resolve, 5))
+        if (supervisorExited) {
+          exitedBeforeRelease = true
+          throw new Error(`Windows Job Object supervisor exited before release (exit ${observedExitCode ?? "unknown"})`)
+        }
+        root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
+        if (!root) {
+          throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
+        }
+        const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
+        const captured = await tracker.scan(acquisitionDeadline)
+        if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
+          throw new Error("failed to establish Windows Job Object containment")
+        }
+        writeFileSync(release, "release")
+        return { child, tracker, rawExited, stdout, stderr }
+      } catch (cause) {
+        try {
+          return await abortLaunch(cause)
+        } catch (failure) {
+          // No release was published, so the target could not launch. Retry a
+          // transient PowerShell/Add-Type startup exit only after the exact
+          // native handle was reaped and every provisional control was removed.
+          if (
+            exitedBeforeRelease &&
+            attempt === 0 &&
+            failure instanceof AggregateError &&
+            failure.errors.length === 1
+          ) {
+            startupFailures.push(failure)
+            continue
+          }
+          if (startupFailures.length)
+            throw new AggregateError([...startupFailures, failure], "Windows Job Object startup failed after retry")
+          throw failure
+        }
+      }
     }
-    // The status is written by Start() using GetProcessTimes on the inherited
-    // native process handle, before this process is ever allowed to launch the
-    // application. Do not defer this identity acquisition to cleanup.
-    try {
-      // Access each child-owned resource before any status, identity, or
-      // release work. If Bun throws synchronously here, abortLaunch still owns
-      // the exact supervisor handle and will terminate, escalate, and reap it.
-      rawExited = child.exited
-      stdout = child.stdout
-      stderr = child.stderr
-      void Promise.resolve(rawExited).catch(() => {})
-      rawExited.then(
-        () => {
-          supervisorExited = true
-        },
-        () => {
-          supervisorExited = true
-        },
-      )
-      while (!existsSync(status) && !supervisorExited && Date.now() < acquisitionDeadline)
-        await new Promise<void>((resolve) => setTimeout(resolve, 5))
-      if (supervisorExited)
-        throw new Error("Windows Job Object supervisor exited before publishing its authenticated launch status")
-      root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
-      if (!root) {
-        throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
-      }
-      const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
-      const captured = await tracker.scan(acquisitionDeadline)
-      if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
-        throw new Error("failed to establish Windows Job Object containment")
-      }
-      writeFileSync(release, "release")
-      return { child, tracker, rawExited, stdout, stderr }
-    } catch (cause) {
-      return await abortLaunch(cause)
-    }
+    throw new Error("Windows Job Object admission attempts exhausted")
   }
   const cgroup = test?.forcePortable ? undefined : prepareCgroup()
   if (cgroup) {

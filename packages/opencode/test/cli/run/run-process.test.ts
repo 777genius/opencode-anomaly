@@ -64,6 +64,7 @@ import {
   windowsNativeCommandLineRoundTripForTest,
   windowsSupervisorArgumentsForTest,
   windowsSupervisorArgumentRoundTripForTest,
+  windowsSupervisorStartupRetryForTest,
   windowsSupervisorDrainLifecycleForTest,
   windowsSupervisorCompletionForTest,
   windowsSupervisorProtocolForTest,
@@ -697,6 +698,11 @@ describe("CLI process cleanup containment", () => {
     await expect(
       windowsSupervisorArgumentRoundTripForTest(["slow handshake"], 1_000, undefined, undefined, 4_500),
     ).resolves.toEqual(["slow handshake"])
+  })
+
+  test("Windows retries a reaped supervisor that exits before releasing its target", async () => {
+    if (process.platform !== "win32") return
+    await expect(windowsSupervisorStartupRetryForTest()).resolves.toEqual({ exitCode: 0, stdout: "ready" })
   })
 
   test("Windows supervisor starts the stalled target timeout after status and reaps its captured child", async () => {
