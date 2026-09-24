@@ -4,9 +4,10 @@ import { makeRuntime } from "@/effect/run-service"
 import { AppFileSystem } from "@opencode-ai/shared/filesystem"
 import { iife } from "@/util/iife"
 import { Log } from "@/util"
-import { LocalContext } from "../util"
+import { Filesystem, LocalContext } from "../util"
 import * as Project from "./project"
 import { WorkspaceContext } from "@/control-plane/workspace-context"
+import { posix, win32 } from "path"
 
 export interface InstanceContext {
   directory: string
@@ -20,6 +21,13 @@ const project = makeRuntime(Project.Service, Project.defaultLayer)
 
 const disposal = {
   all: undefined as Promise<void> | undefined,
+}
+
+function isFilesystemRoot(filepath: string) {
+  return [posix, win32].some((platform) => {
+    const normalized = platform.normalize(filepath)
+    return platform.isAbsolute(normalized) && platform.parse(normalized).root === normalized
+  })
 }
 
 function boot(input: { directory: string; init?: () => Promise<any>; worktree?: string; project?: Project.Info }) {
@@ -93,11 +101,11 @@ export const Instance = {
    */
   containsPath(filepath: string, ctx?: InstanceContext) {
     const instance = ctx ?? Instance
-    if (AppFileSystem.contains(instance.directory, filepath)) return true
-    // Non-git projects set worktree to "/" which would match ANY absolute path.
-    // Skip worktree check in this case to preserve external_directory permissions.
-    if (instance.worktree === "/") return false
-    return AppFileSystem.contains(instance.worktree, filepath)
+    if (Filesystem.contains(instance.directory, filepath)) return true
+    // Non-git projects set worktree to a filesystem root, which would match every path on that volume.
+    // Skip worktree fallback in this case to preserve external_directory permissions.
+    if (isFilesystemRoot(instance.worktree)) return false
+    return Filesystem.contains(instance.worktree, filepath)
   },
   /**
    * Captures the current instance ALS context and returns a wrapper that
