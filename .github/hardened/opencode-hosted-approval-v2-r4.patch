@@ -2073,6 +2073,19 @@ index aa691648a32796f99529141258304c2525db5aed..1463e896d1d77f4153ed6a53bcb893fe
        })
        expect(reviewer.permissions).toEqual([
          { action: "bash", resource: "*", effect: "ask" },
+diff --git a/packages/core/test/effect/cross-spawn-spawner.test.ts b/packages/core/test/effect/cross-spawn-spawner.test.ts
+index fc4e3db6a92e74a4a4f77921c2782abcbf22cd2e..4cdbd1c892fe7201e558d326b779bfd96a622cb2 100644
+--- a/packages/core/test/effect/cross-spawn-spawner.test.ts
++++ b/packages/core/test/effect/cross-spawn-spawner.test.ts
+@@ -195,7 +195,7 @@ describe("cross-spawn spawner", () => {
+     fx.effect(
+       "captures stdout via .all when no stderr",
+       Effect.gen(function* () {
+-        const handle = yield* ChildProcess.make("echo", ["hello from stdout"])
++        const handle = yield* ChildProcess.make(process.execPath, ["-e", 'process.stdout.write("hello from stdout")'])
+         const all = yield* decodeByteStream(handle.all)
+         expect(all).toBe("hello from stdout")
+       }),
 diff --git a/packages/core/test/fixture/git.ts b/packages/core/test/fixture/git.ts
 index f02da400af6a7f436366b2f7126399606ab6157e..a9f2add15e862af57885ed2e47b101ec2c2714ff 100644
 --- a/packages/core/test/fixture/git.ts

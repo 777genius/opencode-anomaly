@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: c968ba64ae25d9580cf0da1461e1a9758db7008b
+  SOURCE_COMMIT: 58d5ae38b582156627e13543cffc58ec4150d4b9
   BASE_COMMIT: 3104c1428ec91f809e5ab86631300de41eb6952e
   VERSION: 1.18.30-agentteams.1
   TAG: v1.18.30-agentteams.1
