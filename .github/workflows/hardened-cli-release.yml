@@ -10,17 +10,17 @@ on:
       - .github/hardened/**
 
 concurrency:
-  group: hardened-cli-v1.18.23-agentteams.1
+  group: hardened-cli-v1.18.30-agentteams.1
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 env:
-  SOURCE_COMMIT: 0aab19b8295feb99f9c45c403e2cd46dbddc4b7b
-  BASE_COMMIT: ef2880f379129aa048be9e9353e30aa168d42c17
-  VERSION: 1.18.23-agentteams.1
-  TAG: v1.18.23-agentteams.1
+  SOURCE_COMMIT: 95ec1099f53a242e9a85b2ab2b1665ee23aa91e9
+  BASE_COMMIT: 3104c1428ec91f809e5ab86631300de41eb6952e
+  VERSION: 1.18.30-agentteams.1
+  TAG: v1.18.30-agentteams.1
   BUN_VERSION: 1.4.0
   PATCH: .github/hardened/opencode-hosted-approval-v2-r4.patch
 
