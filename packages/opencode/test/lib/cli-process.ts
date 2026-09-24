@@ -256,6 +256,12 @@ function isMissingProcess(cause: unknown) {
   )
 }
 
+function isPermissionDenied(cause: unknown): boolean {
+  if (typeof cause !== "object" || cause === null) return false
+  if ("code" in cause && (cause.code === "EACCES" || cause.code === "EPERM")) return true
+  return "cause" in cause && isPermissionDenied(cause.cause)
+}
+
 function recordError(errors: Error[], message: string, cause: unknown) {
   const error = new Error(message, { cause })
   if (!errors.some((previous) => previous.message === error.message)) errors.push(error)
@@ -272,10 +278,20 @@ function linuxCgroup(pid: number) {
   return containment
 }
 
-function linuxSnapshot(pid: number): ProcessSnapshot | undefined {
+type LinuxStat = {
+  readonly parent: number
+  readonly group: number
+  readonly started: string
+  readonly state: string
+}
+
+function linuxStat(
+  pid: number,
+  read = (pid: number) => readFileSync(`/proc/${pid}/stat`, "utf8"),
+): LinuxStat | undefined {
   let stat: string
   try {
-    stat = readFileSync(`/proc/${pid}/stat`, "utf8")
+    stat = read(pid)
   } catch (cause) {
     if (isMissingProcess(cause)) return
     throw new Error(`failed to read stat for process ${pid}`, { cause })
@@ -290,10 +306,21 @@ function linuxSnapshot(pid: number): ProcessSnapshot | undefined {
           .split(/\s+/)
   if (fields.length < 20 || !fields[1] || !fields[2] || !fields[19])
     throw new Error(`process ${pid} has an incomplete stat record`)
+  return {
+    parent: Number(fields[1]),
+    group: Number(fields[2]),
+    started: `${linuxBootIdentity}:${fields[19]}`,
+    state: fields[0]!,
+  }
+}
+
+function linuxSnapshot(pid: number): ProcessSnapshot | undefined {
+  const stat = linuxStat(pid)
+  if (!stat) return
   // /proc keeps a zombie's stat file after its executable link is gone. Both
   // states mean the process is no longer signalable; do not turn ordinary
   // reaping into an identity-corruption error that prevents other cleanup.
-  if (fields[0] === "Z") return
+  if (stat.state === "Z") return
   let executable: string
   try {
     executable = readlinkSync(`/proc/${pid}/exe`)
@@ -303,9 +330,9 @@ function linuxSnapshot(pid: number): ProcessSnapshot | undefined {
   }
   return {
     pid,
-    parent: Number(fields[1]),
-    group: Number(fields[2]),
-    started: `${linuxBootIdentity}:${fields[19]}`,
+    parent: stat.parent,
+    group: stat.group,
+    started: stat.started,
     executable,
     containment: "",
     nonce: true,
@@ -1365,15 +1392,67 @@ async function portableIdentityExited(identity: ProcessSnapshot, deadline: numbe
   }
 }
 
+function linuxGroupDrained(
+  group: number,
+  deadline: number,
+  list = () => readdirSync("/proc"),
+  inspect = linuxStat,
+  groupExists = (group: number) => {
+    try {
+      process.kill(-group, 0)
+      return true
+    } catch (cause) {
+      if (isMissingProcess(cause)) return false
+      if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === "EPERM") return true
+      throw cause
+    }
+  },
+) {
+  let inaccessible = false
+  const memberOrDeadline = list()
+    .filter((entry) => /^\d+$/.test(entry))
+    .some((entry) => {
+      if (Date.now() >= deadline) return true
+      // Only stat is needed to identify group membership. Reading exe for
+      // every unrelated PID can fail with EACCES on shared CI hosts.
+      try {
+        const stat = inspect(Number(entry))
+        return stat?.group === group && stat.state !== "Z"
+      } catch (cause) {
+        if (isPermissionDenied(cause)) {
+          inaccessible = true
+          return false
+        }
+        throw cause
+      }
+    })
+  if (memberOrDeadline || Date.now() >= deadline) return false
+  // An unreadable stat could belong to this group. Only an absent process
+  // group proves drainage; otherwise retain ownership uncertainty.
+  return !inaccessible || !groupExists(group)
+}
+
+export function portableLinuxGroupDrainedForTest(
+  group: number,
+  records: Readonly<Record<number, string | Error>>,
+  groupExists = false,
+) {
+  return linuxGroupDrained(
+    group,
+    Date.now() + 1_000,
+    () => Object.keys(records),
+    (pid) => linuxStat(pid, () => {
+      const record = records[pid]!
+      if (record instanceof Error) throw record
+      return record
+    }),
+    () => groupExists,
+  )
+}
+
 async function portableGroupDrained(group: number, deadline: number, errors: Error[]) {
   try {
-    if (process.platform === "linux")
-      return !readdirSync("/proc")
-        .filter((entry) => /^\d+$/.test(entry))
-        .some((entry) => {
-          if (Date.now() >= deadline) return true
-          return linuxSnapshot(Number(entry))?.group === group
-        })
+    if (process.platform === "linux") return linuxGroupDrained(group, deadline)
     const output = await commandOutput(["ps", "-axo", "pid=,pgid="], deadline)
     return !output.split("\n").some((line) => {
       const [pid, observed] = line.trim().split(/\s+/)
@@ -1420,10 +1499,15 @@ async function finalizePortableController(controller: PortableController, deadli
       killFinished: marker.killIssued && controllerExited && targetExited && groupDrained,
     }
   }
-  const wait = async (limit: number) => {
+  const wait = async (limit: number, acceptDrained = false) => {
     while (Date.now() < limit) {
       const current = await completion(Math.min(limit, Date.now() + 250))
-      if (current.failed || (current.acknowledged && current.killFinished)) return current
+      if (
+        current.failed ||
+        (current.acknowledged && current.killFinished) ||
+        (acceptDrained && current.controllerExited && current.targetExited && current.groupDrained)
+      )
+        return current
       await Bun.sleep(5)
     }
     return completion(limit)
@@ -1447,7 +1531,10 @@ async function finalizePortableController(controller: PortableController, deadli
     controller.onFallback?.()
     await signalPortableControllerGroup(controller, "SIGKILL", deadline, errors)
   }
-  const final = await wait(deadline)
+  // Once fallback has run, verified group disappearance is enough to stop
+  // waiting even if a failed abort write made acknowledgement impossible.
+  // Missing protocol records remain diagnostics below; controls stay retained.
+  const final = await wait(deadline, true)
   if (!final.acknowledged)
     recordError(errors, `portable controller ${controller.identity.pid} did not acknowledge abort before cleanup deadline`, undefined)
   if (!final.killIssued)
@@ -3998,7 +4085,7 @@ async function spawnTracked(
 export async function portableFilesystemFailureForTest(kind: "read" | "unlink") {
   let exited: Promise<number> | undefined
   let failed = false
-  const cause = await spawnTracked(
+  const acquired = await spawnTracked(
     [process.execPath, "-e", 'process.stdout.write("started\\n"); process.stderr.write("started\\n"); setInterval(() => {}, 1_000)'],
     { stdout: "pipe", stderr: "pipe" },
     {
@@ -4023,6 +4110,16 @@ export async function portableFilesystemFailureForTest(kind: "read" | "unlink") 
       },
     },
   ).catch((cause) => cause)
+  // The readiness read happens during acquisition. Control-file unlink now
+  // happens during finalization, after the gated target has been released.
+  // Finalize any successfully acquired child so a test failure cannot leave
+  // its interval process running or wait forever on its exit promise.
+  const cause =
+    acquired instanceof Error
+      ? acquired
+      : await terminateProcessPromise(acquired.child, () => {}, acquired.tracker, Date.now() + 4_000, acquired.rawExited).catch(
+          (cause) => cause,
+        )
   const reaped = await Promise.resolve(exited).then(
     () => true,
     () => true,
@@ -4050,13 +4147,17 @@ export async function portableShortLivedProcessForTest(exitCode: number) {
 
 export async function portableInitialIdentityRetryForTest(kind: "delayed" | "unreadable") {
   let attempts = 0
+  let controllerCaptured = false
   const proc = await spawnTracked(
     [process.execPath, "-e", "setInterval(() => {}, 1_000)"],
     { stdout: "pipe", stderr: "pipe" },
     {
       forcePortable: true,
+      onPortableControllerCapture: () => {
+        controllerCaptured = true
+      },
       portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
-        if (stage === "initial" && attempts++ < 2) {
+        if (stage === "initial" && controllerCaptured && attempts++ < 2) {
           if (kind === "unreadable") throw new Error("synthetic unreadable nonce")
           return
         }
@@ -4259,11 +4360,10 @@ export async function portableReconciliationFailureCleanupForTest() {
   return { cause, reaped }
 }
 
-// This exercises the actual gated spawn and finalizer path. After exec, both
-// the cleanup observation and every exact-target recheck stay opaque while a
-// descendant ignores TERM. The pre-exec controller is the only authority that
-// can still contain that group, and its abort signal must also bound the
-// hanging observation itself.
+// This exercises the actual gated spawn and finalizer path. After exec, the
+// root exits on TERM while a descendant ignores it. The verified controller
+// must still KILL the group, and a cleanup unlink failure must be reported
+// after containment rather than preventing it.
 export async function portableOpaqueExecCleanupForTest() {
   if (process.platform === "win32") throw new Error("portable process groups are unavailable on Windows")
   const marker = path.join(os.tmpdir(), `opencode-portable-descendant-${crypto.randomUUID()}`)
@@ -4273,7 +4373,7 @@ export async function portableOpaqueExecCleanupForTest() {
   const started = Date.now()
   const signalPaths: string[] = []
   const initialNonces = new Map<number, string>()
-  const cause = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
+  const acquired = await spawnTracked([process.execPath, "-e", target], { stdout: "pipe", stderr: "pipe" }, {
     forcePortable: true,
     portableFilesystem: {
       exists: existsSync,
@@ -4283,7 +4383,7 @@ export async function portableOpaqueExecCleanupForTest() {
         unlinkSync(file)
       },
     },
-    portableObserve: async (pid, nonce, deadline, confirmedNonce, stage, signal) => {
+    portableObserve: async (pid, nonce, deadline, confirmedNonce, stage) => {
       if (stage === "initial") initialNonces.set(pid, nonce)
       if (stage === "reconcile") {
         while (!existsSync(marker)) {
@@ -4291,12 +4391,6 @@ export async function portableOpaqueExecCleanupForTest() {
           await Bun.sleep(5)
         }
       }
-      if (stage === "cleanup")
-        return new Promise<ProcessSnapshot | undefined>((_, reject) => {
-          signal?.addEventListener("abort", () => reject(new Error("synthetic hanging cleanup probe aborted")), {
-            once: true,
-          })
-        })
       return portableSnapshot(pid, nonce, deadline, confirmedNonce)
     },
     // Darwin finalization uses signalKnown before its broad nonce walk, so
@@ -4310,6 +4404,14 @@ export async function portableOpaqueExecCleanupForTest() {
         : undefined,
     onPortableTrackerSignal: (path, signal) => signalPaths.push(`${path}:${signal}`),
   }).catch((cause) => cause)
+  // The synthetic unlink failure occurs in finalization now that the gate
+  // consumes its release marker before exec. Exercise that owned boundary.
+  const cause =
+    acquired instanceof Error
+      ? acquired
+      : await terminateProcessPromise(acquired.child, () => {}, acquired.tracker, Date.now() + 4_000, acquired.rawExited).catch(
+          (cause) => cause,
+        )
   const descendantPID = existsSync(marker) ? Number(readFileSync(marker, "utf8")) : 0
   const descendantGone =
     descendantPID > 0 &&

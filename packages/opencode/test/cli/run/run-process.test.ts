@@ -54,6 +54,7 @@ import {
   portableLateControllerRecoveryForTest,
   portableFailedReconciliationCleanupHandoffForTest,
   portableTrackerHandoffCleanupForTest,
+  portableLinuxGroupDrainedForTest,
   type ProcessIdentity,
   windowsIdentityObservationForTest,
   windowsJobCleanupPhasesForTest,
@@ -814,7 +815,7 @@ describe("CLI process cleanup containment", () => {
     })
   })
 
-  test("portable readiness filesystem failures reap the owned gate or target", async () => {
+  test("portable readiness read and cleanup unlink failures reap the owned gate or target", async () => {
     if (process.platform === "win32") return
     for (const kind of ["read", "unlink"] as const) {
       const result = await portableFilesystemFailureForTest(kind)
@@ -895,13 +896,14 @@ describe("CLI process cleanup containment", () => {
     expect(result.descendantGone).toBe(true)
     expect(result.controllerHasDistinctNonce).toBe(true)
     expect(result.durationMs).toBeLessThan(2_500)
-    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic hanging cleanup probe aborted")
+    expect(formatProcessErrorForTest(result.cause)).toContain("synthetic post-exec cleanup trigger")
     if (process.platform === "darwin") {
       expect(formatProcessErrorForTest(result.cause)).toContain("synthetic persistent post-exec native observation failure")
       expect(result.signalPaths).toContain("signalKnown:SIGKILL")
       return
     }
-    expect(result.signalPaths).toContain("signal:SIGTERM")
+    // Linux may complete controller group KILL before the ordinary tracker
+    // needs to signal a target directly.
   })
 
   test("successful portable cleanup waits for controller KILL and removes acknowledged controls", async () => {
@@ -910,7 +912,9 @@ describe("CLI process cleanup containment", () => {
     expect(result.descendantGone).toBe(true)
     expect(result.durationMs).toBeGreaterThanOrEqual(400)
     expect(result.durationMs).toBeLessThan(2_500)
-    expect(result.removedControls).toBe(7)
+    // The gate consumes its release marker before exec, so finalization
+    // removes the six remaining control-file kinds.
+    expect(result.removedControls).toBe(6)
   })
 
   test("portable finalizer falls back when the controller pauses after kill-issued", async () => {
@@ -1085,6 +1089,7 @@ describe("CLI process cleanup containment", () => {
   })
 
   test("Darwin tracker retains and reaps an uncertain admitted child through cleanup", async () => {
+    if (process.platform !== "darwin") return
     const result = await darwinFinalizerDiscoveryForTest("initial-observation-failure")
     expect(result.scans).toBeGreaterThan(2)
     expect(result.rootPresentAtAdmission).toBe(true)
@@ -1096,6 +1101,19 @@ describe("CLI process cleanup containment", () => {
     expect(formatProcessErrorForTest(result.cause)).toContain(
       "failed to recheck macOS process",
     )
+  })
+
+  test("Linux group drain reads stat without inspecting unrelated executables", () => {
+    const stat = (pid: number, group: number, state = "S") =>
+      `${pid} (synthetic process) ${state} 1 ${group} ${"0 ".repeat(16)}123`
+    const foreign = stat(41, 900)
+    const member = stat(42, 800)
+    expect(portableLinuxGroupDrainedForTest(800, { 41: foreign })).toBe(true)
+    expect(portableLinuxGroupDrainedForTest(800, { 41: foreign, 42: member })).toBe(false)
+    expect(portableLinuxGroupDrainedForTest(800, { 41: foreign, 42: stat(42, 800, "Z") })).toBe(true)
+    const denied = Object.assign(new Error("foreign /proc stat is inaccessible"), { code: "EACCES" })
+    expect(portableLinuxGroupDrainedForTest(800, { 41: denied }, false)).toBe(true)
+    expect(portableLinuxGroupDrainedForTest(800, { 41: denied }, true)).toBe(false)
   })
 
   test("broad Darwin discovery skips an opaque PID before it has ownership evidence", async () => {
