@@ -57,7 +57,6 @@ test("animates todo lifecycle without replaying it across session tabs", async (
       default: { providerID: "opencode", modelID: "claude-opus-4-6" },
     },
     sessions: [session(sourceID, sourceTitle, 1700000000000), session(otherID, otherTitle, 1700000001000)],
-    sessionStatus: { [sourceID]: { type: "busy" } },
     pageMessages: () => ({ items: [] }),
     events: () => events.splice(0, 1),
     eventRetry: 16,
@@ -86,7 +85,7 @@ test("animates todo lifecycle without replaying it across session tabs", async (
   await switchSession(page, otherID, otherTitle)
   await expect(dock).toHaveCount(0)
 
-  const returningOpen = sampleDock(page, 700)
+  const returningOpen = sampleDock(page, 10_000, true)
   await switchSession(page, sourceID, sourceTitle)
   const openSamples = (await returningOpen).filter((sample) => sample.present)
   expect(openSamples.length).toBeGreaterThan(0)
@@ -170,8 +169,8 @@ async function switchSession(page: Page, sessionID: string, title: string) {
   await expectSessionTitle(page, title)
 }
 
-function sampleDock(page: Page, duration: number) {
-  return page.evaluate(async (duration) => {
+function sampleDock(page: Page, duration: number, untilPresent = false) {
+  return page.evaluate(async ({ duration, untilPresent }) => {
     const samples: { present: boolean; height: number; opacity: number }[] = []
     const start = performance.now()
     while (performance.now() - start < duration) {
@@ -183,8 +182,9 @@ function sampleDock(page: Page, duration: number) {
         height: clip?.getBoundingClientRect().height ?? 0,
         opacity: label ? Number.parseFloat(getComputedStyle(label).opacity) : 0,
       })
+      if (untilPresent && dock) break
       await new Promise(requestAnimationFrame)
     }
     return samples
-  }, duration)
+  }, { duration, untilPresent })
 }

@@ -22,6 +22,7 @@ import { createMediaQuery } from "@solid-primitives/media"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { ComponentProps, createEffect, createMemo, createSignal, onCleanup, onMount, Show, splitProps } from "solid-js"
 import { createDefaultOptions, styleVariables } from "../pierre"
+import { restoreCommentHover } from "../pierre/comment-hover"
 import { markCommentedDiffLines, markCommentedFileLines } from "../pierre/commented-lines"
 import { fixDiffSelection, findDiffSide, type DiffSelectionSide } from "../pierre/diff-selection"
 import { createFileFind } from "../pierre/file-find"
@@ -876,10 +877,14 @@ function TextViewer<T>(props: TextFileProps<T>) {
     onLineNumberSelectionEnd: (range) => local.onLineNumberSelectionEnd?.(range),
   })
 
-  const options = createMemo(() => ({
+  const options = createMemo<FileOptions<T>>(() => ({
     ...createDefaultOptions<T>("unified"),
     ...others,
     ...lineCallbacks,
+    onPostRender: (node, instance, phase) => {
+      restoreCommentHover(node, instance, others.enableGutterUtility ? phase : "unmount")
+      others.onPostRender?.(node, instance, phase)
+    },
   }))
 
   const notify = () => {
@@ -1081,7 +1086,11 @@ function DiffViewer<T>(props: DiffFileProps<T>) {
       ...createDefaultOptions(props.diffStyle),
       ...others,
       ...lineCallbacks,
-    }
+      onPostRender: (node, instance, phase) => {
+        restoreCommentHover(node, instance, others.enableGutterUtility ? phase : "unmount")
+        others.onPostRender?.(node, instance, phase)
+      },
+    } satisfies FileDiffOptions<T>
 
     const perf = large() ? { ...base, ...largeOptions } : base
     if (!mobile()) return perf

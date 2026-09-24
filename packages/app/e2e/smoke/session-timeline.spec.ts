@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test"
+import { expect, test, type Page, type Request } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { fixture, pageMessages } from "./session-timeline.fixture"
 import { trackPageErrors, expectNoSmokeErrors } from "../utils/errors"
@@ -6,6 +6,7 @@ import { mockOpenCodeServer } from "../utils/mock-server"
 import { APP_READY_TIMEOUT, expectAppVisible, expectSessionTitle } from "../utils/waits"
 
 const forbiddenText = ["Load details", "Show earlier steps"]
+const serverKey = `http://${process.env.PLAYWRIGHT_SERVER_HOST ?? "127.0.0.1"}:${process.env.PLAYWRIGHT_SERVER_PORT ?? "4096"}`
 
 type SmokeState = {
   ids: string[]
@@ -30,63 +31,338 @@ type SmokeWindow = Window & {
 test.describe("smoke: session timeline", () => {
   test.setTimeout(240_000)
 
-  test("keeps the visible message fixed while prepending history", async ({ page }) => {
-    const requests: { before?: string; phase: "start" | "end"; at: number }[] = []
-    await mockOpenCodeServer(page, {
-      sessions: fixture.sessions,
-      provider: fixture.provider,
-      directory: fixture.directory,
-      project: fixture.project,
-      pageMessages,
-      messageDelay: 3_000,
-      onMessages: (input) => requests.push({ before: input.before, phase: input.phase, at: performance.now() }),
-    })
-    await configureSmokePage(page, fixture.directory)
+  test("keeps the visible message fixed while prepending history", async ({ page }, testInfo) => {
+    const requests: { sessionID: string; before?: string; phase: "start" | "end"; at: number }[] = []
+    const release = Promise.withResolvers<void>()
+    const started = Promise.withResolvers<{ sessionID: string; before: string; request: Request }>()
+    const gate = { held: false, before: undefined as string | undefined, request: undefined as Request | undefined }
+    const capture = (request: Request) => {
+      const url = new URL(request.url())
+      if (request.method() !== "GET") return
+      if (
+        url.pathname !== `/session/${fixture.targetID}/message` &&
+        url.pathname !== `/api/session/${fixture.targetID}/message`
+      ) {
+        return
+      }
+      if (!(url.searchParams.get("before") || url.searchParams.get("cursor"))) return
+      gate.request ??= request
+    }
+    const onClose = () => release.resolve()
+    page.on("request", capture)
+    page.once("close", onClose)
+    try {
+      await mockOpenCodeServer(page, {
+        sessions: fixture.sessions,
+        provider: fixture.provider,
+        directory: fixture.directory,
+        project: fixture.project,
+        pageMessages,
+        beforeMessagesResponse: async (input) => {
+          if (input.sessionID !== fixture.targetID || !input.before || gate.before) return
+          if (!gate.request) throw new Error("Missing browser request for held history response")
+          gate.before = input.before
+          gate.held = true
+          // Install the release continuation before announcing the held, decoded request.
+          const pending = release.promise.then(() => {
+            gate.held = false
+          })
+          started.resolve({ sessionID: input.sessionID, before: input.before, request: gate.request })
+          await pending
+        },
+        onMessages: (input) => requests.push({ ...input, at: performance.now() }),
+      })
+      await configureSmokePage(page, fixture.directory)
 
-    await navigateToSession(page, fixture.directory, fixture.targetID, fixture.expected.targetTitle)
-    await waitForTimelineStable(page)
-    const scroller = timelineScroller(page)
-    await pointAtTimeline(page)
-    const deadline = Date.now() + 120_000
-    while (!requests.some((request) => request.before && request.phase === "start")) {
-      if (Date.now() >= deadline) throw new Error("Timed out scrolling to the history boundary")
-      await page.mouse.wheel(0, -240)
-      await page.waitForTimeout(20)
-    }
-    expect(requests.some((request) => request.before && request.phase === "end")).toBe(false)
-    for (let index = 0; index < 12; index++) {
-      await page.mouse.wheel(0, -120)
-      await page.waitForTimeout(20)
-    }
-    const keys = await scroller.evaluate((element) => {
-      const view = element.getBoundingClientRect()
-      return [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")]
-        .filter((row) => {
-          const rect = row.getBoundingClientRect()
-          return rect.bottom > view.top && rect.top < view.bottom
+      await navigateToSession(page, fixture.directory, fixture.targetID, fixture.expected.targetTitle)
+      await waitForTimelineStable(page)
+      const scroller = timelineScroller(page)
+      await pointAtTimeline(page)
+      const wheel = async (delta: number, boundary = false) => {
+        const before = await scroller.evaluate((element) => {
+          const view = element.getBoundingClientRect()
+          return {
+            top: element.scrollTop,
+            rows: [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")]
+              .filter((row) => {
+                const rect = row.getBoundingClientRect()
+                return rect.bottom > view.top && rect.top < view.bottom
+              })
+              .map((row) => ({ key: row.dataset.timelinePartId!, top: row.getBoundingClientRect().top - view.top })),
+          }
         })
-        .map((row) => row.dataset.timelinePartId)
-        .filter((id): id is string => !!id)
-        .slice(0, 3)
-    })
-    expect(keys.length).toBeGreaterThan(0)
-    const positions = () =>
-      scroller.evaluate((element, keys) => {
-        const top = element.getBoundingClientRect().top
-        return Object.fromEntries(
-          keys.map((key) => {
-            const row = element.querySelector<HTMLElement>(`[data-timeline-part-id="${key}"]`)
-            if (!row) throw new Error(`Missing stable timeline key: ${key}`)
-            return [key, Math.round((row.getBoundingClientRect().top - top) * devicePixelRatio) / devicePixelRatio]
-          }),
+        // Mouse.wheel does not wait for dispatch or its default scrolling action.
+        const dispatched = await scroller.evaluateHandle((element) => ({
+          promise: new Promise<void>((resolve) => element.addEventListener("wheel", () => resolve(), { once: true })),
+        }))
+        try {
+          await page.mouse.wheel(0, delta)
+          await dispatched.evaluate((state) => state.promise)
+          await expect
+            .poll(
+              async () =>
+                (boundary && gate.held) ||
+                (await scroller.evaluate(
+                  (element, input) => {
+                    // Row measurement can rebase scrollTop in either direction. Compare
+                    // real content against the viewport instead of the nominal wheel delta.
+                    if (input.before.top === 0 && element.scrollTop === 0) return true
+                    const view = element.getBoundingClientRect()
+                    return [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")].some((row) => {
+                      const rect = row.getBoundingClientRect()
+                      const previous = input.before.rows.find((item) => item.key === row.dataset.timelinePartId)
+                      if (previous && rect.top - view.top > previous.top) return true
+                      // A virtualized-out baseline can also progress to an earlier real fixture key.
+                      return (
+                        rect.bottom > view.top &&
+                        rect.top < view.bottom &&
+                        input.earlier.includes(row.dataset.timelinePartId!)
+                      )
+                    })
+                  },
+                  {
+                    before,
+                    earlier: fixture.expected.targetPartIDs.slice(
+                      0,
+                      Math.max(0, fixture.expected.targetPartIDs.indexOf(before.rows[0]?.key ?? "")),
+                    ),
+                  },
+                )),
+            )
+            .toBe(true)
+        } finally {
+          await dispatched.dispose()
+        }
+      }
+      const deadline = Date.now() + 120_000
+      while (!gate.held) {
+        if (Date.now() >= deadline) throw new Error("Timed out scrolling to the history boundary")
+        await wheel(-240, true)
+      }
+      const held = await started.promise
+      const ended = () =>
+        requests.some(
+          (request) =>
+            request.sessionID === held.sessionID && request.before === held.before && request.phase === "end",
         )
-      }, keys)
-    const before = await positions()
-    expect(requests.some((request) => request.before && request.phase === "end")).toBe(false)
+      expect(gate.held).toBe(true)
+      expect(ended()).toBe(false)
+      for (let index = 0; index < 12; index++) await wheel(-120)
+      await waitForTimelineStable(page)
+      expect(gate.held).toBe(true)
+      expect(ended()).toBe(false)
+      const keys = await scroller.evaluate((element) => {
+        const view = element.getBoundingClientRect()
+        return [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")]
+          .filter((row) => {
+            const rect = row.getBoundingClientRect()
+            return rect.bottom > view.top && rect.top < view.bottom
+          })
+          .map((row) => row.dataset.timelinePartId)
+          .filter((id): id is string => !!id)
+          .slice(0, 3)
+      })
+      expect(keys.length).toBeGreaterThan(0)
+      const positions = () =>
+        scroller.evaluate((element, keys) => {
+          const top = element.getBoundingClientRect().top
+          return Object.fromEntries(
+            keys.map((key) => {
+              const row = element.querySelector<HTMLElement>(`[data-timeline-part-id="${key}"]`)
+              if (!row) throw new Error(`Missing stable timeline key: ${key}`)
+              return [key, Math.round((row.getBoundingClientRect().top - top) * devicePixelRatio) / devicePixelRatio]
+            }),
+          )
+        }, keys)
+      expect(gate.held).toBe(true)
+      expect(ended()).toBe(false)
+      const before = await positions()
+      expect(gate.held).toBe(true)
+      expect(ended()).toBe(false)
 
-    await expect.poll(() => requests.some((request) => request.before && request.phase === "end")).toBe(true)
-    await waitForTimelineStable(page)
-    await expect.poll(positions).toEqual(before)
+      const url = new URL(held.request.url())
+      const history = pageMessages(
+        held.sessionID,
+        Number(url.searchParams.get("limit") ?? (url.pathname.startsWith("/api/") ? 50 : 80)),
+        held.before,
+      ).items.flatMap((message) => message.parts.map((part) => part.id))
+      expect(history.length).toBeGreaterThan(0)
+      const measurement = await scroller.evaluateHandle(
+        (element, input) => {
+          const history = new Set(input.history)
+          const scale = devicePixelRatio
+          const inserted = new Set<string>()
+          const samples: {
+            source: string
+            at: number
+            snapshotAt?: number
+            armedAt?: number
+            positions: Record<string, number | null>
+            inserted: string[]
+            mountedHistory: string[]
+          }[] = []
+          const violations: typeof samples = []
+          const read = () => {
+            const top = element.getBoundingClientRect().top
+            return Object.fromEntries(
+              input.keys.map((key) => {
+                const row = element.querySelector<HTMLElement>(`[data-timeline-part-id="${key}"]`)
+                return [
+                  key,
+                  row
+                    ? Math.round((row.getBoundingClientRect().top - top) * devicePixelRatio) / devicePixelRatio
+                    : null,
+                ]
+              }),
+            )
+          }
+          const existing = [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")]
+            .map((row) => row.dataset.timelinePartId!)
+            .filter((key) => history.has(key))
+          const insertions: { at: number; ids: string[] }[] = []
+          const collect = () => {
+            const ids = [...element.querySelectorAll<HTMLElement>("[data-timeline-part-id]")]
+              .map((row) => row.dataset.timelinePartId!)
+              .filter((key) => history.has(key) && !existing.includes(key) && !inserted.has(key))
+            if (!ids.length) return
+            ids.forEach((key) => inserted.add(key))
+            insertions.push({ at: performance.now(), ids })
+          }
+          const targets = new Map<Element, string>()
+          const state = {
+            frame: 0,
+            armedAt: performance.now(),
+            stopped: false,
+            stop: undefined as { at: number; resolve: () => void } | undefined,
+          }
+          const record = (entries: IntersectionObserverEntry[]) => {
+            // IO stores bounding rectangles during the rendering update, after rAF
+            // anchor restoration, connected measurement and ResizeObserver layout.
+            // Delivery may be late: never consult live DOM to interpret these records.
+            const updates = Map.groupBy(entries, (entry) => entry.time)
+            updates.forEach((entries, snapshotAt) => {
+              const viewport = entries.find((entry) => entry.target === element)
+              const rows = entries.filter((entry) => targets.has(entry.target))
+              const current = {
+                source: "intersection-rendering-update",
+                at: performance.now(),
+                snapshotAt,
+                armedAt: state.armedAt,
+                positions: Object.fromEntries(
+                  input.keys.map((key) => {
+                    const row = rows.find((entry) => targets.get(entry.target) === key)
+                    return [
+                      key,
+                      viewport && row && row.boundingClientRect.width > 0 && row.boundingClientRect.height > 0
+                        ? Math.round((row.boundingClientRect.top - viewport.boundingClientRect.top) * scale) / scale
+                        : null,
+                    ]
+                  }),
+                ),
+                inserted: [...inserted],
+                mountedHistory: rows
+                  .filter((entry) => entry.boundingClientRect.width > 0 && entry.boundingClientRect.height > 0)
+                  .map((entry) => targets.get(entry.target)!)
+                  .filter((key) => history.has(key)),
+              }
+              if (input.keys.some((key) => current.positions[key] !== input.before[key])) violations.push(current)
+              samples.push(current)
+            })
+            // A queued snapshot from before stop was requested cannot drain the probe.
+            if (!state.stop || !entries.some((entry) => entry.time > state.stop!.at)) return
+            state.stopped = true
+            cancelAnimationFrame(state.frame)
+            mutation.disconnect()
+            observer.disconnect()
+            state.stop.resolve()
+          }
+          const observer = new IntersectionObserver(record)
+          const arm = () => {
+            // Drain immutable records before changing their target-to-key identities.
+            record(observer.takeRecords())
+            if (state.stopped) return
+            collect()
+            observer.disconnect()
+            targets.clear()
+            state.armedAt = performance.now()
+            observer.observe(element)
+            element.querySelectorAll<HTMLElement>("[data-timeline-part-id]").forEach((row) => {
+              const key = row.dataset.timelinePartId!
+              if (!input.keys.includes(key) && !history.has(key)) return
+              targets.set(row, key)
+              observer.observe(row)
+            })
+          }
+          // Include rows inserted by later rAF/resize callbacks in this update, too.
+          // Mutation delivery only arms targets and records insertion, never geometry.
+          const mutation = new MutationObserver(arm)
+          mutation.observe(element, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["data-timeline-part-id"],
+          })
+          const frame = () => {
+            // Reobserve for initial entries on every update, even when intersection
+            // thresholds do not change. No mutation-adjacent update is filtered out.
+            arm()
+            if (!state.stopped) state.frame = requestAnimationFrame(frame)
+          }
+          samples.push({ source: "armed", at: performance.now(), positions: read(), inserted: [], mountedHistory: [] })
+          arm()
+          state.frame = requestAnimationFrame(frame)
+          return {
+            existing,
+            renderedInsertion: () => samples.some((sample) => sample.mountedHistory.length > 0),
+            stop: async () => {
+              await new Promise<void>((resolve) => {
+                state.stop = { at: performance.now(), resolve }
+              })
+              return { samples, violations, insertions, inserted: [...inserted] }
+            },
+          }
+        },
+        { keys, before, history },
+      )
+      try {
+        expect(await measurement.evaluate((state) => state.existing)).toEqual([])
+        expect(gate.held).toBe(true)
+        expect(ended()).toBe(false)
+        // Match the actual Request object, not a fixture's pre-fulfillment end event.
+        const response = page.waitForResponse((response) => response.request() === held.request)
+        release.resolve()
+        expect((await response).ok()).toBe(true)
+        await expect.poll(ended).toBe(true)
+        await expect.poll(() => measurement.evaluate((state) => state.renderedInsertion())).toBe(true)
+        await waitForTimelineStable(page)
+        await expect.poll(positions).toEqual(before)
+      } finally {
+        if (!page.isClosed()) {
+          const observed = await measurement.evaluate((state) => state.stop())
+          await testInfo.attach("history-anchor-measurements", {
+            body: JSON.stringify({
+              url: held.request.url(),
+              beforeCursor: held.before,
+              keys,
+              before,
+              requests,
+              ...observed,
+            }),
+            contentType: "application/json",
+          })
+          await measurement.dispose()
+          expect(observed.inserted.length).toBeGreaterThan(0)
+          expect(
+            observed.violations,
+            "Stable keys must not disappear or move in intersection rendering-update snapshots; see history-anchor-measurements",
+          ).toEqual([])
+        }
+      }
+    } finally {
+      release.resolve()
+      page.off("request", capture)
+      page.off("close", onClose)
+    }
   })
 
   test("preserves the timeline gap above the composer", async ({ page }) => {
@@ -125,20 +401,25 @@ test.describe("smoke: session timeline", () => {
     })
     await configureSmokePage(page, fixture.directory)
     await page.addInitScript(
-      ({ dirBase64, sourceID, targetID }) => {
+      ({ dirBase64, sourceID, targetID, server }) => {
         localStorage.setItem(
           "opencode.window.browser.dat:tabs",
           JSON.stringify(
             [sourceID, targetID].map((sessionId) => ({
               type: "session",
-              server: "http://127.0.0.1:4096",
+              server,
               dirBase64,
               sessionId,
             })),
           ),
         )
       },
-      { dirBase64: base64Encode(fixture.directory), sourceID: fixture.sourceID, targetID: fixture.targetID },
+      {
+        dirBase64: base64Encode(fixture.directory),
+        sourceID: fixture.sourceID,
+        targetID: fixture.targetID,
+        server: serverKey,
+      },
     )
 
     await page.goto(`/${base64Encode(fixture.directory)}/session/${fixture.targetID}`)
@@ -251,20 +532,25 @@ test.describe("smoke: session timeline", () => {
     })
     await configureSmokePage(page, fixture.directory)
     await page.addInitScript(
-      ({ dirBase64, sourceID, targetID }) => {
+      ({ dirBase64, sourceID, targetID, server }) => {
         localStorage.setItem(
           "opencode.window.browser.dat:tabs",
           JSON.stringify(
             [sourceID, targetID].map((sessionId) => ({
               type: "session",
-              server: "http://127.0.0.1:4096",
+              server,
               dirBase64,
               sessionId,
             })),
           ),
         )
       },
-      { dirBase64: base64Encode(fixture.directory), sourceID: fixture.sourceID, targetID: fixture.targetID },
+      {
+        dirBase64: base64Encode(fixture.directory),
+        sourceID: fixture.sourceID,
+        targetID: fixture.targetID,
+        server: serverKey,
+      },
     )
     await page.goto(`/${base64Encode(fixture.directory)}/session/${fixture.sourceID}`)
     await expectSessionTitle(page, fixture.expected.sourceTitle)
@@ -728,7 +1014,7 @@ async function navigateToSession(page: Page, directory: string, sessionId: strin
 }
 
 async function switchTitlebarSession(page: Page, sessionID: string, title: string) {
-  const href = `/server/${base64Encode(fixture.serverKey)}/session/${sessionID}`
+  const href = `/server/${base64Encode(serverKey)}/session/${sessionID}`
   const tab = page.locator(`[data-slot="titlebar-tabs"] a[href="${href}"]`).first()
   await expect(tab).toBeVisible()
   await tab.click()

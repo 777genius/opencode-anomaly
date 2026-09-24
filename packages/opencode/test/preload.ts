@@ -1,3 +1,4 @@
+import { unitDiagnostic } from "./lib/unit-diagnostic"
 // IMPORTANT: Set env vars BEFORE any imports from src/ directory
 // xdg-basedir reads env vars at import time, so we must set these first
 import os from "os"
@@ -10,8 +11,13 @@ import { afterAll } from "bun:test"
 const dir = path.join(os.tmpdir(), "opencode-test-data-" + process.pid)
 await fs.mkdir(dir, { recursive: true })
 afterAll(async () => {
+  const mark = unitDiagnostic("preload", "test/preload.ts")
+  mark("runtime.import.start")
   const { AppRuntime } = await import("../src/effect/app-runtime")
+  mark("runtime.import.settled")
+  mark("runtime.dispose.start")
   await AppRuntime.dispose()
+  mark("runtime.dispose.settled")
 
   const busy = (error: unknown) =>
     typeof error === "object" && error !== null && "code" in error && error.code === "EBUSY"
@@ -28,7 +34,9 @@ afterAll(async () => {
 
   // Windows can keep SQLite WAL handles alive until GC finalizers run, so we
   // force GC and retry teardown to avoid flaky EBUSY in test cleanup.
+  mark("filesystem.cleanup.start")
   await rm(30)
+  mark("filesystem.cleanup.settled")
 })
 
 process.env["XDG_DATA_HOME"] = path.join(dir, "share")

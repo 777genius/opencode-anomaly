@@ -6,6 +6,7 @@ import { ConfigProvider, Context, Effect, Exit, Layer, Scope } from "effect"
 import { HttpRouter, HttpServer } from "effect/unstable/http"
 import { OpenApi } from "effect/unstable/httpapi"
 import { createServer } from "node:http"
+import type { AddressInfo } from "node:net"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
@@ -13,6 +14,9 @@ import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
 import { PublicApi } from "./routes/instance/httpapi/public"
 import type { CorsOptions } from "@opencode-ai/server/cors"
 import { lazy } from "@/util/lazy"
+import { HostedApprovalProvenance } from "@/hosted-approval/provenance"
+import { HostedApprovalCoordinator, type Interface } from "@/hosted-approval/coordinator"
+import { readinessLine, type Readiness } from "@/hosted-approval/readiness"
 
 // @ts-ignore This global is needed to prevent ai-sdk from logging warnings to stdout https://github.com/vercel/ai/blob/2dc67e0ef538307f21368db32d5a12345d98831b/packages/ai/src/logger/log-warnings.ts#L85
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -21,6 +25,7 @@ export type Listener = {
   hostname: string
   port: number
   url: URL
+  readonly hostedApprovalReadiness?: Readiness
   stop: (close?: boolean) => Promise<void>
 }
 
@@ -40,6 +45,7 @@ type ListenerState = {
   server: Context.Service.Shape<typeof HttpServer.HttpServer>
   http: ListenerServer
   websockets: WebSocketTracker.Interface
+  hostedApproval: Interface
 }
 type EffectListener = Omit<Listener, "stop"> & {
   stop: (close?: boolean) => Effect.Effect<void>
@@ -47,6 +53,7 @@ type EffectListener = Omit<Listener, "stop"> & {
 
 interface ListenerServer {
   readonly closeAll: Effect.Effect<void>
+  readonly address: () => AddressInfo | string | null
 }
 
 class ListenerServerService extends Context.Service<ListenerServerService, ListenerServer>()(
@@ -71,11 +78,15 @@ export async function openapi() {
 export let url: URL | undefined
 
 export async function listen(opts: ListenOptions): Promise<Listener> {
+  HostedApprovalProvenance.assertInitialized(process.env)
   const listener = await Effect.runPromise(listenEffect(opts))
   return {
     hostname: listener.hostname,
     port: listener.port,
     url: listener.url,
+    ...(listener.hostedApprovalReadiness === undefined
+      ? {}
+      : { hostedApprovalReadiness: listener.hostedApprovalReadiness }),
     stop: (close?: boolean) => Effect.runPromiseExit(listener.stop(close)).then(() => undefined),
   }
 }
@@ -83,17 +94,43 @@ export async function listen(opts: ListenOptions): Promise<Listener> {
 const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unknown> = Effect.fn("Server.listen")(
   function* (opts: ListenOptions) {
     const state = yield* startWithPortFallback(opts)
-    const address = yield* tcpAddress(state)
-    const listenerUrl = makeURL(opts.hostname, address.port)
-    const unpublishMdns = yield* setupMdns(opts, address.port, state.scope)
-    url = listenerUrl
-
-    return {
-      hostname: opts.hostname,
-      port: address.port,
-      url: listenerUrl,
-      stop: yield* makeStop(state, unpublishMdns, listenerUrl),
-    }
+    return yield* Effect.gen(function* () {
+      const address = yield* tcpAddress(state)
+      const listenerUrl = makeURL(opts.hostname, address.port)
+      const unpublishMdns = yield* setupMdns(opts, address.port, state.scope)
+      const producer = HostedApprovalProvenance.current()
+      const hostedApprovalReadiness = producer === null
+        ? undefined
+        : yield* state.hostedApproval.withConditionalReply(
+            Effect.sync(() => {
+              producer.assertHealthy()
+              // NodeHttpServer normalizes the IPv6 wildcard to IPv4 for display.
+              // Read the owned socket itself for the supervisor's bound endpoint.
+              const bound = state.http.address()
+              if (bound === null || typeof bound === "string") throw new Error("hosted-approval-readiness-address")
+              const value: Readiness = Object.freeze({
+                ...state.hostedApproval.snapshot(),
+                endpoint: Object.freeze({
+                  protocol: "http:" as const,
+                  address: bound.address,
+                  port: bound.port,
+                  baseUrl: makeURL(bound.address, bound.port).origin,
+                }),
+              })
+              readinessLine(value)
+              return value
+            }),
+          )
+      const stop = yield* makeStop(state, unpublishMdns, listenerUrl)
+      url = listenerUrl
+      return {
+        hostname: opts.hostname,
+        port: address.port,
+        url: listenerUrl,
+        ...(hostedApprovalReadiness === undefined ? {} : { hostedApprovalReadiness }),
+        stop,
+      }
+    }).pipe(Effect.onError(() => Scope.close(state.scope, Exit.void).pipe(Effect.ignore)))
   },
 )
 
@@ -103,6 +140,9 @@ function listenerLayer(opts: ListenOptions, port: number) {
     disableLogger: true,
     disableListenLog: true,
   }).pipe(
+    // This exact Layer holds one process authority, also used by the routes
+    // and Permission service. Read it from the assembled listener context.
+    Layer.provideMerge(HostedApprovalCoordinator.layer),
     Layer.provideMerge(AppNodeBuilder.build(WebSocketTracker.node)),
     Layer.provideMerge(serverLayer({ port, hostname: opts.hostname })),
     // Install a fresh `ConfigProvider` per listener so `Config.string(...)`
@@ -132,6 +172,7 @@ function startListener(opts: ListenOptions, port: number) {
         server: Context.get(ctx, HttpServer.HttpServer),
         http: Context.get(ctx, ListenerServerService),
         websockets: Context.get(ctx, WebSocketTracker.Service),
+        hostedApproval: Context.get(ctx, HostedApprovalCoordinator.Service),
       }),
     ),
   )
@@ -147,7 +188,7 @@ function tcpAddress(state: ListenerState) {
 
 function makeURL(hostname: string, port: number) {
   const result = new URL("http://localhost")
-  result.hostname = hostname
+  result.hostname = hostname.includes(":") && !hostname.startsWith("[") ? `[${hostname}]` : hostname
   result.port = String(port)
   return result
 }
@@ -214,6 +255,7 @@ function serverLayer(opts: { port: number; hostname: string }) {
     NodeHttpServer.layer(() => server, { port: opts.port, host: opts.hostname, gracefulShutdownTimeout: "1 second" }),
     Layer.succeed(ListenerServerService)(
       ListenerServerService.of({
+        address: () => server.address(),
         closeAll: Effect.sync(() => {
           serverRef.forceStop = true
           if (serverRef.closeStarted) server.closeAllConnections()

@@ -1,8 +1,9 @@
 import { expect, test, type Page, type Route } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { currentSession } from "../utils/mock-server"
+import { fixtureOrigins, fixtureRoutePattern } from "../utils/fixture-origin"
 
-const server = "http://127.0.0.1:4096"
+const server = fixtureOrigins.canonical
 const sessionA = session("ses_tab_a", "Tab A session")
 const sessionB = session("ses_tab_b", "Tab B session")
 const sessionC = session("ses_tab_c", "Tab C session")
@@ -84,7 +85,8 @@ function session(id: string, title: string) {
 
 async function mockServer(page: Page) {
   const sessions = [sessionA, sessionB, sessionC]
-  await page.route("**/*", async (route) => {
+  await page.route(fixtureRoutePattern(server), async (route) => {
+    if (!["fetch", "xhr", "eventsource"].includes(route.request().resourceType())) return route.fallback()
     const url = new URL(route.request().url())
     if (url.origin !== server) return route.fallback()
     if ([`/api/session/${unresolvedSessionID}`, `/session/${unresolvedSessionID}`].includes(url.pathname))

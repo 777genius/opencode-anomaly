@@ -279,6 +279,47 @@ const scenarios: Scenario[] = [
       body: { method: "bad" },
     }))
     .status(400),
+  http.protected
+    .get("/experimental/agent-teams/hosted-approval-capability", "permission.hostedCapability")
+    .json(404, (body) => {
+      object(body)
+      check(body._tag === "HostedApprovalUnavailable", "hosted capability should require configured server auth")
+    }),
+  http.protected
+    .get(
+      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions",
+      "permission.hostedObserve",
+    )
+    .seeded((ctx) => ctx.session({ title: "Hosted approval observer" }))
+    .at((ctx) => ({
+      path: route("/experimental/agent-teams/hosted-approval/session/{sessionID}/permissions", {
+        sessionID: ctx.state.id,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(404, (body) => {
+      object(body)
+      check(body._tag === "HostedApprovalUnavailable", "hosted observe should require configured server auth")
+    }),
+  http.protected
+    .post(
+      "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
+      "permission.hostedReply",
+    )
+    .seeded((ctx) => ctx.session({ title: "Hosted approval reply owner" }))
+    .at((ctx) => ({
+      path: route(
+        "/experimental/agent-teams/hosted-approval/session/{sessionID}/permission/{requestID}/reply",
+        { sessionID: ctx.state.id, requestID: "per_httpapi_missing" },
+      ),
+      headers: ctx.headers(),
+      body: {},
+    }))
+    .status(404, (_ctx, result) =>
+      Effect.sync(() => {
+        check(result.text === "", "unavailable hosted reply should not parse or expose a response body")
+      }),
+    ),
   http.protected.get("/permission", "permission.list").json(200, array),
   http.protected
     .post("/permission/{requestID}/reply", "permission.reply.invalid")

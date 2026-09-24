@@ -129,6 +129,8 @@ test.describe("session timeline projection", () => {
   })
 
   test("renders comment strips and historical diff summary overflow", async ({ page }) => {
+    // CommentStrip belongs to the legacy layout, which retires after September 14, 2026.
+    await page.clock.setFixedTime(new Date("2026-09-10T12:00:00Z"))
     const user = userMessage(
       [
         userText("The user made the following comment regarding lines 4 through 8 of src/a.ts: Keep this stable", {
@@ -157,7 +159,8 @@ test.describe("session timeline projection", () => {
       settings: { newLayoutDesigns: false },
     })
     const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
-    await scroller.evaluate((element) => (element.scrollTop = 0))
+    await scroller.focus()
+    await scroller.press("Home")
 
     await expect(page.locator('[data-timeline-row="CommentStrip"]')).toBeVisible()
     await expect(page.getByText("Keep this stable", { exact: true })).toBeVisible()

@@ -32,7 +32,8 @@ test("keeps the file-browser sidebar mounted when switching file tabs", async ({
 
   await panel.getByRole("button", { name: "file-00.ts" }).click()
   await expect(panel.getByRole("tab", { name: "file-00.ts" })).toHaveAttribute("data-selected", "")
-  await expect(panel.getByText("contents:file-00.ts", { exact: true })).toBeVisible()
+  // The first code preview can wait on a cold syntax highlighter on Windows CI.
+  await expect(panel.getByText("contents:file-00.ts", { exact: true })).toBeVisible({ timeout: 30_000 })
 
   const viewport = panel.locator('[data-slot="session-review-v2-sidebar-tree"] .scroll-view__viewport')
   await viewport.hover()

@@ -2,9 +2,10 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import { expect, test, type Page, type Route } from "@playwright/test"
 import { installSseTransport } from "../utils/sse-transport"
 import { currentSession } from "../utils/mock-server"
+import { fixtureOrigins, fixtureRoutePattern } from "../utils/fixture-origin"
 
-const serverA = "http://127.0.0.1:4096"
-const serverB = "http://127.0.0.1:4097"
+const serverA = fixtureOrigins.canonical
+const serverB = fixtureOrigins.remote
 const directoryA = "C:/server-a"
 const directoryB = "/home/server-b"
 const sessionA = session("ses_server_a", directoryA, "Server A session")
@@ -162,7 +163,8 @@ async function configureServers(page: Page, tabs: { type: "session"; server: str
 }
 
 async function mockServers(page: Page, permissionRequests: string[], permissionResponses: PermissionResponse[] = []) {
-  await page.route("**/*", async (route) => {
+  await page.route(fixtureRoutePattern(serverA, serverB), async (route) => {
+    if (!["fetch", "xhr", "eventsource"].includes(route.request().resourceType())) return route.fallback()
     const url = new URL(route.request().url())
     if (url.origin !== serverA && url.origin !== serverB) return route.fallback()
     const remote = url.origin === serverB
