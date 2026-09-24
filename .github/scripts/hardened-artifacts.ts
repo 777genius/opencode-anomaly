@@ -5,12 +5,12 @@ import { lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/pr
 import path from "node:path"
 
 export const RELEASE = {
-  sourceCommit: "95ec1099f53a242e9a85b2ab2b1665ee23aa91e9",
-  sourceTree: "270be7b42305c1973969cb546e8e96d530d2e2a1",
-  packagesTree: "b63e850d90ad1a6a1ff4baeef32f053ae8bf012b",
-  artifactTree: "ba088a05908ad1b04c97c9b71e2fd68454eb9f22",
+  sourceCommit: "0564ecbb2b37265dc5c083e99943137cfdda6604",
+  sourceTree: "ab2a331c9ad1c4464dd0ca3df187b2343ac6534b",
+  packagesTree: "0a8198dfaa715218fc21d4739052e6bd7647c6a4",
+  artifactTree: "43fbcd0bc4fb86799c89dec6c5f2d43740d28bc0",
   baseCommit: "3104c1428ec91f809e5ab86631300de41eb6952e",
-  patchSha256: "bfeb74ce5adc6a0cbdff7f330be68c814746a63560881b43cb30c87e57fe7140",
+  patchSha256: "f696c32ada738d470128c320fda08c925d440df287357c45efc8a3634b18a325",
   version: "1.18.30-agentteams.1",
   tag: "v1.18.30-agentteams.1",
   bunVersion: "1.4.0",

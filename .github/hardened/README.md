@@ -4,11 +4,11 @@ This directory freezes the reviewed patch used by the isolated hardened release
 workflow. The artifact is upstream base commit
 `3104c1428ec91f809e5ab86631300de41eb6952e` (upstream `v1.18.30`) plus the exact
 `packages/` projection from the pinned PR3 source commit
-`95ec1099f53a242e9a85b2ab2b1665ee23aa91e9`. The patch is byte-for-byte the
+`0564ecbb2b37265dc5c083e99943137cfdda6604`. The patch is byte-for-byte the
 canonical `packages/` diff between those commits. The source commit tree is
-`270be7b42305c1973969cb546e8e96d530d2e2a1`, its `packages/` subtree is
-`b63e850d90ad1a6a1ff4baeef32f053ae8bf012b`, and applying the patch produces the
-frozen artifact tree `ba088a05908ad1b04c97c9b71e2fd68454eb9f22`. PR3's `.github/`
+`ab2a331c9ad1c4464dd0ca3df187b2343ac6534b`, its `packages/` subtree is
+`0a8198dfaa715218fc21d4739052e6bd7647c6a4`, and applying the patch produces the
+frozen artifact tree `43fbcd0bc4fb86799c89dec6c5f2d43740d28bc0`. PR3's `.github/`
 runner changes are deliberately excluded from the release source artifact. Bun
 `1.4.0` is separately pinned by the workflow and is not taken from the projected
 PR3 tree.

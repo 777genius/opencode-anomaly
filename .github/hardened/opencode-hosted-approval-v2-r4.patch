@@ -658,6 +658,46 @@ index 37878325e14de8f16921c32bb7ac2d3a4e8b4ddf..5d257d680a534eabdb48ea35e21a9e18
 +    String(searches),
 +  )
 +}
+diff --git a/packages/app/e2e/regression/session-timeline-file-projection.spec.ts b/packages/app/e2e/regression/session-timeline-file-projection.spec.ts
+index f07da121c66674ecebf7fbf4192e3f34f297c1c6..43742d259a863e43c66b90ec4c9d91011f24e09b 100644
+--- a/packages/app/e2e/regression/session-timeline-file-projection.spec.ts
++++ b/packages/app/e2e/regression/session-timeline-file-projection.spec.ts
+@@ -1,5 +1,6 @@
+ import { expect, test } from "@playwright/test"
+ import { assistantMessage, setupTimeline, toolPart, userMessage } from "../performance/timeline-stability/fixture"
++import { APP_READY_TIMEOUT, expectAppVisible } from "../utils/waits"
+ 
+ test("renders completed write content", async ({ page }) => {
+   const id = "prt_file_projection_write"
+@@ -17,6 +18,7 @@ test("renders completed write content", async ({ page }) => {
+ })
+ 
+ test("renders a completed single-file patch", async ({ page }) => {
++  test.setTimeout(90_000)
+   const id = "prt_file_projection_single_patch"
+   await setupTimeline(page, {
+     messages: [
+@@ -48,5 +50,19 @@ test("renders a completed single-file patch", async ({ page }) => {
+     settings: { editToolPartsExpanded: true },
+   })
+ 
+-  await expect(page.locator(`[data-timeline-part-id="${id}"] [data-component="apply-patch-file-diff"]`)).toBeVisible()
++  const diff = page.locator(`[data-timeline-part-id="${id}"] [data-component="apply-patch-file-diff"]`)
++  await expect(diff.locator("diffs-container [data-line]")).toHaveCount(2, { timeout: APP_READY_TIMEOUT })
++  await expectAppVisible(diff)
++  const row = page.locator("[data-timeline-key]", { has: diff })
++  await expect
++    .poll(
++      () =>
++        row.evaluate((element) => {
++          const content = element.querySelector<HTMLElement>('[data-component="apply-patch-file-diff"]')
++          if (!content) return false
++          return content.getBoundingClientRect().bottom <= element.getBoundingClientRect().bottom + 0.5
++        }),
++      { timeout: APP_READY_TIMEOUT },
++    )
++    .toBe(true)
+ })
 diff --git a/packages/app/e2e/regression/session-timeline-projection.spec.ts b/packages/app/e2e/regression/session-timeline-projection.spec.ts
 index b1aabcc32ca9503fc245ddedef18dc2aac0bc873..a560a8d65528377a99e73abe283179a6c1d24df3 100644
 --- a/packages/app/e2e/regression/session-timeline-projection.spec.ts
@@ -6255,10 +6295,10 @@ index 9a49384855a1528ed1b43419a2ca6c9a5a9f4c2c..052a6157cca2c0391c3ffe3f57e74bb1
    )
  })
 diff --git a/packages/opencode/test/cli/run/run-process.test.ts b/packages/opencode/test/cli/run/run-process.test.ts
-index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa5ce25f53 100644
+index d2d4bae879216be6fb79840bea83d2a4054e6bec..af7060d3d67cde5ffeb5c1a56241c421caff3845 100644
 --- a/packages/opencode/test/cli/run/run-process.test.ts
 +++ b/packages/opencode/test/cli/run/run-process.test.ts
-@@ -3,12 +3,154 @@
+@@ -3,12 +3,155 @@
  // same process. See `test/lib/cli-process.ts` for the harness — each test uses
  // `opencode.run(message, opts?)` to spawn `bun src/index.ts run ...` with
  // `OPENCODE_CONFIG_CONTENT` providing the test provider config inline.
@@ -6325,6 +6365,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
 +  windowsNativeCommandLineRoundTripForTest,
 +  windowsSupervisorArgumentsForTest,
 +  windowsSupervisorArgumentRoundTripForTest,
++  windowsSupervisorStartupRetryForTest,
 +  windowsSupervisorDrainLifecycleForTest,
 +  windowsSupervisorCompletionForTest,
 +  windowsSupervisorProtocolForTest,
@@ -6415,7 +6456,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    // Happy path: prompt completes, output reaches stdout, process exits 0.
    // If this fails, all the others likely will too — debug here first.
    cliIt.concurrent(
-@@ -20,7 +162,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -20,7 +163,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          opencode.expectExit(result, 0)
          expect(result.stdout).toBe("hello from the test llm\n")
        }),
@@ -6424,7 +6465,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -42,7 +184,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -42,7 +185,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          opencode.expectExit(result, 0)
          expect(result.stdout).toBe("before tool\nafter tool\n")
        }),
@@ -6433,7 +6474,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -59,7 +201,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -59,7 +202,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          opencode.expectExit(plain, 0)
          expect(plain.stdout).toBe("visible\n")
        }),
@@ -6442,7 +6483,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    // Regression for #27371: an unknown model used to hang the process forever
-@@ -73,12 +215,13 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -73,12 +216,13 @@ describe("opencode run (non-interactive subprocess)", () => {
        Effect.gen(function* () {
          const result = yield* opencode.run("say hi", {
            model: "test/nonexistent-model",
@@ -6460,7 +6501,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    // The test provider's SSE error item is interpreted by the SDK as an unknown
-@@ -96,12 +239,12 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -96,12 +240,12 @@ describe("opencode run (non-interactive subprocess)", () => {
          )
          yield* llm.fail("upstream provider exploded mid-stream")
          yield* llm.text("recovered")
@@ -6475,7 +6516,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    // --format json puts one JSON object per line on stdout for each emitted
-@@ -138,7 +281,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -138,7 +282,7 @@ describe("opencode run (non-interactive subprocess)", () => {
              .every((line) => line.length > 0),
          ).toBe(true)
        }),
@@ -6484,7 +6525,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -161,7 +304,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -161,7 +305,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          })
          expect(result.stdout.split("\n").filter(Boolean)).toHaveLength(1)
        }),
@@ -6493,7 +6534,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -210,7 +353,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -210,7 +354,7 @@ describe("opencode run (non-interactive subprocess)", () => {
              .every((line) => line.startsWith("{")),
          ).toBe(true)
        }),
@@ -6502,7 +6543,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -225,7 +368,14 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -225,7 +369,14 @@ describe("opencode run (non-interactive subprocess)", () => {
          )
          yield* llm.fail("provider failed")
          yield* llm.text("recovered")
@@ -6518,7 +6559,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
  
          const events = opencode.parseJsonEvents(result.stdout)
          expect(result.exitCode).toBe(0)
-@@ -245,7 +395,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -245,7 +396,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          expect(events[7]?.part).toEqual(expect.objectContaining({ type: "text", text: "recovered" }))
          expect(events.at(-1)?.part).toEqual(expect.objectContaining({ type: "step-finish", reason: "stop" }))
        }),
@@ -6527,7 +6568,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -260,28 +410,41 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -260,28 +411,41 @@ describe("opencode run (non-interactive subprocess)", () => {
          expect(denied.stdout).toBe("")
  
          yield* llm.reset
@@ -6581,7 +6622,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.live(
-@@ -303,7 +466,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -303,7 +467,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          expect(input).toContain(sentinel)
          expect(input).not.toContain(`file://${source}`)
        }),
@@ -6590,7 +6631,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.concurrent(
-@@ -317,7 +480,7 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -317,7 +481,7 @@ describe("opencode run (non-interactive subprocess)", () => {
          expect(result.exitCode).not.toBe(0)
          expect(result.stderr).toContain("Cannot attach local directory without a shared filesystem")
        }),
@@ -6599,7 +6640,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
    )
  
    cliIt.live(
-@@ -327,6 +490,14 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -327,6 +491,14 @@ describe("opencode run (non-interactive subprocess)", () => {
          yield* llm.hang
          const run = yield* opencode.startRun("wait forever")
          yield* llm.wait(1)
@@ -6614,7 +6655,7 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
          run.interrupt()
          const result = yield* run.result
  
-@@ -336,3 +507,808 @@ describe("opencode run (non-interactive subprocess)", () => {
+@@ -336,3 +508,813 @@ describe("opencode run (non-interactive subprocess)", () => {
      30_000,
    )
  })
@@ -6808,6 +6849,11 @@ index d2d4bae879216be6fb79840bea83d2a4054e6bec..ff1e7c795b443aaf7293a114190224aa
 +    await expect(
 +      windowsSupervisorArgumentRoundTripForTest(["slow handshake"], 1_000, undefined, undefined, 4_500),
 +    ).resolves.toEqual(["slow handshake"])
++  })
++
++  test("Windows retries a reaped supervisor that exits before releasing its target", async () => {
++    if (process.platform !== "win32") return
++    await expect(windowsSupervisorStartupRetryForTest()).resolves.toEqual({ exitCode: 0, stdout: "ready" })
 +  })
 +
 +  test("Windows supervisor starts the stalled target timeout after status and reaps its captured child", async () => {
@@ -9284,7 +9330,7 @@ index 0000000000000000000000000000000000000000..c466dddd08b20427feaaf71fc7bfa7b5
 +  })
 +}
 diff --git a/packages/opencode/test/lib/cli-process.ts b/packages/opencode/test/lib/cli-process.ts
-index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc42dc7f85 100644
+index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..596394f8692837ae8d9d8e9fd5c275deda25d18f 100644
 --- a/packages/opencode/test/lib/cli-process.ts
 +++ b/packages/opencode/test/lib/cli-process.ts
 @@ -1,3 +1,15 @@
@@ -9303,7 +9349,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
  // Subprocess test harness for the opencode CLI. Spawns the real binary against
  // a TestLLMServer running in-process at a random port, with full env isolation.
  //
-@@ -21,42 +33,5090 @@ import { test, type TestOptions } from "bun:test"
+@@ -21,42 +33,5139 @@ import { test, type TestOptions } from "bun:test"
  import { FSUtil } from "@opencode-ai/core/fs-util"
  import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
  import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -12144,6 +12190,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
 +function windowsSupervisorScript() {
 +  const separator = "\t"
 +  const script = String.raw`param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Command)
++if ($env:OPENCODE_TEST_FAIL_BEFORE_STATUS -eq "1") { exit 125 }
 +Add-Type @'
 +using System;
 +using System.Text;
@@ -12405,6 +12452,23 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
 +        operationError ? [operationError, ...cleanupErrors] : cleanupErrors,
 +        "Windows supervisor argv probe cleanup failed",
 +      )
++  }
++}
++
++export async function windowsSupervisorStartupRetryForTest() {
++  if (process.platform !== "win32") throw new Error("Windows supervisor test requires Windows")
++  const proc = await spawnTracked(
++    [process.execPath, "-e", 'process.stdout.write("ready")'],
++    { env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe" },
++    { windowsFailFirstSupervisor: true },
++  )
++  const observed = proc.rawExited ?? proc.child.exited
++  try {
++    if (!proc.stdout) throw new Error("Windows supervisor did not expose stdout")
++    const [exitCode, stdout] = await Promise.all([observed, new Response(proc.stdout).text()])
++    return { exitCode, stdout }
++  } finally {
++    await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 8_000, observed)
 +  }
 +}
 +
@@ -12709,6 +12773,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
 +
 +type SpawnTrackedTestOptions = {
 +  readonly forcePortable?: boolean
++  readonly windowsFailFirstSupervisor?: boolean
 +  readonly portableFilesystem?: PortableFilesystem
 +  readonly portableObserve?: PortableObserve
 +  // The test-only pause sits after the controller publishes kill-issued and
@@ -12738,133 +12803,163 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
 +  test?: SpawnTrackedTestOptions,
 +) {
 +  if (process.platform === "win32") {
-+    const nonce = crypto.randomUUID()
-+    const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
-+    const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
-+    const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
-+    const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
-+    const supervisor = writeWindowsSupervisor(nonce)
-+    let child: ReturnType<typeof Bun.spawn>
-+    try {
-+      // `-File` gives the script's ValueFromRemainingArguments parameter the
-+      // original argv. With `-Command`, these values are concatenated into
-+      // PowerShell source and no longer arrive in `$Command` reliably.
-+      child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor, ...command], {
-+        ...options,
-+        env: {
-+          ...options.env,
-+          OPENCODE_TEST_RELEASE: release,
-+          OPENCODE_TEST_ABORT: abort,
-+          OPENCODE_TEST_STATUS: status,
-+          OPENCODE_TEST_COMPLETION: completion,
-+          OPENCODE_TEST_JOB_ID: nonce,
-+        },
-+      })
-+    } catch (cause) {
++    const startupFailures: Error[] = []
++    for (let attempt = 0; attempt < 2; attempt++) {
++      const nonce = crypto.randomUUID()
++      const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
++      const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
++      const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
++      const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
++      const supervisor = writeWindowsSupervisor(nonce)
++      let child: ReturnType<typeof Bun.spawn>
 +      try {
-+        unlinkSync(supervisor)
-+      } catch (cleanup) {
-+        throw new AggregateError(
-+          [
-+            new Error("failed to spawn Windows job supervisor", { cause }),
-+            new Error("failed to remove Windows supervisor script", { cause: cleanup }),
-+          ],
-+          "failed to establish Windows Job Object containment",
-+        )
-+      }
-+      throw new Error("failed to spawn Windows job supervisor", { cause })
-+    }
-+    const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
-+    let root: ProcessIdentity | undefined
-+    let rawExited: Promise<number> | undefined
-+    let stdout: ReadableStream<Uint8Array> | undefined
-+    let stderr: ReadableStream<Uint8Array> | undefined
-+    let supervisorExited = false
-+    const abortLaunch = async (cause: unknown) => {
-+      const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
-+      const cleanupDeadline = Date.now() + 4_000
-+      // These must stay separate. If either filesystem operation fails, the
-+      // other still gives the provisional supervisor a path to exit.
-+      try {
-+        writeFileSync(abort, "abort")
-+      } catch (abortCause) {
-+        recordError(errors, "failed to write Windows acquisition abort", abortCause)
-+      }
-+      try {
-+        writeFileSync(release, "release")
-+      } catch (releaseCause) {
-+        recordError(errors, "failed to write Windows acquisition release", releaseCause)
-+      }
-+      try {
-+        try {
-+          // Do this even if identity/status probing failed. `child` carries
-+          // Bun's exact native handle, so it cannot resolve a recycled PID.
-+          child.kill()
-+        } catch (termination) {
-+          if (!isMissingProcess(termination))
-+            recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
-+        }
-+        if (
-+          !(await exitedWithin(
-+            child,
-+            Math.max(cleanupDeadline - Date.now(), 0),
-+            "after Windows acquisition failure",
-+            errors,
-+            rawExited,
-+          ))
-+        ) {
-+          errors.push(new Error("Windows Job Object supervisor did not exit after acquisition failure"))
-+        }
-+      } finally {
-+        // The supervisor may still be observing these files until it is known
-+        // dead. Do not remove a control signal before the reap above.
-+        ;[status, release, abort, completion, supervisor].forEach((file) => {
-+          try {
-+            if (existsSync(file)) unlinkSync(file)
-+          } catch (cleanup) {
-+            recordError(errors, `failed to remove Windows acquisition control ${file}`, cleanup)
-+          }
++        // `-File` gives the script's ValueFromRemainingArguments parameter the
++        // original argv. With `-Command`, these values are concatenated into
++        // PowerShell source and no longer arrive in `$Command` reliably.
++        child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor, ...command], {
++          ...options,
++          env: {
++            ...options?.env,
++            OPENCODE_TEST_RELEASE: release,
++            OPENCODE_TEST_ABORT: abort,
++            OPENCODE_TEST_STATUS: status,
++            OPENCODE_TEST_COMPLETION: completion,
++            OPENCODE_TEST_JOB_ID: nonce,
++            OPENCODE_TEST_FAIL_BEFORE_STATUS: test?.windowsFailFirstSupervisor && attempt === 0 ? "1" : "0",
++          },
 +        })
++      } catch (cause) {
++        try {
++          unlinkSync(supervisor)
++        } catch (cleanup) {
++          throw new AggregateError(
++            [
++              new Error("failed to spawn Windows job supervisor", { cause }),
++              new Error("failed to remove Windows supervisor script", { cause: cleanup }),
++            ],
++            "failed to establish Windows Job Object containment",
++          )
++        }
++        throw new Error("failed to spawn Windows job supervisor", { cause })
 +      }
-+      throw new AggregateError(errors, "failed to establish Windows Job Object containment")
++      const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
++      let root: ProcessIdentity | undefined
++      let rawExited: Promise<number> | undefined
++      let stdout: ReadableStream<Uint8Array> | undefined
++      let stderr: ReadableStream<Uint8Array> | undefined
++      let supervisorExited = false
++      let observedExitCode: number | undefined
++      let exitedBeforeRelease = false
++      const abortLaunch = async (cause: unknown) => {
++        const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
++        const cleanupDeadline = Date.now() + 4_000
++        // These must stay separate. If either filesystem operation fails, the
++        // other still gives the provisional supervisor a path to exit.
++        try {
++          writeFileSync(abort, "abort")
++        } catch (abortCause) {
++          recordError(errors, "failed to write Windows acquisition abort", abortCause)
++        }
++        try {
++          writeFileSync(release, "release")
++        } catch (releaseCause) {
++          recordError(errors, "failed to write Windows acquisition release", releaseCause)
++        }
++        try {
++          try {
++            // Do this even if identity/status probing failed. `child` carries
++            // Bun's exact native handle, so it cannot resolve a recycled PID.
++            if (observedExitCode === undefined) child.kill()
++          } catch (termination) {
++            if (!isMissingProcess(termination))
++              recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
++          }
++          if (
++            !(await exitedWithin(
++              child,
++              Math.max(cleanupDeadline - Date.now(), 0),
++              "after Windows acquisition failure",
++              errors,
++              rawExited,
++            ))
++          ) {
++            errors.push(new Error("Windows Job Object supervisor did not exit after acquisition failure"))
++          }
++        } finally {
++          // The supervisor may still be observing these files until it is known
++          // dead. Do not remove a control signal before the reap above.
++          ;[status, release, abort, completion, supervisor].forEach((file) => {
++            try {
++              if (existsSync(file)) unlinkSync(file)
++            } catch (cleanup) {
++              recordError(errors, `failed to remove Windows acquisition control ${file}`, cleanup)
++            }
++          })
++        }
++        throw new AggregateError(errors, "failed to establish Windows Job Object containment")
++      }
++      // The status is written by Start() using GetProcessTimes on the inherited
++      // native process handle, before this process is ever allowed to launch the
++      // application. Do not defer this identity acquisition to cleanup.
++      try {
++        // Access each child-owned resource before any status, identity, or
++        // release work. If Bun throws synchronously here, abortLaunch still owns
++        // the exact supervisor handle and will terminate, escalate, and reap it.
++        rawExited = child.exited
++        if (!(child.stdout instanceof ReadableStream) || !(child.stderr instanceof ReadableStream))
++          throw new Error("Windows Job Object supervisor did not expose pipe streams")
++        stdout = child.stdout
++        stderr = child.stderr
++        void Promise.resolve(rawExited).catch(() => {})
++        rawExited.then(
++          (code) => {
++            supervisorExited = true
++            observedExitCode = code
++          },
++          () => {
++            supervisorExited = true
++          },
++        )
++        while (!existsSync(status) && !supervisorExited && Date.now() < acquisitionDeadline)
++          await new Promise<void>((resolve) => setTimeout(resolve, 5))
++        if (supervisorExited) {
++          exitedBeforeRelease = true
++          throw new Error(`Windows Job Object supervisor exited before release (exit ${observedExitCode ?? "unknown"})`)
++        }
++        root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
++        if (!root) {
++          throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
++        }
++        const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
++        const captured = await tracker.scan(acquisitionDeadline)
++        if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
++          throw new Error("failed to establish Windows Job Object containment")
++        }
++        writeFileSync(release, "release")
++        return { child, tracker, rawExited, stdout, stderr }
++      } catch (cause) {
++        try {
++          return await abortLaunch(cause)
++        } catch (failure) {
++          // No release was published, so the target could not launch. Retry a
++          // transient PowerShell/Add-Type startup exit only after the exact
++          // native handle was reaped and every provisional control was removed.
++          if (
++            exitedBeforeRelease &&
++            attempt === 0 &&
++            failure instanceof AggregateError &&
++            failure.errors.length === 1
++          ) {
++            startupFailures.push(failure)
++            continue
++          }
++          if (startupFailures.length)
++            throw new AggregateError([...startupFailures, failure], "Windows Job Object startup failed after retry")
++          throw failure
++        }
++      }
 +    }
-+    // The status is written by Start() using GetProcessTimes on the inherited
-+    // native process handle, before this process is ever allowed to launch the
-+    // application. Do not defer this identity acquisition to cleanup.
-+    try {
-+      // Access each child-owned resource before any status, identity, or
-+      // release work. If Bun throws synchronously here, abortLaunch still owns
-+      // the exact supervisor handle and will terminate, escalate, and reap it.
-+      rawExited = child.exited
-+      stdout = child.stdout
-+      stderr = child.stderr
-+      void Promise.resolve(rawExited).catch(() => {})
-+      rawExited.then(
-+        () => {
-+          supervisorExited = true
-+        },
-+        () => {
-+          supervisorExited = true
-+        },
-+      )
-+      while (!existsSync(status) && !supervisorExited && Date.now() < acquisitionDeadline)
-+        await new Promise<void>((resolve) => setTimeout(resolve, 5))
-+      if (supervisorExited)
-+        throw new Error("Windows Job Object supervisor exited before publishing its authenticated launch status")
-+      root = existsSync(status) ? windowsSupervisorIdentity(readFileSync(status, "utf8"), child.pid, nonce) : undefined
-+      if (!root) {
-+        throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
-+      }
-+      const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
-+      const captured = await tracker.scan(acquisitionDeadline)
-+      if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
-+        throw new Error("failed to establish Windows Job Object containment")
-+      }
-+      writeFileSync(release, "release")
-+      return { child, tracker, rawExited, stdout, stderr }
-+    } catch (cause) {
-+      return await abortLaunch(cause)
-+    }
++    throw new Error("Windows Job Object admission attempts exhausted")
 +  }
 +  const cgroup = test?.forcePortable ? undefined : prepareCgroup()
 +  if (cgroup) {
@@ -14417,7 +14512,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
  }
  
  function isolatedEnv(home: string, configJson: string): Record<string, string> {
-@@ -140,6 +5200,10 @@ export type AcpOpts = SpawnOpts & {
+@@ -140,6 +5249,10 @@ export type AcpOpts = SpawnOpts & {
  }
  
  export type AcpHandle = {
@@ -14428,7 +14523,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
    // Writes a single JSON-RPC message to the child's stdin as one ndjson line.
    readonly send: (msg: object) => Effect.Effect<void>
    // Resolves with the next parsed JSON-RPC line from the child's stdout.
-@@ -150,6 +5214,7 @@ export type AcpHandle = {
+@@ -150,6 +5263,7 @@ export type AcpHandle = {
    // calls this, so tests only need it when asserting exit behavior.
    readonly close: () => void
    readonly exited: Promise<number>
@@ -14436,7 +14531,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
  }
  
  export type OpencodeCli = {
-@@ -192,9 +5257,8 @@ export function withCliFixture<A, E>(
+@@ -192,9 +5306,8 @@ export function withCliFixture<A, E>(
    return Effect.gen(function* () {
      const llm = yield* TestLLMServer
      const fs = yield* FSUtil.Service
@@ -14447,7 +14542,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
      yield* Effect.addFinalizer(() =>
        fs
          .remove(home, { recursive: true })
-@@ -204,49 +5268,73 @@ export function withCliFixture<A, E>(
+@@ -204,49 +5317,73 @@ export function withCliFixture<A, E>(
      const configJson = JSON.stringify(testProviderConfig(llm.url))
      const env = isolatedEnv(home, configJson)
  
@@ -14562,7 +14657,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
  
      const runArgs = (message: string, opts?: RunOpts) => {
        const argv: string[] = ["run"]
-@@ -279,29 +5367,43 @@ export function withCliFixture<A, E>(
+@@ -279,29 +5416,43 @@ export function withCliFixture<A, E>(
      }
  
      const startRun = Effect.fn("opencode.startRun")(function* (message: string, opts?: RunOpts) {
@@ -14623,7 +14718,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
          result: Effect.promise(async () => ({
            exitCode: await proc.exited,
            stdout: normalizeLines(await stdout),
-@@ -312,6 +5414,11 @@ export function withCliFixture<A, E>(
+@@ -312,6 +5463,11 @@ export function withCliFixture<A, E>(
      })
  
      const serve = Effect.fn("opencode.serve")(function* (opts?: ServeOpts) {
@@ -14635,7 +14730,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
        const argv = ["serve"]
        // Default port 0 — let the OS pick a free port, parse the actual one
        // off stdout. Hard-coded ports flake under parallel tests.
-@@ -320,117 +5427,147 @@ export function withCliFixture<A, E>(
+@@ -320,117 +5476,147 @@ export function withCliFixture<A, E>(
        if (opts?.extraArgs) argv.push(...opts.extraArgs)
  
        // Acquire the subprocess; release sends SIGTERM and awaits exit on
@@ -14849,7 +14944,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
            Stream.decodeText(),
            Stream.splitLines,
            Stream.runForEach((line) => {
-@@ -443,6 +5580,7 @@ export function withCliFixture<A, E>(
+@@ -443,6 +5629,7 @@ export function withCliFixture<A, E>(
              }
              return Queue.offer(responses, parsed)
            }),
@@ -14857,7 +14952,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
            Effect.ignore({ log: true }),
          ),
        )
-@@ -454,28 +5592,31 @@ export function withCliFixture<A, E>(
+@@ -454,28 +5641,31 @@ export function withCliFixture<A, E>(
          // and corrupt the ndjson framing.
          send: (msg: object) =>
            Effect.promise(async () => {
@@ -14898,7 +14993,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
      ),
    )
  }
-@@ -506,22 +5647,71 @@ function expectExit(result: RunResult, expected: number, label = "opencode") {
+@@ -506,22 +5696,71 @@ function expectExit(result: RunResult, expected: number, label = "opencode") {
    throw new Error(`${label}: expected exit ${expected}, got ${result.exitCode}`)
  }
  
@@ -14975,7 +15070,7 @@ index a4d3b36c1dae2fc5742c97b13d80803e934d0f11..6d43b745bd64d1e828ae89d328c458fc
    concurrent: <A, E>(
      name: string,
      body: (input: CliFixture) => Effect.Effect<A, E, Scope.Scope | HttpClient.HttpClient>,
-@@ -529,7 +5719,9 @@ export const cliIt = {
+@@ -529,7 +5768,9 @@ export const cliIt = {
    ) =>
      (process.platform === "win32" ? test : test.concurrent)(
        name,
