@@ -64,6 +64,7 @@ import {
   windowsNativeCommandLineRoundTripForTest,
   windowsSupervisorArgumentsForTest,
   windowsSupervisorArgumentRoundTripForTest,
+  windowsSupervisorInvalidArgvForTest,
   windowsSupervisorStartupRetryForTest,
   windowsSupervisorDrainLifecycleForTest,
   windowsSupervisorCompletionForTest,
@@ -681,17 +682,32 @@ describe("CLI process cleanup containment", () => {
     expect(formatProcessErrorForTest(result.cause)).toContain("synthetic native argv stdout getter failed")
   })
 
-  test("Windows supervisor binds real argv through its -File launch boundary", async () => {
+  test("Windows supervisor transfers real argv through its -File launch boundary", async () => {
     if (process.platform !== "win32") return
     const argv = ["", "", "two words", 'say "hello"', "C:\\program files\\", 'escaped \\" command', "plain", ""]
     let finalized: { statusRemoved: boolean; reaped: boolean } | undefined
     await expect(
-      windowsSupervisorArgumentRoundTripForTest(argv, 4_000, undefined, (result) => {
-        finalized = result
-      }),
+      windowsSupervisorArgumentRoundTripForTest(
+        argv,
+        4_000,
+        undefined,
+        (result) => {
+          finalized = result
+        },
+        0,
+        true,
+      ),
     ).resolves.toEqual(argv)
     expect(finalized).toEqual({ statusRemoved: true, reaped: true })
   })
+
+  test("Windows supervisor keeps target flags opaque across its -File boundary", async () => {
+    if (process.platform !== "win32") return
+    const argv = ["", "-e", "--", "-ErrorAction", "two words", 'say "hello"', "C:\\program files\\", ""]
+    await expect(windowsSupervisorArgumentRoundTripForTest(argv, 4_000, undefined, undefined, 0, true)).resolves.toEqual(
+      argv,
+    )
+  }, 30_000)
 
   test("Windows supervisor gives its PowerShell/C# handshake a separate deadline", async () => {
     if (process.platform !== "win32") return
@@ -704,6 +720,18 @@ describe("CLI process cleanup containment", () => {
     if (process.platform !== "win32") return
     await expect(windowsSupervisorStartupRetryForTest()).resolves.toEqual({ exitCode: 0, stdout: "ready" })
   })
+
+  test("Windows supervisor never dispatches a target with a missing or invalid argv file", async () => {
+    if (process.platform !== "win32") return
+    for (const fault of ["missing", "invalid-utf8"] as const) {
+      const result = await windowsSupervisorInvalidArgvForTest(fault)
+      expect(result.targetExecuted).toBe(false)
+      expect(result.error).toBeInstanceOf(AggregateError)
+      expect(formatProcessErrorForTest(result.error)).toContain(
+        fault === "missing" ? "missing argv payload file" : "invalid UTF-8 argv payload",
+      )
+    }
+  }, 30_000)
 
   test("Windows supervisor starts the stalled target timeout after status and reaps its captured child", async () => {
     if (process.platform !== "win32") return

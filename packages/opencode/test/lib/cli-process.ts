@@ -2629,6 +2629,7 @@ function trackWindowsProcess(
   status: string,
   completion: string,
   supervisor: string,
+  argvFile: string,
   job: string,
 ): ProcessTracker {
   const errors: Error[] = []
@@ -2645,7 +2646,7 @@ function trackWindowsProcess(
     jobDrained: () => drained,
     scan,
     stop: async () => {
-      ;[status, release, abort, completion, supervisor].forEach((file) => {
+      ;[status, release, abort, completion, supervisor, argvFile].forEach((file) => {
         try {
           if (existsSync(file)) unlinkSync(file)
         } catch (cause) {
@@ -2865,8 +2866,12 @@ export async function abortedCgroupMembershipDeadlineForTest() {
 
 function windowsSupervisorScript() {
   const separator = "\t"
-  const script = String.raw`param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Command)
-if ($env:OPENCODE_TEST_FAIL_BEFORE_STATUS -eq "1") { exit 125 }
+  const script = String.raw`if ($env:OPENCODE_TEST_FAIL_BEFORE_STATUS -eq "1") { exit 125 }
+try { $argvBytes=[IO.File]::ReadAllBytes($env:OPENCODE_TEST_ARGV_FILE) }
+catch { [Console]::Error.WriteLine("OPENCODE_ARGV_MISSING"); exit 125 }
+try { $utf8=[Text.UTF8Encoding]::new($false,$true); [string[]]$Command=$utf8.GetString($argvBytes).Split([char[]]@([char]0),[StringSplitOptions]::None) }
+catch { [Console]::Error.WriteLine("OPENCODE_ARGV_INVALID_UTF8"); exit 125 }
+if ($Command.Length -lt 1 -or [string]::IsNullOrEmpty($Command[0])) { [Console]::Error.WriteLine("OPENCODE_ARGV_INVALID_COMMAND"); exit 125 }
 Add-Type @'
 using System;
 using System.Text;
@@ -3000,39 +3005,110 @@ export function windowsSupervisorArgumentsForTest(record: string) {
   return windowsSupervisorArguments(record)
 }
 
-// `powershell.exe -Command` consumes the rest of its command line as source
-// text. Use `-File` so the supervisor's remaining positional arguments bind to
-// `$Command` instead of being parsed as another command.
+// PowerShell's -File parameter binder can reinterpret target flags. Transfer
+// opaque argv through a private, nonce-named file instead of script parameters.
+// NUL cannot occur in native argv, so the delimiter also preserves empty args.
+function writeWindowsSupervisorArgv(nonce: string, command: readonly string[]) {
+  if (!command.length || command.some((argument) => argument.includes("\0")))
+    throw new Error("Windows supervisor requires nonempty NUL-free argv")
+  const argvFile = path.join(os.tmpdir(), `opencode-supervisor-argv-${nonce}.bin`)
+  writeFileSync(argvFile, Buffer.from(command.join("\0"), "utf8"), { flag: "wx", mode: 0o600 })
+  return argvFile
+}
+
 function writeWindowsSupervisor(nonce: string) {
   const supervisor = path.join(os.tmpdir(), `opencode-supervisor-${nonce}.ps1`)
-  writeFileSync(supervisor, windowsSupervisorScript())
+  writeFileSync(supervisor, windowsSupervisorScript(), { flag: "wx", mode: 0o600 })
   return supervisor
 }
 
-// This crosses the real powershell.exe `-File` boundary used by spawnTracked.
-// A C# quote-only assertion cannot prove that PowerShell bound the script's
-// ValueFromRemainingArguments parameter rather than treating argv as source.
+function writeWindowsSupervisorLaunch(nonce: string, command: readonly string[]) {
+  const argvFile = writeWindowsSupervisorArgv(nonce, command)
+  try {
+    return { argvFile, supervisor: writeWindowsSupervisor(nonce) }
+  } catch (cause) {
+    try {
+      unlinkSync(argvFile)
+    } catch (cleanup) {
+      throw new AggregateError([cause, cleanup], "failed to prepare Windows supervisor launch")
+    }
+    throw cause
+  }
+}
+
+// A failed PowerShell launch may print a credential-bearing exception. Read a
+// bounded prefix only after the exact supervisor handle was reaped, and expose
+// only a fixed classification to the test result.
+async function windowsSupervisorStartupDiagnostic(stream: ReadableStream<Uint8Array>) {
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  const deadline = Date.now() + 300
+  try {
+    while (size < 4_096 && Date.now() < deadline) {
+      const remaining = deadline - Date.now()
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const read = reader.read()
+      void read.catch(() => {})
+      const next = await Promise.race([
+        read,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), remaining)
+        }),
+      ]).finally(() => {
+        if (timer) clearTimeout(timer)
+      })
+      if (!next || next.done) break
+      chunks.push(next.value.subarray(0, 4_096 - size))
+      size += next.value.length
+    }
+  } catch {
+    return "stderr unavailable"
+  } finally {
+    void reader.cancel().catch(() => {})
+  }
+  const output = Buffer.concat(chunks).toString("utf8")
+  if (/OPENCODE_ARGV_INVALID_UTF8/.test(output)) return "invalid UTF-8 argv payload"
+  if (/OPENCODE_ARGV_MISSING/.test(output)) return "missing argv payload file"
+  if (/OPENCODE_ARGV_INVALID_COMMAND/.test(output)) return "invalid argv command"
+  if (/ParameterBindingException/i.test(output)) return "PowerShell parameter binding failed"
+  if (/Add-Type|COMPILER ERROR|CS\d{4}/i.test(output)) return "PowerShell C# compilation failed"
+  if (/CreateJobObject|SetInformationJobObject|GetProcessTimes/i.test(output)) return "native Job Object startup failed"
+  return output ? "PowerShell startup error" : "no PowerShell stderr"
+}
+
+// This crosses the real powershell.exe -File boundary used by spawnTracked.
+// An external target verifies that no script binder reparses the target argv.
 export async function windowsSupervisorArgumentRoundTripForTest(
   argv: string[],
   targetTimeoutMs = 4_000,
   targetSource = "$encoded=[System.Collections.Generic.List[string]]::new(); foreach($argument in $args) { [void]$encoded.Add([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($argument))) }; [Console]::Out.Write((ConvertTo-Json -InputObject ($encoded.ToArray()) -Compress))",
   finalized?: (result: { readonly statusRemoved: boolean; readonly reaped: boolean }) => void,
   statusDelayMs = 0,
+  nativeTarget = false,
 ) {
   const nonce = crypto.randomUUID()
   const release = path.join(os.tmpdir(), `opencode-release-${nonce}`)
   const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
   const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
   const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
-  const target = path.join(os.tmpdir(), `opencode-supervisor-argv-${nonce}.ps1`)
-  const supervisor = writeWindowsSupervisor(nonce)
+  const target = path.join(os.tmpdir(), `opencode-supervisor-target-${nonce}.${nativeTarget ? "js" : "ps1"}`)
+  const command = nativeTarget
+    ? [process.execPath, target, ...argv]
+    : ["powershell.exe", "-NoProfile", "-File", target, ...argv]
+  const { argvFile, supervisor } = writeWindowsSupervisorLaunch(nonce, command)
   let child: ReturnType<typeof Bun.spawn> | undefined
   let completed = false
   let operationError: Error | undefined
   try {
-    writeFileSync(target, targetSource)
+    writeFileSync(
+      target,
+      nativeTarget
+        ? "process.stdout.write(JSON.stringify(process.argv.slice(2).map((argument) => Buffer.from(argument, 'utf8').toString('base64'))))"
+        : targetSource,
+    )
     child = Bun.spawn(
-      ["powershell.exe", "-NoProfile", "-File", supervisor, "powershell.exe", "-NoProfile", "-File", target, ...argv],
+      ["powershell.exe", "-NoProfile", "-File", supervisor],
       {
         stdout: "pipe",
         stderr: "pipe",
@@ -3044,6 +3120,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
           OPENCODE_TEST_COMPLETION: completion,
           OPENCODE_TEST_JOB_ID: nonce,
           OPENCODE_TEST_STATUS_DELAY_MS: `${statusDelayMs}`,
+          OPENCODE_TEST_ARGV_FILE: argvFile,
         },
       },
     )
@@ -3115,7 +3192,7 @@ export async function windowsSupervisorArgumentRoundTripForTest(
         cleanupErrors.push(new Error("Windows supervisor argv probe did not exit during cleanup"))
       }
     }
-    ;[status, release, abort, completion, target, supervisor].forEach((file) => {
+    ;[status, release, abort, completion, target, supervisor, argvFile].forEach((file) => {
       try {
         if (existsSync(file)) unlinkSync(file)
       } catch (cause) {
@@ -3146,6 +3223,36 @@ export async function windowsSupervisorStartupRetryForTest() {
   } finally {
     await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 8_000, observed)
   }
+}
+
+export async function windowsSupervisorInvalidArgvForTest(fault: "missing" | "invalid-utf8") {
+  if (process.platform !== "win32") throw new Error("Windows supervisor test requires Windows")
+  const marker = path.join(os.tmpdir(), `opencode-dispatch-${crypto.randomUUID()}`)
+  let proc: Awaited<ReturnType<typeof spawnTracked>> | undefined
+  let error: Error | undefined
+  try {
+    proc = await spawnTracked(
+      [process.execPath, "-e", 'require("node:fs").writeFileSync(process.env.OPENCODE_TEST_DISPATCH_MARKER,"executed")'],
+      {
+        env: { ...process.env, OPENCODE_TEST_DISPATCH_MARKER: marker },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+      { windowsArgvFileFault: fault },
+    )
+    await (proc.rawExited ?? proc.child.exited)
+  } catch (cause) {
+    error = cause instanceof Error ? cause : new Error("Windows argv fault probe failed", { cause })
+  } finally {
+    if (proc) {
+      const observed = proc.rawExited ?? proc.child.exited
+      await terminateProcessPromise(proc.child, () => {}, proc.tracker, Date.now() + 8_000, observed)
+    }
+  }
+  const targetExecuted = existsSync(marker)
+  if (targetExecuted) unlinkSync(marker)
+  return { error, targetExecuted }
 }
 
 // CreateProcess receives one command line, then uses the same backslash/quote
@@ -3450,6 +3557,7 @@ async function observePortable(
 type SpawnTrackedTestOptions = {
   readonly forcePortable?: boolean
   readonly windowsFailFirstSupervisor?: boolean
+  readonly windowsArgvFileFault?: "missing" | "invalid-utf8"
   readonly portableFilesystem?: PortableFilesystem
   readonly portableObserve?: PortableObserve
   // The test-only pause sits after the controller publishes kill-issued and
@@ -3486,13 +3594,12 @@ async function spawnTracked(
       const abort = path.join(os.tmpdir(), `opencode-abort-${nonce}`)
       const status = path.join(os.tmpdir(), `opencode-status-${nonce}`)
       const completion = path.join(os.tmpdir(), `opencode-complete-${nonce}`)
-      const supervisor = writeWindowsSupervisor(nonce)
+      const { argvFile, supervisor } = writeWindowsSupervisorLaunch(nonce, command)
       let child: ReturnType<typeof Bun.spawn>
       try {
-        // `-File` gives the script's ValueFromRemainingArguments parameter the
-        // original argv. With `-Command`, these values are concatenated into
-        // PowerShell source and no longer arrive in `$Command` reliably.
-        child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor, ...command], {
+        if (test?.windowsArgvFileFault === "missing") unlinkSync(argvFile)
+        if (test?.windowsArgvFileFault === "invalid-utf8") writeFileSync(argvFile, Buffer.from([0xff]))
+        child = Bun.spawn(["powershell.exe", "-NoProfile", "-File", supervisor], {
           ...options,
           env: {
             ...options?.env,
@@ -3501,22 +3608,25 @@ async function spawnTracked(
             OPENCODE_TEST_STATUS: status,
             OPENCODE_TEST_COMPLETION: completion,
             OPENCODE_TEST_JOB_ID: nonce,
+            OPENCODE_TEST_ARGV_FILE: argvFile,
             OPENCODE_TEST_FAIL_BEFORE_STATUS: test?.windowsFailFirstSupervisor && attempt === 0 ? "1" : "0",
           },
         })
       } catch (cause) {
-        try {
-          unlinkSync(supervisor)
-        } catch (cleanup) {
-          throw new AggregateError(
-            [
-              new Error("failed to spawn Windows job supervisor", { cause }),
-              new Error("failed to remove Windows supervisor script", { cause: cleanup }),
-            ],
-            "failed to establish Windows Job Object containment",
-          )
+        const errors: Error[] = [new Error("failed to spawn Windows job supervisor", { cause })]
+        for (const [file, label] of [
+          [supervisor, "script"],
+          [argvFile, "argv payload"],
+        ] as const) {
+          try {
+            if (existsSync(file)) unlinkSync(file)
+          } catch (cleanup) {
+            recordError(errors, `failed to remove Windows supervisor ${label}`, cleanup)
+          }
         }
-        throw new Error("failed to spawn Windows job supervisor", { cause })
+        if (errors.length > 1)
+          throw new AggregateError(errors, "failed to establish Windows Job Object containment")
+        throw errors[0]
       }
       const acquisitionDeadline = Date.now() + windowsSupervisorAdmissionTimeoutMs
       let root: ProcessIdentity | undefined
@@ -3529,6 +3639,7 @@ async function spawnTracked(
       const abortLaunch = async (cause: unknown) => {
         const errors: Error[] = [cause instanceof Error ? cause : new Error("Windows acquisition failed", { cause })]
         const cleanupDeadline = Date.now() + 4_000
+        let reaped = false
         // These must stay separate. If either filesystem operation fails, the
         // other still gives the provisional supervisor a path to exit.
         try {
@@ -3550,21 +3661,23 @@ async function spawnTracked(
             if (!isMissingProcess(termination))
               recordError(errors, "failed to terminate Windows acquisition supervisor", termination)
           }
-          if (
-            !(await exitedWithin(
-              child,
-              Math.max(cleanupDeadline - Date.now(), 0),
-              "after Windows acquisition failure",
-              errors,
-              rawExited,
-            ))
-          ) {
+          reaped = await exitedWithin(
+            child,
+            Math.max(cleanupDeadline - Date.now(), 0),
+            "after Windows acquisition failure",
+            errors,
+            rawExited,
+          )
+          if (!reaped) {
             errors.push(new Error("Windows Job Object supervisor did not exit after acquisition failure"))
+          } else if (exitedBeforeRelease && stderr) {
+            const diagnostic = await windowsSupervisorStartupDiagnostic(stderr)
+            errors[0] = new Error(`${errors[0].message}; ${diagnostic}`, { cause: errors[0] })
           }
         } finally {
           // The supervisor may still be observing these files until it is known
           // dead. Do not remove a control signal before the reap above.
-          ;[status, release, abort, completion, supervisor].forEach((file) => {
+          ;[status, release, abort, completion, supervisor, argvFile].forEach((file) => {
             try {
               if (existsSync(file)) unlinkSync(file)
             } catch (cleanup) {
@@ -3606,7 +3719,7 @@ async function spawnTracked(
         if (!root) {
           throw new Error("failed to capture exact Windows job supervisor identity before launching opencode")
         }
-        const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, nonce)
+        const tracker = trackWindowsProcess(child, root, release, abort, status, completion, supervisor, argvFile, nonce)
         const captured = await tracker.scan(acquisitionDeadline)
         if (tracker.errors.length || !captured.some((identity) => sameIdentity(root!, identity))) {
           throw new Error("failed to establish Windows Job Object containment")
